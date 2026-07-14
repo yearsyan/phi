@@ -1,0 +1,16 @@
+[package]
+name = "phi-daemon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["ws"] }
+phi = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23.5", features = ["serde", "v7"] }
