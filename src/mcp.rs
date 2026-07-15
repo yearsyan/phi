@@ -40,6 +40,7 @@ use crate::{
 
 pub const DEFAULT_MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_MCP_IMAGE_BASE64_CHARS: usize = 28 * 1024 * 1024;
 
 /// Options shared by stdio and Streamable HTTP MCP connections.
 #[derive(Clone, Debug)]
@@ -557,16 +558,38 @@ fn tool_definition(remote_tool: &RemoteTool, prefix: Option<&str>) -> (String, T
 
 fn format_tool_result(result: CallToolResult, max_lines: usize, max_bytes: usize) -> ToolOutput {
     let is_error = result.is_error.unwrap_or(false);
-    let mut chunks = result
-        .content
-        .into_iter()
-        .map(render_content_block)
-        .filter(|chunk| !chunk.is_empty())
-        .collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut content_parts = Vec::new();
+    for block in result.content {
+        match block {
+            ContentBlock::Image(image) => {
+                if image.data.len() <= MAX_MCP_IMAGE_BASE64_CHARS {
+                    content_parts.push(crate::types::ContentPart::image_url(format!(
+                        "data:{};base64,{}",
+                        image.mime_type, image.data
+                    )));
+                    chunks.push(format!("[MCP image: {}]", image.mime_type));
+                } else {
+                    chunks.push(format!(
+                        "[MCP image omitted: {}, {} base64 characters exceeds attachment limit]",
+                        image.mime_type,
+                        image.data.len()
+                    ));
+                }
+            }
+            block => {
+                let chunk = render_content_block(block);
+                if !chunk.is_empty() {
+                    chunks.push(chunk);
+                }
+            }
+        }
+    }
 
-    if let Some(structured) = result.structured_content
+    let structured_content = result.structured_content;
+    if let Some(structured) = structured_content.as_ref()
         && !chunks.iter().any(|chunk| {
-            serde_json::from_str::<Value>(chunk).is_ok_and(|content| content == structured)
+            serde_json::from_str::<Value>(chunk).is_ok_and(|content| content == *structured)
         })
     {
         let structured =
@@ -580,21 +603,33 @@ fn format_tool_result(result: CallToolResult, max_lines: usize, max_bytes: usize
         chunks.join("\n\n")
     };
     let content = truncate_tool_output(&content, max_lines, max_bytes);
-    if is_error {
+    let mut output = if is_error {
         ToolOutput::error(content)
     } else {
         ToolOutput::success(content)
     }
+    .with_content_parts(content_parts);
+    if let Some(structured) = structured_content {
+        let structured_bytes = serde_json::to_vec(&structured)
+            .map_or(max_bytes.saturating_add(1), |encoded| encoded.len());
+        output = if structured_bytes <= max_bytes {
+            output.with_metadata(serde_json::json!({
+                "mcp_structured_content": structured
+            }))
+        } else {
+            output.with_metadata(serde_json::json!({
+                "mcp_structured_content_truncated": true,
+                "original_bytes": structured_bytes
+            }))
+        };
+    }
+    output
 }
 
 fn render_content_block(content: ContentBlock) -> String {
     match content {
         ContentBlock::Text(text) => text.text,
-        ContentBlock::Image(image) => format!(
-            "[MCP image: {}, {} base64 characters omitted]",
-            image.mime_type,
-            image.data.len()
-        ),
+        ContentBlock::Image(image) => format!("[MCP image: {}]", image.mime_type),
         ContentBlock::Audio(audio) => format!(
             "[MCP audio: {}, {} base64 characters omitted]",
             audio.mime_type,
@@ -703,6 +738,12 @@ mod tests {
         assert!(output.is_error);
         assert!(output.content.contains("lookup failed"));
         assert!(output.content.contains("NOT_FOUND"));
+        assert_eq!(
+            output.metadata,
+            Some(json!({
+                "mcp_structured_content": { "code": "NOT_FOUND" }
+            }))
+        );
     }
 
     #[test]
@@ -717,7 +758,28 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_binary_content_instead_of_forwarding_base64() {
+    fn bounds_structured_metadata_independently_of_the_text_fallback() {
+        let output = format_tool_result(
+            CallToolResult::structured(json!({ "value": "x".repeat(1_000) })),
+            100,
+            64,
+        );
+
+        assert_eq!(
+            output.metadata.as_ref().unwrap()["mcp_structured_content_truncated"],
+            true
+        );
+        assert!(
+            output.metadata.as_ref().unwrap()["original_bytes"]
+                .as_u64()
+                .unwrap()
+                > 64
+        );
+        assert!(output.content.len() < 256);
+    }
+
+    #[test]
+    fn preserves_images_as_rich_content_with_a_safe_text_fallback() {
         let output = format_tool_result(
             CallToolResult::success(vec![ContentBlock::image("secret-base64", "image/png")]),
             100,
@@ -726,6 +788,11 @@ mod tests {
 
         assert!(output.content.contains("MCP image"));
         assert!(!output.content.contains("secret-base64"));
+        assert_eq!(output.content_parts.len(), 1);
+        assert_eq!(
+            output.content_parts[0],
+            crate::types::ContentPart::image_url("data:image/png;base64,secret-base64")
+        );
     }
 
     #[test]

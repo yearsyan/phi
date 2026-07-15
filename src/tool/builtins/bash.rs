@@ -2,6 +2,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -17,16 +18,23 @@ use tokio::{
 };
 
 use super::{
+    bash_classifier::classify_bash_arguments_concurrency,
+    bash_task::BashTaskRegistry,
     common::{invalid_arguments, normalize_cwd},
     truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, truncate_tail},
 };
 use crate::{
     error::ToolError,
-    tool::{Tool, ToolOutput},
+    tool::{Tool, ToolConcurrency, ToolEffect, ToolExecutionContext, ToolOutput, ToolProgress},
     types::ToolDefinition,
 };
 
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483_647_f64 / 1_000_f64;
+pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(not(test))]
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct BashTool {
@@ -34,6 +42,8 @@ pub struct BashTool {
     shell: PathBuf,
     max_lines: usize,
     max_bytes: usize,
+    default_timeout: Option<Duration>,
+    task_registry: BashTaskRegistry,
 }
 
 impl BashTool {
@@ -43,6 +53,8 @@ impl BashTool {
             shell: default_shell(),
             max_lines: DEFAULT_MAX_LINES,
             max_bytes: DEFAULT_MAX_BYTES,
+            default_timeout: Some(DEFAULT_BASH_TIMEOUT),
+            task_registry: BashTaskRegistry::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES),
         }
     }
 
@@ -54,49 +66,38 @@ impl BashTool {
     pub fn output_limits(mut self, max_lines: usize, max_bytes: usize) -> Self {
         self.max_lines = max_lines.max(1);
         self.max_bytes = max_bytes.max(1);
+        self.task_registry = BashTaskRegistry::new(self.max_lines, self.max_bytes);
         self
     }
-}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BashArguments {
-    command: String,
-    timeout: Option<f64>,
-}
-
-#[async_trait]
-impl Tool for BashTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(
-            "bash",
-            format!(
-                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. An optional timeout is measured in seconds.",
-                self.max_lines, self.max_bytes
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute"
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "description": "Optional timeout in seconds; no timeout is applied when omitted"
-                    }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        )
+    pub(super) fn task_registry(mut self, task_registry: BashTaskRegistry) -> Self {
+        self.task_registry = task_registry;
+        self
     }
 
-    async fn execute(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let arguments: BashArguments =
-            serde_json::from_value(arguments).map_err(|error| invalid_arguments("bash", error))?;
-        let timeout = resolve_timeout(arguments.timeout)?;
+    /// Sets the timeout used when a call omits its `timeout` argument.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(nonzero_timeout(timeout));
+        self
+    }
+
+    /// Disables the Bash-specific default timeout. An explicit call argument
+    /// and the agent-level tool-call timeout may still apply.
+    pub fn without_timeout(mut self) -> Self {
+        self.default_timeout = None;
+        self
+    }
+
+    pub fn configured_timeout(&self) -> Option<Duration> {
+        self.default_timeout
+    }
+
+    /// Changes the timeout used by subsequent calls to this tool.
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.default_timeout = timeout.map(nonzero_timeout);
+    }
+
+    async fn validate_cwd(&self) -> Result<(), ToolError> {
         let metadata = tokio::fs::metadata(&self.cwd).await.map_err(|error| {
             ToolError::new(format!(
                 "working directory does not exist: {}: {error}",
@@ -109,6 +110,42 @@ impl Tool for BashTool {
                 self.cwd.display()
             )));
         }
+        Ok(())
+    }
+
+    fn start_background(&self, arguments: ResolvedBashArguments) -> Result<ToolOutput, ToolError> {
+        // The running task must not retain its management registry. Otherwise
+        // the registry owns the JoinHandle while the task owns the registry,
+        // preventing Agent drop from cancelling an orphaned command.
+        let tool = Self {
+            task_registry: BashTaskRegistry::new(self.max_lines, self.max_bytes),
+            ..self.clone()
+        };
+        let task_registry = self.task_registry.clone();
+        let registry_for_run = task_registry.downgrade();
+        let task_id = task_registry.spawn(move |task_id| {
+            let registry_for_output = registry_for_run.clone();
+            let output_task_id = task_id.clone();
+            let observer: OutputObserver = Arc::new(move |chunk| {
+                registry_for_output.append_output(&output_task_id, chunk);
+            });
+            async move { tool.run_foreground(arguments, Some(observer)).await }
+        })?;
+        Ok(ToolOutput::success(format!(
+            "Background bash task started: {task_id}\nUse bash_task_output to inspect it or bash_task_stop to stop it."
+        ))
+        .with_metadata(json!({
+            "task_id": task_id,
+            "status": "running",
+        })))
+    }
+
+    async fn run_foreground(
+        &self,
+        arguments: ResolvedBashArguments,
+        observer: Option<OutputObserver>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.validate_cwd().await?;
 
         let mut command = shell_command(&self.shell, &arguments.command);
         command
@@ -124,6 +161,7 @@ impl Tool for BashTool {
                 self.shell.display()
             ))
         })?;
+        let mut process_guard = ProcessGroupGuard::new(child.id());
 
         let stdout = child
             .stdout
@@ -141,29 +179,33 @@ impl Tool for BashTool {
         let max_bytes = self.max_bytes;
         let collector = tokio::spawn(async move {
             let mut accumulator = BashOutputAccumulator::new(max_lines, max_bytes);
-            collect_output(receiver, &mut accumulator).await?;
+            collect_output(receiver, &mut accumulator, observer.as_ref()).await?;
             accumulator.finish().await
         });
 
-        let wait_outcome = wait_for_child(&mut child, timeout).await;
-        let stdout_result = join_reader(stdout_task, "stdout").await;
-        let stderr_result = join_reader(stderr_task, "stderr").await;
-        let snapshot = collector
-            .await
-            .map_err(|error| ToolError::new(format!("bash output collector failed: {error}")))?
-            .map_err(|error| ToolError::new(format!("could not collect bash output: {error}")))?;
-        stdout_result?;
-        stderr_result?;
+        let wait_outcome = wait_for_child(&mut child, arguments.timeout).await;
+        let (snapshot, drain_timed_out) =
+            drain_output_tasks(stdout_task, stderr_task, collector, &process_guard).await?;
+        process_guard.disarm();
+        let drain_note = drain_timed_out.then(|| {
+            format!(
+                "Output drain exceeded {:.3} seconds after the command exited; remaining process-group members and output tasks were terminated. Output may be incomplete.",
+                OUTPUT_DRAIN_GRACE.as_secs_f64()
+            )
+        });
 
         match wait_outcome {
             WaitOutcome::Exited(status) => {
                 let status = status.map_err(|error| {
                     ToolError::new(format!("failed waiting for command to exit: {error}"))
                 })?;
+                let output = drain_note.as_deref().map_or_else(
+                    || format_output(&snapshot, if status.success() { "(no output)" } else { "" }),
+                    |note| append_status(format_output(&snapshot, ""), note),
+                );
                 if status.success() {
-                    Ok(ToolOutput::success(format_output(&snapshot, "(no output)")))
+                    Ok(ToolOutput::success(output))
                 } else {
-                    let output = format_output(&snapshot, "");
                     Err(ToolError::new(append_status(
                         output,
                         &format_exit_status(status),
@@ -171,13 +213,145 @@ impl Tool for BashTool {
                 }
             }
             WaitOutcome::TimedOut(duration) => {
-                let output = format_output(&snapshot, "");
+                let output = drain_note.as_deref().map_or_else(
+                    || format_output(&snapshot, ""),
+                    |note| append_status(format_output(&snapshot, ""), note),
+                );
                 Err(ToolError::new(append_status(
                     output,
                     &format!("Command timed out after {} seconds", duration.as_secs_f64()),
                 )))
             }
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashArguments {
+    command: String,
+    timeout: Option<f64>,
+    #[serde(default)]
+    run_in_background: bool,
+}
+
+struct ResolvedBashArguments {
+    command: String,
+    timeout: Option<Duration>,
+}
+
+type OutputObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+#[async_trait]
+impl Tool for BashTool {
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ExternalSideEffect
+    }
+
+    fn concurrency(&self, arguments: &serde_json::Value) -> ToolConcurrency {
+        if classify_bash_arguments_concurrency(arguments) {
+            ToolConcurrency::Safe
+        } else {
+            ToolConcurrency::Exclusive
+        }
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "bash",
+            format!(
+                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. The optional timeout is measured in seconds and overrides the configured default{}. Set run_in_background=true for a long-running command, then inspect or stop it with bash_task_output and bash_task_stop.",
+                self.max_lines,
+                self.max_bytes,
+                self.default_timeout.map_or_else(
+                    || " (none)".to_owned(),
+                    |timeout| format!(" ({:.3}s)", timeout.as_secs_f64())
+                )
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Optional timeout in seconds; overrides the configured Bash default"
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Start the command as a managed background task and return immediately"
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let arguments: BashArguments =
+            serde_json::from_value(arguments).map_err(|error| invalid_arguments("bash", error))?;
+        let resolved = ResolvedBashArguments {
+            command: arguments.command,
+            timeout: resolve_timeout(arguments.timeout, self.default_timeout)?,
+        };
+        if arguments.run_in_background {
+            // Fail obvious configuration errors synchronously instead of
+            // returning an id for a task that can never start.
+            self.validate_cwd().await?;
+            self.start_background(resolved)
+        } else {
+            self.run_foreground(resolved, None).await
+        }
+    }
+
+    async fn execute_with_context(
+        &self,
+        arguments: serde_json::Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let background = arguments
+            .get("run_in_background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        context.report_progress(ToolProgress::new(if background {
+            "Starting background command"
+        } else {
+            "Command started"
+        }));
+        let execution = self.execute(arguments);
+        tokio::pin!(execution);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.tick().await;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut execution => break result,
+                _ = context.cancelled() => {
+                    break Err(ToolError::new("bash command cancelled"));
+                }
+                _ = heartbeat.tick() => {
+                    context.report_progress(ToolProgress::new("Command is still running"));
+                }
+            }
+        };
+        context.report_progress(
+            ToolProgress::new(match (background, result.is_ok()) {
+                (true, true) => "Background task started",
+                (true, false) => "Background task failed to start",
+                (false, true) => "Command finished",
+                (false, false) => "Command failed",
+            })
+            .with_metadata(json!({
+                "is_error": result.is_err(),
+                "background": background,
+            })),
+        );
+        result
     }
 }
 
@@ -205,9 +379,12 @@ fn shell_command(shell: &Path, command: &str) -> Command {
     process
 }
 
-fn resolve_timeout(timeout: Option<f64>) -> Result<Option<Duration>, ToolError> {
+fn resolve_timeout(
+    timeout: Option<f64>,
+    default_timeout: Option<Duration>,
+) -> Result<Option<Duration>, ToolError> {
     let Some(timeout) = timeout else {
-        return Ok(None);
+        return Ok(default_timeout);
     };
     if !timeout.is_finite() || timeout <= 0.0 {
         return Err(ToolError::new(
@@ -220,6 +397,55 @@ fn resolve_timeout(timeout: Option<f64>) -> Result<Option<Duration>, ToolError> 
         )));
     }
     Ok(Some(Duration::from_secs_f64(timeout)))
+}
+
+fn nonzero_timeout(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_millis(1))
+}
+
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            #[cfg(unix)]
+            pid,
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pid = None;
+        }
+    }
+
+    fn terminate(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // The shell is the process-group leader. It may already have
+            // exited, but descendants that inherited the group can still be
+            // holding stdout/stderr open.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.pid.is_some() {
+            // The shell is started as process-group leader. This synchronous
+            // best-effort kill also runs when an outer agent timeout or stop
+            // drops the Bash future, cleaning descendants still in the group.
+            self.terminate();
+        }
+    }
 }
 
 enum WaitOutcome {
@@ -279,17 +505,89 @@ where
     }
 }
 
-async fn join_reader(task: JoinHandle<io::Result<()>>, stream: &str) -> Result<(), ToolError> {
-    task.await
+async fn drain_output_tasks(
+    mut stdout_task: JoinHandle<io::Result<()>>,
+    mut stderr_task: JoinHandle<io::Result<()>>,
+    mut collector: JoinHandle<io::Result<BashOutputSnapshot>>,
+    process_guard: &ProcessGroupGuard,
+) -> Result<(BashOutputSnapshot, bool), ToolError> {
+    let deadline = tokio::time::sleep(OUTPUT_DRAIN_GRACE);
+    tokio::pin!(deadline);
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut snapshot_result = None;
+    let mut timed_out = false;
+
+    while stdout_result.is_none() || stderr_result.is_none() || snapshot_result.is_none() {
+        tokio::select! {
+            result = &mut stdout_task, if stdout_result.is_none() => {
+                stdout_result = Some(map_reader_result(result, "stdout"));
+            }
+            result = &mut stderr_task, if stderr_result.is_none() => {
+                stderr_result = Some(map_reader_result(result, "stderr"));
+            }
+            result = &mut collector, if snapshot_result.is_none() => {
+                snapshot_result = Some(map_collector_result(result));
+            }
+            _ = &mut deadline => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    if timed_out {
+        process_guard.terminate();
+        if stdout_result.is_none() {
+            stdout_task.abort();
+            let _ = (&mut stdout_task).await;
+            stdout_result = Some(Ok(()));
+        }
+        if stderr_result.is_none() {
+            stderr_task.abort();
+            let _ = (&mut stderr_task).await;
+            stderr_result = Some(Ok(()));
+        }
+        // Aborting the readers drops the last channel senders, allowing the
+        // collector to flush and return everything received before the grace
+        // deadline instead of losing the partial output.
+        if snapshot_result.is_none() {
+            snapshot_result = Some(map_collector_result(collector.await));
+        }
+    }
+
+    stdout_result.expect("stdout task completed or was aborted")?;
+    stderr_result.expect("stderr task completed or was aborted")?;
+    let snapshot = snapshot_result.expect("collector completed after reader shutdown")?;
+    Ok((snapshot, timed_out))
+}
+
+fn map_reader_result(
+    result: Result<io::Result<()>, tokio::task::JoinError>,
+    stream: &str,
+) -> Result<(), ToolError> {
+    result
         .map_err(|error| ToolError::new(format!("bash {stream} reader failed: {error}")))?
         .map_err(|error| ToolError::new(format!("could not read bash {stream}: {error}")))
+}
+
+fn map_collector_result(
+    result: Result<io::Result<BashOutputSnapshot>, tokio::task::JoinError>,
+) -> Result<BashOutputSnapshot, ToolError> {
+    result
+        .map_err(|error| ToolError::new(format!("bash output collector failed: {error}")))?
+        .map_err(|error| ToolError::new(format!("could not collect bash output: {error}")))
 }
 
 async fn collect_output(
     mut receiver: mpsc::Receiver<Vec<u8>>,
     accumulator: &mut BashOutputAccumulator,
+    observer: Option<&OutputObserver>,
 ) -> io::Result<()> {
     while let Some(chunk) = receiver.recv().await {
+        if let Some(observer) = observer {
+            observer(&chunk);
+        }
         accumulator.append(&chunk).await?;
     }
     Ok(())
@@ -493,6 +791,28 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::tool::builtins::bash_task::{BashTaskOutputTool, BashTaskStopTool};
+
+    fn task_id(output: &ToolOutput) -> String {
+        output.metadata.as_ref().unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn wait_for_terminal(output_tool: &BashTaskOutputTool, task_id: &str) -> ToolOutput {
+        for _ in 0..100 {
+            let output = output_tool
+                .execute(json!({ "task_id": task_id }))
+                .await
+                .unwrap();
+            if output.metadata.as_ref().unwrap()["status"] != "running" {
+                return output;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("background task did not finish in time");
+    }
 
     #[tokio::test]
     async fn executes_commands_in_the_configured_directory() {
@@ -532,6 +852,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_timeout_applies_when_argument_is_omitted() {
+        let directory = tempdir().unwrap();
+        let mut tool = BashTool::new(directory.path()).without_timeout();
+        assert_eq!(tool.configured_timeout(), None);
+        tool.set_timeout(Some(Duration::from_millis(20)));
+
+        let error = tool
+            .execute(json!({ "command": "sleep 1" }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(tool.configured_timeout(), Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn has_a_finite_default_timeout() {
+        let directory = tempdir().unwrap();
+        assert_eq!(
+            BashTool::new(directory.path()).configured_timeout(),
+            Some(DEFAULT_BASH_TIMEOUT)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounds_output_drain_after_shell_exit() {
+        let directory = tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = BashTool::new(directory.path())
+            .shell("/bin/sh")
+            .execute(json!({ "command": "sleep 5 & exit 7", "timeout": 2 }))
+            .await
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("Output drain exceeded"));
+        assert!(error.to_string().contains("exited with code 7"));
+        assert!(!error.to_string().contains("unknown"));
+    }
+
+    #[tokio::test]
     async fn truncates_from_the_tail_and_persists_full_output() {
         let directory = tempdir().unwrap();
         let output = BashTool::new(directory.path())
@@ -553,5 +915,231 @@ mod tests {
             "one\ntwo\nthree\n"
         );
         tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_task_returns_immediately_and_exposes_live_then_final_output() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
+        let started = std::time::Instant::now();
+        let started_output = tool
+            .execute(json!({
+                "command": "printf 'started\\n'; sleep 0.3; printf 'finished\\n'",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let task_id = task_id(&started_output);
+
+        let mut saw_live_output = false;
+        for _ in 0..50 {
+            let output = output_tool
+                .execute(json!({ "task_id": task_id }))
+                .await
+                .unwrap();
+            saw_live_output |= output.content.contains("started");
+            if output.metadata.as_ref().unwrap()["status"] != "running" {
+                assert_eq!(output.metadata.as_ref().unwrap()["status"], "completed");
+                assert!(output.content.contains("started"));
+                assert!(output.content.contains("finished"));
+                assert!(saw_live_output);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = stop_tool.execute(json!({ "task_id": task_id })).await;
+        panic!("background task did not finish in time");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_last_registry_owner_cancels_background_commands() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("must-not-exist");
+        let tool = BashTool::new(directory.path()).without_timeout();
+        tool.execute(json!({
+            "command": format!("sleep 0.2; touch '{}'", marker.display()),
+            "run_in_background": true
+        }))
+        .await
+        .unwrap();
+
+        drop(tool);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn background_task_reports_failed_exit_with_output() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let started_output = tool
+            .execute(json!({
+                "command": "printf failure; exit 7",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = task_id(&started_output);
+
+        let output = wait_for_terminal(&output_tool, &task_id).await;
+        assert_eq!(output.metadata.as_ref().unwrap()["status"], "failed");
+        assert_eq!(output.metadata.as_ref().unwrap()["exit_code"], 7);
+        assert!(output.content.contains("failure"));
+        assert!(output.content.contains("exited with code 7"));
+    }
+
+    #[tokio::test]
+    async fn background_task_preserves_timeout_and_reports_it_structurally() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let started_output = tool
+            .execute(json!({
+                "command": "sleep 30",
+                "timeout": 0.02,
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = task_id(&started_output);
+
+        let output = wait_for_terminal(&output_tool, &task_id).await;
+        assert_eq!(output.metadata.as_ref().unwrap()["status"], "failed");
+        assert_eq!(output.metadata.as_ref().unwrap()["timed_out"], true);
+        assert!(output.content.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn stopping_background_task_is_idempotent() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
+        let started_output = tool
+            .execute(json!({
+                "command": "printf ready; sleep 30",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = task_id(&started_output);
+        for _ in 0..50 {
+            let output = output_tool
+                .execute(json!({ "task_id": task_id }))
+                .await
+                .unwrap();
+            if output.content.contains("ready") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stopped = stop_tool
+            .execute(json!({ "task_id": task_id }))
+            .await
+            .unwrap();
+        assert_eq!(stopped.metadata.as_ref().unwrap()["status"], "stopped");
+        assert!(stopped.content.contains("ready"));
+        let stopped_again = stop_tool
+            .execute(json!({ "task_id": task_id }))
+            .await
+            .unwrap();
+        assert_eq!(
+            stopped_again.metadata.as_ref().unwrap()["status"],
+            "stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_task_preserves_full_output_file_for_truncation() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path())
+            .without_timeout()
+            .output_limits(2, 1_024);
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let started_output = tool
+            .execute(json!({
+                "command": "printf 'one\\ntwo\\nthree\\n'",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = task_id(&started_output);
+        let output = wait_for_terminal(&output_tool, &task_id).await;
+
+        assert_eq!(output.metadata.as_ref().unwrap()["exit_code"], 0);
+        assert!(output.content.starts_with("two\nthree"));
+        let path = output
+            .content
+            .split("Full output: ")
+            .nth(1)
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_background_task_terminates_descendant_process_group() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
+        let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
+        let started_output = tool
+            .execute(json!({
+                "command": "sleep 30 & printf '%s\\n' $!; wait",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = task_id(&started_output);
+
+        let mut child_pid = None;
+        for _ in 0..100 {
+            let output = output_tool
+                .execute(json!({ "task_id": task_id }))
+                .await
+                .unwrap();
+            if let Ok(pid) = output
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .parse::<i32>()
+            {
+                child_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_pid = child_pid.expect("background task did not report its child pid");
+        stop_tool
+            .execute(json!({ "task_id": task_id }))
+            .await
+            .unwrap();
+
+        let mut gone = false;
+        for _ in 0..50 {
+            let result = unsafe { libc::kill(child_pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "background descendant process {child_pid} survived stop"
+        );
     }
 }

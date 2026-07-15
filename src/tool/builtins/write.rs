@@ -7,7 +7,7 @@ use serde_json::json;
 use super::common::{invalid_arguments, io_error, mutation_guard, normalize_cwd, resolve_path};
 use crate::{
     error::ToolError,
-    tool::{Tool, ToolOutput},
+    tool::{Tool, ToolEffect, ToolOutput},
     types::ToolDefinition,
 };
 
@@ -33,6 +33,10 @@ struct WriteArguments {
 
 #[async_trait]
 impl Tool for WriteTool {
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::WorkspaceWrite
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "write",
@@ -98,5 +102,22 @@ mod tests {
                 .unwrap(),
             "hello"
         );
+    }
+
+    #[tokio::test]
+    async fn treats_a_leading_at_as_part_of_the_file_name() {
+        let directory = tempdir().unwrap();
+        WriteTool::new(directory.path())
+            .execute(json!({ "path": "@notes.txt", "content": "literal" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(directory.path().join("@notes.txt"))
+                .await
+                .unwrap(),
+            "literal"
+        );
+        assert!(!directory.path().join("notes.txt").exists());
     }
 }

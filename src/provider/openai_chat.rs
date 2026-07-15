@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
@@ -12,7 +12,7 @@ use crate::{
     hook::{BeforeRequestContext, Hook, HookRegistry, ProviderApi},
     provider::{
         ExtraBody, HttpRequestEvent, LlmProvider, ProviderEventStream, RetryConfig, header_value,
-        json_headers, merge_extra_body, parse_extra_body, send_with_retry,
+        json_headers, merge_extra_body, next_stream_item, parse_extra_body, send_with_retry,
     },
     types::{
         AssistantDelta, AssistantMessage, Content, ContentPart, Message, ProviderEvent,
@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenAiChatProvider {
     client: reqwest::Client,
     api_key: String,
@@ -31,8 +31,32 @@ pub struct OpenAiChatProvider {
     hooks: HookRegistry,
 }
 
+impl fmt::Debug for OpenAiChatProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiChatProvider")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("retry_config", &self.retry_config)
+            .field("hooks", &self.hooks)
+            .finish()
+    }
+}
+
 impl OpenAiChatProvider {
     pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_client(reqwest::Client::new(), api_key, base_url, model)
+    }
+
+    /// Builds a provider around an existing HTTP client without constructing
+    /// a throwaway client first.
+    pub fn new_with_client(
+        client: reqwest::Client,
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -43,7 +67,7 @@ impl OpenAiChatProvider {
         validate(&api_key, &base_url, &model)?;
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             model,
@@ -51,6 +75,14 @@ impl OpenAiChatProvider {
             retry_config: RetryConfig::default(),
             hooks: HookRegistry::default(),
         })
+    }
+
+    /// Replaces the provider's HTTP client. Cloning and sharing one configured
+    /// client across providers reuses connection pools and centralizes proxy,
+    /// TLS, and client-level transport policy.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Sets fixed JSON members to append to every Chat Completions request.
@@ -86,11 +118,7 @@ impl OpenAiChatProvider {
     }
 
     fn request_body(&self, request: &ProviderRequest) -> Value {
-        let messages = request
-            .messages
-            .iter()
-            .map(message_to_json)
-            .collect::<Vec<_>>();
+        let messages = chat_messages(&request.messages);
         let tools = request
             .tools
             .iter()
@@ -106,8 +134,9 @@ impl OpenAiChatProvider {
             })
             .collect::<Vec<_>>();
 
+        let model = request.config.model.as_deref().unwrap_or(&self.model);
         let mut body = json!({
-            "model": self.model,
+            "model": model,
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true }
@@ -141,6 +170,7 @@ impl LlmProvider for OpenAiChatProvider {
         let endpoint = format!("{}/chat/completions", self.base_url);
         let body = self.request_body(&request);
         let retry_config = self.retry_config;
+        let stream_idle_timeout = retry_config.stream_idle_timeout();
         let hooks = self.hooks.clone();
 
         Box::pin(try_stream! {
@@ -183,20 +213,27 @@ impl LlmProvider for OpenAiChatProvider {
 
             let mut source = response.bytes_stream().eventsource();
             let mut state = ChatStreamState::default();
-            while let Some(event) = source.next().await {
+            let mut saw_done = false;
+            while let Some(event) = next_stream_item(&mut source, stream_idle_timeout).await? {
                 let event = event.map_err(|error| ProviderError::Stream(error.to_string()))?;
                 if event.data.trim() == "[DONE]" {
+                    saw_done = true;
                     break;
                 }
                 let chunk: Value = serde_json::from_str(&event.data).map_err(|error| {
                     ProviderError::InvalidResponse(format!("invalid chat stream chunk: {error}"))
                 })?;
                 if let Some(error) = chunk.get("error") {
-                    Err(ProviderError::InvalidResponse(error.to_string()))?;
+                    Err(ProviderError::from_stream_response_error(error.to_string()))?;
                 }
                 for delta in state.apply(&chunk)? {
                     yield ProviderEvent::Delta(delta);
                 }
+            }
+            if !saw_done && !state.saw_normal_finish_reason {
+                Err(ProviderError::Stream(
+                    "chat stream ended before [DONE] or a normal finish_reason".to_owned(),
+                ))?;
             }
             yield ProviderEvent::Done(state.finish()?);
         })
@@ -213,6 +250,7 @@ struct ChatStreamState {
     tools: BTreeMap<usize, PendingToolCall>,
     reasoning_fields: BTreeMap<String, Value>,
     usage: Option<TokenUsage>,
+    saw_normal_finish_reason: bool,
 }
 
 #[derive(Default)]
@@ -234,6 +272,12 @@ impl ChatStreamState {
 
         let mut deltas = Vec::new();
         for choice in chunk["choices"].as_array().into_iter().flatten() {
+            if matches!(
+                choice["finish_reason"].as_str(),
+                Some("stop" | "tool_calls" | "function_call")
+            ) {
+                self.saw_normal_finish_reason = true;
+            }
             let delta = &choice["delta"];
             self.capture_reasoning(delta);
             if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
@@ -352,7 +396,7 @@ fn message_to_json(message: &Message) -> Value {
     };
     let mut value = json!({ "role": role });
     if let Some(content) = &message.content {
-        value["content"] = content_to_json(content);
+        value["content"] = content_to_json(content, &message.role);
     }
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
@@ -390,7 +434,60 @@ fn message_to_json(message: &Message) -> Value {
     value
 }
 
-fn content_to_json(content: &Content) -> Value {
+/// Chat tool messages are text-only, while user messages support images and
+/// inline files. Keep every tool result in protocol order, then hoist rich
+/// attachments from a contiguous tool-result batch into one following user
+/// message so the model can actually inspect them.
+fn chat_messages(messages: &[Message]) -> Vec<Value> {
+    let mut output = Vec::with_capacity(messages.len());
+    let mut pending_attachments = Vec::new();
+
+    for message in messages {
+        if message.role != Role::Tool {
+            flush_tool_attachments(&mut output, &mut pending_attachments);
+        }
+        output.push(message_to_json(message));
+        if message.role == Role::Tool
+            && let Some(Content::Parts(parts)) = &message.content
+        {
+            let attachments = parts
+                .iter()
+                .filter(|part| !matches!(part, ContentPart::Text { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !attachments.is_empty() {
+                pending_attachments.push(ContentPart::text(format!(
+                    "Attachments returned by tool call {}:\n",
+                    message.tool_call_id.as_deref().unwrap_or("unknown")
+                )));
+                pending_attachments.extend(attachments);
+            }
+        }
+    }
+    flush_tool_attachments(&mut output, &mut pending_attachments);
+    output
+}
+
+fn flush_tool_attachments(output: &mut Vec<Value>, pending: &mut Vec<ContentPart>) {
+    if pending.is_empty() {
+        return;
+    }
+    let content = Content::Parts(std::mem::take(pending));
+    output.push(json!({
+        "role": "user",
+        "content": content_to_json(&content, &Role::User)
+    }));
+}
+
+fn content_to_json(content: &Content, role: &Role) -> Value {
+    // Chat Completions only documents multimodal content blocks for user
+    // messages. In particular, tool-result content must remain a string.
+    // Preserve the textual ToolOutput fallback for non-user roles instead of
+    // emitting a provider-invalid attachment array.
+    if *role != Role::User {
+        return json!(chat_text_fallback(content, *role != Role::Tool));
+    }
+
     match content {
         Content::Text(text) => json!(text),
         Content::Parts(parts) => Value::Array(
@@ -405,9 +502,53 @@ fn content_to_json(content: &Content) -> Value {
                         }
                         json!({ "type": "image_url", "image_url": image })
                     }
+                    ContentPart::Document { document } => {
+                        if document.data.starts_with("data:") {
+                            json!({
+                                "type": "file",
+                                "file": {
+                                    "filename": document.filename,
+                                    "file_data": document.data
+                                }
+                            })
+                        } else {
+                            // Chat's file block accepts inline data or an
+                            // uploaded file ID, but the provider-neutral block
+                            // contains a remote URL here. Keep a safe text
+                            // fallback rather than inventing an unsupported
+                            // file_url field.
+                            json!({
+                                "type": "text",
+                                "text": format!(
+                                    "[Document attachment {} ({}) omitted: Chat Completions cannot attach this remote URL]",
+                                    document.filename, document.mime_type
+                                )
+                            })
+                        }
+                    }
                 })
                 .collect(),
         ),
+    }
+}
+
+fn chat_text_fallback(content: &Content, attachment_notices: bool) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => text.clone(),
+                ContentPart::ImageUrl { .. } if attachment_notices => {
+                    "\n[Image attachment omitted by Chat Completions adapter]\n".to_owned()
+                }
+                ContentPart::Document { document } if attachment_notices => format!(
+                    "\n[Document attachment {} ({}) omitted by Chat Completions adapter]\n",
+                    document.filename, document.mime_type
+                ),
+                ContentPart::ImageUrl { .. } | ContentPart::Document { .. } => String::new(),
+            })
+            .collect(),
     }
 }
 
@@ -552,10 +693,63 @@ fn parse_content(value: Value) -> Result<Content, ProviderError> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
 
     use super::*;
-    use crate::types::{GenerationConfig, ImageDetail, ImageUrl, ReasoningEffort, ToolDefinition};
+    use crate::types::{
+        Document, GenerationConfig, ImageDetail, ImageUrl, ReasoningEffort, ToolDefinition,
+    };
+
+    enum TestSseResponse {
+        Body(String),
+        Idle(Duration),
+    }
+
+    async fn serve_sse(response: TestSseResponse) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+
+            match response {
+                TestSseResponse::Body(body) => {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+                TestSseResponse::Idle(duration) => {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(duration).await;
+                }
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn basic_request() -> ProviderRequest {
+        ProviderRequest {
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        }
+    }
 
     #[test]
     fn maps_normalized_request_to_chat_completions() {
@@ -597,6 +791,7 @@ mod tests {
                 json!({"type": "object"}),
             )],
             config: GenerationConfig {
+                model: None,
                 temperature: Some(0.2),
                 max_tokens: Some(100),
                 reasoning_effort: Some(ReasoningEffort::High),
@@ -623,6 +818,76 @@ mod tests {
     }
 
     #[test]
+    fn maps_chat_files_and_hoists_tool_attachments_to_a_user_message() {
+        let provider = OpenAiChatProvider::new("key", "https://example.com/v1", "model").unwrap();
+        let inline_document =
+            Document::from_bytes("inline.pdf", "application/pdf", b"inline-pdf-contents");
+        let private_tool_document =
+            Document::from_bytes("private.pdf", "application/pdf", b"private-pdf-contents");
+        let request = ProviderRequest {
+            messages: vec![
+                Message::user_parts([
+                    ContentPart::text("inspect"),
+                    ContentPart::document(inline_document),
+                    ContentPart::document(Document::new(
+                        "remote.pdf",
+                        "application/pdf",
+                        "https://example.com/remote.pdf",
+                    )),
+                ]),
+                Message::assistant(None, vec![ToolCall::new("call-1", "read", json!({}))]),
+                Message::tool_result_content(
+                    "call-1",
+                    Content::parts([
+                        ContentPart::text("tool summary"),
+                        ContentPart::image_url("data:image/png;base64,c2VjcmV0"),
+                        ContentPart::document(private_tool_document),
+                    ]),
+                    false,
+                    None,
+                ),
+            ],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        };
+
+        let body = provider.request_body(&request);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "file");
+        assert_eq!(
+            body["messages"][0]["content"][1]["file"]["filename"],
+            "inline.pdf"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][1]["file"]["file_data"],
+            "data:application/pdf;base64,aW5saW5lLXBkZi1jb250ZW50cw=="
+        );
+        assert_eq!(body["messages"][0]["content"][2]["type"], "text");
+        assert!(
+            body["messages"][0]["content"][2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("remote.pdf")
+        );
+        let tool_content = body["messages"][2]["content"].as_str().unwrap();
+        assert_eq!(tool_content, "tool summary");
+        assert_eq!(body["messages"][3]["role"], "user");
+        assert_eq!(body["messages"][3]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,c2VjcmV0"
+        );
+        assert_eq!(body["messages"][3]["content"][2]["type"], "file");
+        assert_eq!(
+            body["messages"][3]["content"][2]["file"]["filename"],
+            "private.pdf"
+        );
+        let serialized = body.to_string();
+        assert!(serialized.contains("c2VjcmV0"));
+        assert!(serialized.contains("cHJpdmF0ZS1wZGYtY29udGVudHM="));
+        assert!(!serialized.contains("https://example.com/remote.pdf"));
+    }
+
+    #[test]
     fn rejects_non_object_extra_body() {
         let error = OpenAiChatProvider::new("key", "https://example.com/v1", "model")
             .unwrap()
@@ -630,6 +895,111 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ProviderError::InvalidConfiguration(_)));
+    }
+
+    #[test]
+    fn debug_redacts_api_key_and_accepts_an_injected_http_client() {
+        let provider = OpenAiChatProvider::new_with_client(
+            reqwest::Client::new(),
+            "super-secret-chat-key",
+            "https://example.com/v1",
+            "model",
+        )
+        .unwrap();
+
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("super-secret-chat-key"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn rejects_partial_text_when_the_stream_ends_without_a_terminal_event() {
+        let body = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "partial" },
+                    "finish_reason": null
+                }]
+            })
+        );
+        let (base_url, server) = serve_sse(TestSseResponse::Body(body)).await;
+        let provider = OpenAiChatProvider::new("key", base_url, "model")
+            .unwrap()
+            .max_retries(0);
+
+        let error = provider.generate(basic_request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::Stream(message)
+                if message.contains("ended before [DONE] or a normal finish_reason")
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_a_compatible_stream_with_an_explicit_normal_finish_reason() {
+        let body = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "complete" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, server) = serve_sse(TestSseResponse::Body(body)).await;
+        let provider = OpenAiChatProvider::new("key", base_url, "model")
+            .unwrap()
+            .max_retries(0);
+
+        let response = provider.generate(basic_request()).await.unwrap();
+
+        assert_eq!(
+            response.message.content.unwrap().as_text(),
+            Some("complete")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn times_out_an_idle_established_stream_without_retrying_it() {
+        let (base_url, server) = serve_sse(TestSseResponse::Idle(Duration::from_secs(5))).await;
+        let timeout = Duration::from_millis(20);
+        let retry_config = RetryConfig::default()
+            .with_max_retries(0)
+            .with_stream_idle_timeout(timeout);
+        let provider = OpenAiChatProvider::new("key", base_url, "model")
+            .unwrap()
+            .retry_config(retry_config);
+
+        let error = provider.generate(basic_request()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::StreamIdleTimeout { timeout: observed } if observed == timeout
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn request_model_override_takes_precedence_over_provider_model() {
+        let provider =
+            OpenAiChatProvider::new("key", "https://example.com/v1", "default-model").unwrap();
+        let request = ProviderRequest {
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            config: GenerationConfig {
+                model: Some("request-model".to_owned()),
+                ..GenerationConfig::default()
+            },
+        };
+
+        assert_eq!(provider.request_body(&request)["model"], "request-model");
     }
 
     #[test]

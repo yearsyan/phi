@@ -1,27 +1,64 @@
 use std::{future::Future, io, net::SocketAddr, sync::Arc};
 
+use phi::{DiskPlanStore, DiskSessionStorage};
 use thiserror::Error;
-use tokio::{net::TcpListener, signal};
+use tokio::{net::TcpListener, signal, sync::oneshot};
 use tracing::{error, info, warn};
 
 use crate::{
     api::{self, AppState},
     config::{ConfigError, DaemonConfig},
+    runtime::AgentRegistry,
     service::ApplicationService,
+    store::{DiskControlStore, DiskProviderStore},
 };
 
+const CONTROL_DIRECTORY: &str = "control";
+const SESSION_DIRECTORY: &str = "sessions";
+const PLAN_DIRECTORY: &str = "plans";
+const PROVIDER_CONFIG_FILE: &str = "provider.json";
+
 pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
+    let service = Arc::new(application_service(&config));
+    let state = AppState::new(Arc::clone(&service), config.auth_key());
     let address = config.bind_address();
     let listener = TcpListener::bind(address)
         .await
         .map_err(|source| DaemonError::Bind { address, source })?;
     let local_address = listener.local_addr().map_err(DaemonError::LocalAddress)?;
-    let service = Arc::new(ApplicationService::unconfigured());
-    let state = AppState::new(Arc::clone(&service));
 
-    info!(%local_address, "phi daemon listening; public API routes are not enabled yet");
-    let result = serve(listener, state, shutdown_signal()).await;
+    info!(
+        %local_address,
+        data_dir = %config.data_dir().display(),
+        "phi daemon listening"
+    );
+    let (begin_graceful_shutdown, graceful_shutdown) = oneshot::channel();
+    let shutdown_service = Arc::clone(&service);
+    let shutdown_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        // Stop accepting new HTTP/WS connections before draining the actors.
+        let _ = begin_graceful_shutdown.send(());
+        shutdown_agents(&shutdown_service).await;
+    });
+    let result = serve(listener, state, async move {
+        let _ = graceful_shutdown.await;
+    })
+    .await;
 
+    if result.is_ok() {
+        let _ = shutdown_task.await;
+    } else {
+        shutdown_task.abort();
+    }
+
+    // Also clean up if the HTTP server exits because of an I/O failure before
+    // the signal task runs. After a normal signal this is an empty no-op.
+    shutdown_agents(&service).await;
+
+    result.map_err(DaemonError::Serve)
+}
+
+async fn shutdown_agents(service: &ApplicationService) {
     for failure in service.shutdown().await {
         warn!(
             session_id = %failure.session_id,
@@ -29,8 +66,23 @@ pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
             "agent actor did not shut down cleanly"
         );
     }
+}
 
-    result.map_err(DaemonError::Serve)
+fn application_service(config: &DaemonConfig) -> ApplicationService {
+    let data_dir = config.data_dir();
+    let control_store = Arc::new(DiskControlStore::new(data_dir.join(CONTROL_DIRECTORY)));
+    let session_storage = Arc::new(DiskSessionStorage::new(data_dir.join(SESSION_DIRECTORY)));
+    let plan_store = Arc::new(DiskPlanStore::new(data_dir.join(PLAN_DIRECTORY)));
+    let provider_store = Arc::new(DiskProviderStore::new(data_dir.join(PROVIDER_CONFIG_FILE)));
+
+    ApplicationService::managed_with_plan_store_and_skills(
+        AgentRegistry::new(),
+        control_store,
+        session_storage,
+        plan_store,
+        provider_store,
+        config.skills_config(),
+    )
 }
 
 pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> Result<(), io::Error>
@@ -102,7 +154,10 @@ mod tests {
     async fn server_starts_and_stops_gracefully() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let state = AppState::new(Arc::new(ApplicationService::unconfigured()));
+        let state = AppState::new(
+            Arc::new(ApplicationService::unconfigured()),
+            "a-secure-test-key-with-at-least-32-bytes",
+        );
         let (stop, stopped) = oneshot::channel();
 
         let server = tokio::spawn(serve(listener, state, async move {

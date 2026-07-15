@@ -8,8 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use phi::{
-    Agent, AgentEvent, AssistantDelta, DEFAULT_MAX_RETRIES, DiskSessionStorage, OpenAiChatProvider,
-    ReasoningEffort, RetryConfig, Tool, ToolDefinition, ToolError, ToolOutput,
+    Agent, AgentEvent, AssistantDelta, DEFAULT_MAX_RETRIES, DEFAULT_STREAM_IDLE_TIMEOUT,
+    DiskSessionStorage, OpenAiChatProvider, ReasoningEffort, RetryConfig, Tool, ToolDefinition,
+    ToolError, ToolOutput,
 };
 use serde_json::json;
 
@@ -71,9 +72,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let request_timeout_secs = env::var("LLM_REQUEST_TIMEOUT_SECS")
         .unwrap_or_else(|_| "30".to_owned())
         .parse()?;
+    let stream_idle_timeout_secs = env::var("LLM_STREAM_IDLE_TIMEOUT_SECS")
+        .unwrap_or_else(|_| DEFAULT_STREAM_IDLE_TIMEOUT.as_secs().to_string())
+        .parse()?;
     let retry_config = RetryConfig::default()
         .with_max_retries(max_retries)
-        .with_request_timeout(Duration::from_secs(request_timeout_secs));
+        .with_request_timeout(Duration::from_secs(request_timeout_secs))
+        .with_stream_idle_timeout(Duration::from_secs(stream_idle_timeout_secs));
     let provider = OpenAiChatProvider::new(
         load_api_key()?,
         env::var("LLM_BASE_URL")?,
@@ -89,7 +94,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "You are a concise assistant. When a relevant tool is available, use it before answering.",
         )
         .tool(CharacterCount)
-        .max_turns(8)
         .max_tokens(max_output_tokens)
         .max_context_tokens(max_context_tokens);
     if let Ok(temperature) = env::var("LLM_TEMPERATURE") {

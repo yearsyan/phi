@@ -1,3 +1,5 @@
+use std::fmt;
+
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -9,15 +11,16 @@ use crate::{
     hook::{BeforeRequestContext, Hook, HookRegistry, ProviderApi},
     provider::{
         ExtraBody, HttpRequestEvent, LlmProvider, ProviderEventStream, RetryConfig, header_value,
-        json_headers, merge_extra_body, parse_extra_body, send_with_retry, text_only,
+        json_headers, merge_extra_body, next_stream_item, parse_extra_body, send_with_retry,
+        text_only,
     },
     types::{
-        AssistantDelta, AssistantMessage, Content, ContentPart, ProviderEvent, ProviderRequest,
-        ProviderResponse, ProviderState, Role, TokenUsage, ToolCall,
+        AssistantDelta, AssistantMessage, Content, ContentPart, Message, ProviderEvent,
+        ProviderRequest, ProviderResponse, ProviderState, Role, TokenUsage, ToolCall,
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenAiResponsesProvider {
     client: reqwest::Client,
     api_key: String,
@@ -28,8 +31,32 @@ pub struct OpenAiResponsesProvider {
     hooks: HookRegistry,
 }
 
+impl fmt::Debug for OpenAiResponsesProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiResponsesProvider")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("retry_config", &self.retry_config)
+            .field("hooks", &self.hooks)
+            .finish()
+    }
+}
+
 impl OpenAiResponsesProvider {
     pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_client(reqwest::Client::new(), api_key, base_url, model)
+    }
+
+    /// Builds a provider around an existing HTTP client without constructing
+    /// a throwaway client first.
+    pub fn new_with_client(
+        client: reqwest::Client,
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -39,7 +66,7 @@ impl OpenAiResponsesProvider {
         let model = model.into();
         validate(&api_key, &base_url, &model)?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             model,
@@ -47,6 +74,14 @@ impl OpenAiResponsesProvider {
             retry_config: RetryConfig::default(),
             hooks: HookRegistry::default(),
         })
+    }
+
+    /// Replaces the provider's HTTP client. Cloning and sharing one configured
+    /// client across providers reuses connection pools and centralizes proxy,
+    /// TLS, and client-level transport policy.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     pub fn openai(
@@ -100,26 +135,7 @@ impl OpenAiResponsesProvider {
                     "content": response_content(message.content.as_ref(), false)
                 })),
                 Role::Assistant => {
-                    if let Some(ProviderState::OpenAiResponses { output }) = &message.provider_state
-                    {
-                        input.extend(output.iter().cloned());
-                        continue;
-                    }
-                    if message.content.is_some() {
-                        input.push(json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": response_content(message.content.as_ref(), true)
-                        }));
-                    }
-                    input.extend(message.tool_calls.iter().map(|call| {
-                        json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments.to_string()
-                        })
-                    }));
+                    input.extend(responses_assistant_items(message));
                 }
                 Role::Tool => input.push(json!({
                     "type": "function_call_output",
@@ -141,7 +157,8 @@ impl OpenAiResponsesProvider {
                 })
             })
             .collect::<Vec<_>>();
-        let mut body = json!({ "model": self.model, "input": input, "stream": true });
+        let model = request.config.model.as_deref().unwrap_or(&self.model);
+        let mut body = json!({ "model": model, "input": input, "stream": true });
         if !instructions.is_empty() {
             body["instructions"] = json!(instructions.join("\n"));
         }
@@ -169,6 +186,7 @@ impl LlmProvider for OpenAiResponsesProvider {
         let api_key = self.api_key.clone();
         let endpoint = format!("{}/responses", self.base_url);
         let retry_config = self.retry_config;
+        let stream_idle_timeout = retry_config.stream_idle_timeout();
         let hooks = self.hooks.clone();
 
         Box::pin(try_stream! {
@@ -212,7 +230,7 @@ impl LlmProvider for OpenAiResponsesProvider {
 
             let mut source = response.bytes_stream().eventsource();
             let mut completed = false;
-            while let Some(event) = source.next().await {
+            while let Some(event) = next_stream_item(&mut source, stream_idle_timeout).await? {
                 let event = event.map_err(|error| ProviderError::Stream(error.to_string()))?;
                 let value: Value = serde_json::from_str(&event.data).map_err(|error| {
                     ProviderError::InvalidResponse(format!("invalid Responses stream event: {error}"))
@@ -225,7 +243,7 @@ impl LlmProvider for OpenAiResponsesProvider {
                         break;
                     }
                     Some("response.failed" | "response.incomplete") => {
-                        Err(ProviderError::InvalidResponse(value.to_string()))?;
+                        Err(ProviderError::from_stream_response_error(value.to_string()))?;
                     }
                     _ => {
                         if let Some(delta) = response_delta(&value) {
@@ -289,45 +307,88 @@ fn response_content(content: Option<&Content>, output: bool) -> Vec<Value> {
         Some(Content::Text(text)) => vec![json!({ "type": text_type, "text": text })],
         Some(Content::Parts(parts)) => parts
             .iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => json!({ "type": text_type, "text": text }),
-                ContentPart::ImageUrl { image_url } => json!({
+            .map(|part| match (part, output) {
+                (ContentPart::Text { text }, _) => {
+                    json!({ "type": text_type, "text": text })
+                }
+                (ContentPart::ImageUrl { .. }, true) => json!({
+                    "type": "output_text",
+                    "text": "[Image attachment omitted while replaying assistant content]"
+                }),
+                (ContentPart::Document { document }, true) => json!({
+                    "type": "output_text",
+                    "text": format!(
+                        "[Document attachment {} ({}) omitted while replaying assistant content]",
+                        document.filename, document.mime_type
+                    )
+                }),
+                (ContentPart::ImageUrl { image_url }, false) => json!({
                     "type": "input_image",
                     "image_url": image_url.url,
                     "detail": image_url.detail.map_or("auto", |detail| detail.as_str())
                 }),
+                (ContentPart::Document { document }, false) => {
+                    if document.data.starts_with("data:") {
+                        json!({
+                            "type": "input_file",
+                            "filename": document.filename,
+                            "file_data": document.data
+                        })
+                    } else {
+                        json!({
+                            "type": "input_file",
+                            "file_url": document.data
+                        })
+                    }
+                }
             })
             .collect(),
     }
 }
 
-fn response_tool_output(content: Option<&Content>) -> Value {
-    match content {
-        None => json!(""),
-        Some(Content::Text(text)) => json!(text),
-        Some(content) => Value::Array(response_content(Some(content), false)),
+fn responses_assistant_items(message: &Message) -> Vec<Value> {
+    if let Some(ProviderState::OpenAiResponses { output }) = &message.provider_state
+        && normalized_responses_output(output).is_ok_and(|(normalized_content, tool_calls)| {
+            normalized_content == message.content && tool_calls == message.tool_calls
+        })
+    {
+        return output.clone();
     }
+
+    let mut input = match &message.provider_state {
+        Some(ProviderState::OpenAiResponses { output }) => output
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("message" | "function_call")
+                )
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    if message.content.is_some() {
+        input.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": response_content(message.content.as_ref(), true)
+        }));
+    }
+    input.extend(message.tool_calls.iter().map(|call| {
+        json!({
+            "type": "function_call",
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": call.arguments.to_string()
+        })
+    }));
+    input
 }
 
-fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
-    let usage = response.get("usage").and_then(|usage| {
-        let input = usage.get("input_tokens")?.as_u64()?;
-        let output = usage.get("output_tokens")?.as_u64()?;
-        let total = usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| input.saturating_add(output));
-        let cached = usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        Some(TokenUsage::with_total(input, output, total, cached))
-    });
-    let output = response["output"]
-        .as_array()
-        .ok_or_else(|| ProviderError::InvalidResponse("output is not an array".to_owned()))?;
-    let raw_output = output.clone();
+fn normalized_responses_output(
+    output: &[Value],
+) -> Result<(Option<Content>, Vec<ToolCall>), ProviderError> {
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     for item in output {
@@ -361,7 +422,40 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
         }
     }
 
-    let content = (!text.is_empty()).then(|| Content::text(text.join("")));
+    Ok((
+        (!text.is_empty()).then(|| Content::text(text.join(""))),
+        tool_calls,
+    ))
+}
+
+fn response_tool_output(content: Option<&Content>) -> Value {
+    match content {
+        None => json!(""),
+        Some(Content::Text(text)) => json!(text),
+        Some(content) => Value::Array(response_content(Some(content), false)),
+    }
+}
+
+fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
+    let usage = response.get("usage").and_then(|usage| {
+        let input = usage.get("input_tokens")?.as_u64()?;
+        let output = usage.get("output_tokens")?.as_u64()?;
+        let total = usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| input.saturating_add(output));
+        let cached = usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Some(TokenUsage::with_total(input, output, total, cached))
+    });
+    let output = response["output"]
+        .as_array()
+        .ok_or_else(|| ProviderError::InvalidResponse("output is not an array".to_owned()))?;
+    let raw_output = output.clone();
+    let (content, tool_calls) = normalized_responses_output(output)?;
     if content.is_none() && tool_calls.is_empty() {
         return Err(ProviderError::InvalidResponse(
             "response contains neither output text nor function calls".to_owned(),
@@ -382,7 +476,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::{GenerationConfig, Message, ReasoningEffort, ToolDefinition};
+    use crate::types::{Document, GenerationConfig, Message, ReasoningEffort, ToolDefinition};
+
+    #[test]
+    fn debug_redacts_api_key_and_accepts_an_injected_http_client() {
+        let provider = OpenAiResponsesProvider::new_with_client(
+            reqwest::Client::new(),
+            "super-secret-responses-key",
+            "https://example.com/v1",
+            "model",
+        )
+        .unwrap();
+
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("super-secret-responses-key"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn maps_normalized_request_to_responses_items() {
@@ -406,6 +515,7 @@ mod tests {
                 json!({"type": "object"}),
             )],
             config: GenerationConfig {
+                model: Some("request-model".to_owned()),
                 temperature: Some(0.1),
                 max_tokens: Some(99),
                 reasoning_effort: Some(ReasoningEffort::XHigh),
@@ -413,6 +523,7 @@ mod tests {
         };
 
         let body = provider.request_body(&request).unwrap();
+        assert_eq!(body["model"], "request-model");
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["max_output_tokens"], 99);
@@ -420,6 +531,86 @@ mod tests {
         assert_eq!(body["input"][1]["type"], "function_call");
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn maps_data_and_url_documents_to_responses_input_files() {
+        let provider =
+            OpenAiResponsesProvider::new("key", "https://example.com/v1", "model").unwrap();
+        let request = ProviderRequest {
+            messages: vec![Message::user_parts([
+                ContentPart::text("inspect"),
+                ContentPart::document(Document::from_bytes(
+                    "inline.pdf",
+                    "application/pdf",
+                    b"%PDF-inline",
+                )),
+                ContentPart::document(Document::new(
+                    "remote.pdf",
+                    "application/pdf",
+                    "https://example.com/remote.pdf",
+                )),
+            ])],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        };
+
+        let body = provider.request_body(&request).unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "input_file",
+                "filename": "inline.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi1pbmxpbmU="
+            })
+        );
+        assert_eq!(
+            content[2],
+            json!({
+                "type": "input_file",
+                "file_url": "https://example.com/remote.pdf"
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_rich_tool_outputs_for_responses() {
+        let provider =
+            OpenAiResponsesProvider::new("key", "https://example.com/v1", "model").unwrap();
+        let request = ProviderRequest {
+            messages: vec![
+                Message::assistant(None, vec![ToolCall::new("call-1", "read", json!({}))]),
+                Message::tool_result_content(
+                    "call-1",
+                    Content::parts([
+                        ContentPart::text("result summary"),
+                        ContentPart::image_url("data:image/png;base64,cG5n"),
+                        ContentPart::document(Document::from_bytes(
+                            "result.pdf",
+                            "application/pdf",
+                            b"pdf",
+                        )),
+                    ]),
+                    false,
+                    None,
+                ),
+            ],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        };
+
+        let body = provider.request_body(&request).unwrap();
+        let output = body["input"][1]["output"].as_array().unwrap();
+        assert_eq!(
+            output[0],
+            json!({ "type": "input_text", "text": "result summary" })
+        );
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,cG5n");
+        assert_eq!(output[2]["type"], "input_file");
+        assert_eq!(output[2]["filename"], "result.pdf");
+        assert_eq!(output[2]["file_data"], "data:application/pdf;base64,cGRm");
     }
 
     #[test]
@@ -454,6 +645,57 @@ mod tests {
     }
 
     #[test]
+    fn normalized_assistant_fields_override_stale_responses_output_items() {
+        let provider =
+            OpenAiResponsesProvider::new("key", "https://example.com/v1", "model").unwrap();
+        let mut assistant = Message::assistant(
+            Some(Content::text("hooked answer")),
+            vec![ToolCall::new(
+                "hooked-call",
+                "echo",
+                json!({"text": "hooked"}),
+            )],
+        );
+        assistant.provider_state = Some(ProviderState::OpenAiResponses {
+            output: vec![
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque"
+                }),
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "stale answer" }]
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "stale-call",
+                    "name": "stale-tool",
+                    "arguments": "{\"text\":\"stale\"}"
+                }),
+            ],
+        });
+        let request = ProviderRequest {
+            messages: vec![assistant],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        };
+
+        let body = provider.request_body(&request).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "opaque");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "hooked answer");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "hooked-call");
+        assert_eq!(input[2]["name"], "echo");
+        assert_eq!(input[2]["arguments"], "{\"text\":\"hooked\"}");
+    }
+
+    #[test]
     fn replays_reasoning_items_for_ordinary_assistant_turns() {
         let provider =
             OpenAiResponsesProvider::new("key", "https://example.com/v1", "model").unwrap();
@@ -466,8 +708,14 @@ mod tests {
                 },
                 {
                     "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
                     "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "answer" }]
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": [{ "type": "opaque_annotation", "value": "kept" }]
+                    }]
                 }
             ]
         }))
@@ -481,6 +729,12 @@ mod tests {
         let body = provider.request_body(&request).unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["id"], "msg_1");
+        assert_eq!(body["input"][1]["status"], "completed");
+        assert_eq!(
+            body["input"][1]["content"][0]["annotations"],
+            json!([{ "type": "opaque_annotation", "value": "kept" }])
+        );
         assert_eq!(body["input"][2]["role"], "user");
     }
 

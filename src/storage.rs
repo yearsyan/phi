@@ -2,8 +2,11 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -15,7 +18,10 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 
-use crate::types::{Message, TokenUsage};
+use crate::{
+    tool::AgentMode,
+    types::{Message, TokenUsage},
+};
 
 const DISK_FORMAT_VERSION: u32 = 1;
 const MAX_SESSION_ID_BYTES: usize = 180;
@@ -28,6 +34,12 @@ pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub last_usage: Option<TokenUsage>,
     pub cumulative_usage: TokenUsage,
+    /// Execution mode restored when this session is resumed.
+    ///
+    /// The default preserves compatibility with snapshots written before
+    /// modes were introduced.
+    #[serde(default)]
+    pub mode: AgentMode,
 }
 
 impl SessionSnapshot {
@@ -39,6 +51,7 @@ impl SessionSnapshot {
             messages,
             last_usage: None,
             cumulative_usage: TokenUsage::default(),
+            mode: AgentMode::default(),
         })
     }
 }
@@ -71,6 +84,9 @@ pub enum StorageError {
 
     #[error("stored session ID {actual:?} does not match requested ID {expected:?}")]
     SessionIdMismatch { expected: String, actual: String },
+
+    #[error("invalid transcript for session {session_id:?}: {message}")]
+    InvalidTranscript { session_id: String, message: String },
 }
 
 /// Persistence boundary for normalized session snapshots.
@@ -79,6 +95,34 @@ pub trait SessionStorage: Send + Sync {
     async fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, StorageError>;
 
     async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError>;
+
+    /// Persists a snapshot whose first `previous_message_count` messages are
+    /// already durable and unchanged.
+    ///
+    /// The default implementation preserves compatibility with snapshot-only
+    /// stores. Append-oriented stores can override this method to avoid
+    /// re-reading and comparing the complete transcript on every checkpoint.
+    async fn save_incremental(
+        &self,
+        session: &SessionSnapshot,
+        previous_message_count: usize,
+    ) -> Result<(), StorageError> {
+        let _ = previous_message_count;
+        self.save(session).await
+    }
+
+    /// Persists a snapshot whose first `unchanged_message_count` messages are
+    /// already durable and unchanged, replacing only the transcript tail.
+    ///
+    /// Snapshot-only stores may use the default full-save implementation.
+    async fn save_replacing_from(
+        &self,
+        session: &SessionSnapshot,
+        unchanged_message_count: usize,
+    ) -> Result<(), StorageError> {
+        let _ = unchanged_message_count;
+        self.save(session).await
+    }
 
     async fn delete(&self, session_id: &str) -> Result<(), StorageError>;
 }
@@ -94,6 +138,26 @@ where
 
     async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError> {
         (**self).save(session).await
+    }
+
+    async fn save_incremental(
+        &self,
+        session: &SessionSnapshot,
+        previous_message_count: usize,
+    ) -> Result<(), StorageError> {
+        (**self)
+            .save_incremental(session, previous_message_count)
+            .await
+    }
+
+    async fn save_replacing_from(
+        &self,
+        session: &SessionSnapshot,
+        unchanged_message_count: usize,
+    ) -> Result<(), StorageError> {
+        (**self)
+            .save_replacing_from(session, unchanged_message_count)
+            .await
     }
 
     async fn delete(&self, session_id: &str) -> Result<(), StorageError> {
@@ -140,14 +204,20 @@ impl SessionStorage for InMemorySessionStorage {
 #[derive(Clone, Debug)]
 pub struct DiskSessionStorage {
     root: PathBuf,
-    io_lock: Arc<Mutex<()>>,
+    io_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    cursors: Arc<Mutex<HashMap<String, LogCursor>>>,
+    #[cfg(test)]
+    fail_next_post_write_sync: Arc<AtomicBool>,
 }
 
 impl DiskSessionStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            io_lock: Arc::new(Mutex::new(())),
+            io_locks: Arc::new(Mutex::new(HashMap::new())),
+            cursors: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            fail_next_post_write_sync: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -159,6 +229,33 @@ impl DiskSessionStorage {
         validate_session_id(session_id)?;
         let encoded = URL_SAFE_NO_PAD.encode(session_id.as_bytes());
         Ok(self.root.join(format!("session-{encoded}.jsonl")))
+    }
+
+    async fn session_io_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.io_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(session_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn inject_post_write_sync_failure(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fail_next_post_write_sync.swap(false, Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_post_write_sync(&self) {
+        self.fail_next_post_write_sync.store(true, Ordering::SeqCst);
     }
 }
 
@@ -185,11 +282,20 @@ enum StoredSessionEventRef<'a> {
         messages: &'a [Message],
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
+        mode: AgentMode,
     },
     Replace {
         messages: &'a [Message],
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
+        mode: AgentMode,
+    },
+    ReplaceTail {
+        from: usize,
+        messages: &'a [Message],
+        last_usage: Option<TokenUsage>,
+        cumulative_usage: TokenUsage,
+        mode: AgentMode,
     },
 }
 
@@ -200,31 +306,88 @@ enum StoredSessionEvent {
         messages: Vec<Message>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
+        #[serde(default)]
+        mode: AgentMode,
     },
     Replace {
         messages: Vec<Message>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
+        #[serde(default)]
+        mode: AgentMode,
+    },
+    ReplaceTail {
+        from: usize,
+        messages: Vec<Message>,
+        last_usage: Option<TokenUsage>,
+        cumulative_usage: TokenUsage,
+        #[serde(default)]
+        mode: AgentMode,
     },
 }
 
 struct ParsedLog {
     snapshot: Option<SessionSnapshot>,
     valid_len: usize,
+    file_len: usize,
     ends_with_newline: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LogCursor {
+    message_count: usize,
+    last_usage: Option<TokenUsage>,
+    cumulative_usage: TokenUsage,
+    mode: AgentMode,
+    valid_len: usize,
+    file_len: usize,
+    ends_with_newline: bool,
+}
+
+impl LogCursor {
+    fn from_parsed(parsed: &ParsedLog) -> Self {
+        let (message_count, last_usage, cumulative_usage, mode) = parsed
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot.messages.len(),
+                    snapshot.last_usage,
+                    snapshot.cumulative_usage,
+                    snapshot.mode,
+                )
+            })
+            .unwrap_or((0, None, TokenUsage::default(), AgentMode::default()));
+        Self {
+            message_count,
+            last_usage,
+            cumulative_usage,
+            mode,
+            valid_len: parsed.valid_len,
+            file_len: parsed.file_len,
+            ends_with_newline: parsed.ends_with_newline,
+        }
+    }
 }
 
 #[async_trait]
 impl SessionStorage for DiskSessionStorage {
     async fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, StorageError> {
-        let _guard = self.io_lock.lock().await;
-        Ok(read_log(&self.session_path(session_id)?, session_id)
-            .await?
-            .snapshot)
+        validate_session_id(session_id)?;
+        let lock = self.session_io_lock(session_id).await;
+        let _guard = lock.lock().await;
+        let parsed = read_log(&self.session_path(session_id)?, session_id).await?;
+        self.cursors
+            .lock()
+            .await
+            .insert(session_id.to_owned(), LogCursor::from_parsed(&parsed));
+        Ok(parsed.snapshot)
     }
 
     async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError> {
-        let _guard = self.io_lock.lock().await;
+        validate_session_id(&session.id)?;
+        let lock = self.session_io_lock(&session.id).await;
+        let _guard = lock.lock().await;
         let path = self.session_path(&session.id)?;
         fs::create_dir_all(&self.root)
             .await
@@ -236,59 +399,328 @@ impl SessionStorage for DiskSessionStorage {
                     messages: &session.messages[previous.messages.len()..],
                     last_usage: session.last_usage,
                     cumulative_usage: session.cumulative_usage,
+                    mode: session.mode,
                 }
             }
             _ => StoredSessionEventRef::Replace {
                 messages: &session.messages,
                 last_usage: session.last_usage,
                 cumulative_usage: session.cumulative_usage,
+                mode: session.mode,
             },
         };
-        let mut bytes = serde_json::to_vec(&StoredSessionRecordRef {
-            format_version: DISK_FORMAT_VERSION,
-            session_id: &session.id,
+        let prior_message_count = parsed
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.messages.len());
+        let cursor = append_record(
+            &path,
+            &session.id,
             event,
-        })?;
-        bytes.push(b'\n');
+            &parsed,
+            prior_message_count,
+            self.inject_post_write_sync_failure(),
+        )
+        .await?;
+        self.cursors.lock().await.insert(session.id.clone(), cursor);
+        Ok(())
+    }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|source| io_error(path.clone(), source))?;
-        let file_len = file
-            .metadata()
-            .await
-            .map_err(|source| io_error(path.clone(), source))?
-            .len() as usize;
-        if parsed.valid_len < file_len {
-            file.set_len(parsed.valid_len as u64)
-                .await
-                .map_err(|source| io_error(path.clone(), source))?;
+    async fn save_incremental(
+        &self,
+        session: &SessionSnapshot,
+        previous_message_count: usize,
+    ) -> Result<(), StorageError> {
+        validate_session_id(&session.id)?;
+        if previous_message_count > session.messages.len() {
+            return Err(StorageError::InvalidTranscript {
+                session_id: session.id.clone(),
+                message: format!(
+                    "incremental save starts at message {previous_message_count}, but the snapshot contains only {} messages",
+                    session.messages.len()
+                ),
+            });
         }
-        if parsed.valid_len > 0 && !parsed.ends_with_newline {
-            file.write_all(b"\n")
-                .await
-                .map_err(|source| io_error(path.clone(), source))?;
+
+        let lock = self.session_io_lock(&session.id).await;
+        let _guard = lock.lock().await;
+        let path = self.session_path(&session.id)?;
+        fs::create_dir_all(&self.root)
+            .await
+            .map_err(|source| io_error(self.root.clone(), source))?;
+
+        let actual_file_len = match fs::metadata(&path).await {
+            Ok(metadata) => metadata.len() as usize,
+            Err(source) if source.kind() == ErrorKind::NotFound => 0,
+            Err(source) => return Err(io_error(path.clone(), source)),
+        };
+        let cached = self.cursors.lock().await.get(&session.id).copied();
+        let cursor = match cached {
+            Some(cursor)
+                if cursor.file_len == actual_file_len
+                    && cursor.message_count == previous_message_count =>
+            {
+                cursor
+            }
+            _ => {
+                let parsed = read_log(&path, &session.id).await?;
+                let cursor = LogCursor::from_parsed(&parsed);
+                if cursor.message_count != previous_message_count {
+                    return Err(StorageError::InvalidTranscript {
+                        session_id: session.id.clone(),
+                        message: format!(
+                            "incremental save expected {previous_message_count} durable messages, but storage contains {}",
+                            cursor.message_count
+                        ),
+                    });
+                }
+                cursor
+            }
+        };
+
+        if previous_message_count == session.messages.len()
+            && cursor.last_usage == session.last_usage
+            && cursor.cumulative_usage == session.cumulative_usage
+            && cursor.mode == session.mode
+            && cursor.valid_len == cursor.file_len
+        {
+            return Ok(());
         }
-        file.write_all(&bytes)
+
+        let parsed = ParsedLog {
+            snapshot: None,
+            valid_len: cursor.valid_len,
+            file_len: cursor.file_len,
+            ends_with_newline: cursor.ends_with_newline,
+        };
+        let event = StoredSessionEventRef::Append {
+            messages: &session.messages[previous_message_count..],
+            last_usage: session.last_usage,
+            cumulative_usage: session.cumulative_usage,
+            mode: session.mode,
+        };
+        let cursor = append_record(
+            &path,
+            &session.id,
+            event,
+            &parsed,
+            previous_message_count,
+            self.inject_post_write_sync_failure(),
+        )
+        .await?;
+        self.cursors.lock().await.insert(session.id.clone(), cursor);
+        Ok(())
+    }
+
+    async fn save_replacing_from(
+        &self,
+        session: &SessionSnapshot,
+        unchanged_message_count: usize,
+    ) -> Result<(), StorageError> {
+        validate_session_id(&session.id)?;
+        if unchanged_message_count > session.messages.len() {
+            return Err(StorageError::InvalidTranscript {
+                session_id: session.id.clone(),
+                message: format!(
+                    "tail replacement starts at message {unchanged_message_count}, but the snapshot contains only {} messages",
+                    session.messages.len()
+                ),
+            });
+        }
+
+        let lock = self.session_io_lock(&session.id).await;
+        let _guard = lock.lock().await;
+        let path = self.session_path(&session.id)?;
+        fs::create_dir_all(&self.root)
             .await
-            .map_err(|source| io_error(path.clone(), source))?;
-        file.sync_all()
-            .await
-            .map_err(|source| io_error(path, source))
+            .map_err(|source| io_error(self.root.clone(), source))?;
+        let actual_file_len = match fs::metadata(&path).await {
+            Ok(metadata) => metadata.len() as usize,
+            Err(source) if source.kind() == ErrorKind::NotFound => 0,
+            Err(source) => return Err(io_error(path.clone(), source)),
+        };
+        let cached = self.cursors.lock().await.get(&session.id).copied();
+        let cursor = match cached {
+            Some(cursor) if cursor.file_len == actual_file_len => cursor,
+            _ => {
+                let parsed = read_log(&path, &session.id).await?;
+                LogCursor::from_parsed(&parsed)
+            }
+        };
+        if unchanged_message_count > cursor.message_count {
+            return Err(StorageError::InvalidTranscript {
+                session_id: session.id.clone(),
+                message: format!(
+                    "tail replacement keeps {unchanged_message_count} messages, but storage contains only {}",
+                    cursor.message_count
+                ),
+            });
+        }
+
+        let parsed = ParsedLog {
+            snapshot: None,
+            valid_len: cursor.valid_len,
+            file_len: cursor.file_len,
+            ends_with_newline: cursor.ends_with_newline,
+        };
+        let event = StoredSessionEventRef::ReplaceTail {
+            from: unchanged_message_count,
+            messages: &session.messages[unchanged_message_count..],
+            last_usage: session.last_usage,
+            cumulative_usage: session.cumulative_usage,
+            mode: session.mode,
+        };
+        let cursor = append_record(
+            &path,
+            &session.id,
+            event,
+            &parsed,
+            cursor.message_count,
+            self.inject_post_write_sync_failure(),
+        )
+        .await?;
+        self.cursors.lock().await.insert(session.id.clone(), cursor);
+        Ok(())
     }
 
     async fn delete(&self, session_id: &str) -> Result<(), StorageError> {
-        let _guard = self.io_lock.lock().await;
+        validate_session_id(session_id)?;
+        let lock = self.session_io_lock(session_id).await;
+        let _guard = lock.lock().await;
         let path = self.session_path(session_id)?;
-        match fs::remove_file(&path).await {
+        let result = match fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
             Err(source) => Err(io_error(path, source)),
+        };
+        if result.is_ok() {
+            self.cursors.lock().await.remove(session_id);
+        }
+        result
+    }
+}
+
+async fn append_record(
+    path: &Path,
+    session_id: &str,
+    event: StoredSessionEventRef<'_>,
+    parsed: &ParsedLog,
+    prior_message_count: usize,
+    inject_post_write_sync_failure: bool,
+) -> Result<LogCursor, StorageError> {
+    let (message_count, last_usage, cumulative_usage, mode) = match &event {
+        StoredSessionEventRef::Append {
+            messages,
+            last_usage,
+            cumulative_usage,
+            mode,
+        } => (
+            prior_message_count + messages.len(),
+            *last_usage,
+            *cumulative_usage,
+            *mode,
+        ),
+        StoredSessionEventRef::Replace {
+            messages,
+            last_usage,
+            cumulative_usage,
+            mode,
+        } => (messages.len(), *last_usage, *cumulative_usage, *mode),
+        StoredSessionEventRef::ReplaceTail {
+            from,
+            messages,
+            last_usage,
+            cumulative_usage,
+            mode,
+        } => (from + messages.len(), *last_usage, *cumulative_usage, *mode),
+    };
+    let mut bytes = serde_json::to_vec(&StoredSessionRecordRef {
+        format_version: DISK_FORMAT_VERSION,
+        session_id,
+        event,
+    })?;
+    bytes.push(b'\n');
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|source| io_error(path.to_owned(), source))?;
+    let file_len = file
+        .metadata()
+        .await
+        .map_err(|source| io_error(path.to_owned(), source))?
+        .len() as usize;
+    if parsed.valid_len < file_len {
+        file.set_len(parsed.valid_len as u64)
+            .await
+            .map_err(|source| io_error(path.to_owned(), source))?;
+    }
+    let separator_len = usize::from(parsed.valid_len > 0 && !parsed.ends_with_newline);
+    if separator_len > 0 {
+        file.write_all(b"\n")
+            .await
+            .map_err(|source| io_error(path.to_owned(), source))?;
+    }
+    file.write_all(&bytes)
+        .await
+        .map_err(|source| io_error(path.to_owned(), source))?;
+    let sync_result = if inject_post_write_sync_failure {
+        Err(std::io::Error::other(
+            "injected session journal sync failure after write",
+        ))
+    } else {
+        file.sync_all().await
+    };
+    if let Err(source) = sync_result {
+        // A sync error is reported after write_all's logical commit point. The
+        // complete record may therefore already be visible in the journal. If
+        // callers rolled their in-memory checkpoint back unconditionally while
+        // the file kept this record, a restart could restore a different mode
+        // or tool outcome. Reconcile the exact appended bytes before deciding
+        // whether this operation failed. This rare error path may read the
+        // complete log; ordinary checkpoints remain append-only.
+        drop(file);
+        if !appended_record_is_complete(path, parsed.valid_len, separator_len, &bytes).await {
+            return Err(io_error(path.to_owned(), source));
         }
     }
+
+    let file_len = parsed.valid_len + separator_len + bytes.len();
+    Ok(LogCursor {
+        message_count,
+        last_usage,
+        cumulative_usage,
+        mode,
+        valid_len: file_len,
+        file_len,
+        ends_with_newline: true,
+    })
+}
+
+async fn appended_record_is_complete(
+    path: &Path,
+    valid_len: usize,
+    separator_len: usize,
+    record: &[u8],
+) -> bool {
+    let Ok(bytes) = fs::read(path).await else {
+        return false;
+    };
+    let Some(record_start) = valid_len.checked_add(separator_len) else {
+        return false;
+    };
+    let Some(expected_len) = record_start.checked_add(record.len()) else {
+        return false;
+    };
+    if bytes.len() != expected_len {
+        return false;
+    }
+    if separator_len == 1 && bytes.get(valid_len) != Some(&b'\n') {
+        return false;
+    }
+    bytes.get(record_start..expected_len) == Some(record)
 }
 
 async fn read_log(path: &Path, session_id: &str) -> Result<ParsedLog, StorageError> {
@@ -298,6 +730,7 @@ async fn read_log(path: &Path, session_id: &str) -> Result<ParsedLog, StorageErr
             return Ok(ParsedLog {
                 snapshot: None,
                 valid_len: 0,
+                file_len: 0,
                 ends_with_newline: true,
             });
         }
@@ -347,7 +780,7 @@ async fn read_log(path: &Path, session_id: &str) -> Result<ParsedLog, StorageErr
                 actual: record.session_id,
             });
         }
-        apply_record(&mut snapshot, session_id, record.event);
+        apply_record(&mut snapshot, session_id, record.event)?;
         valid_len = offset + segment.len();
         ends_with_newline = terminated;
         offset += segment.len();
@@ -356,6 +789,7 @@ async fn read_log(path: &Path, session_id: &str) -> Result<ParsedLog, StorageErr
     Ok(ParsedLog {
         snapshot,
         valid_len,
+        file_len: bytes.len(),
         ends_with_newline,
     })
 }
@@ -364,36 +798,71 @@ fn apply_record(
     snapshot: &mut Option<SessionSnapshot>,
     session_id: &str,
     event: StoredSessionEvent,
-) {
+) -> Result<(), StorageError> {
     match event {
         StoredSessionEvent::Append {
             messages,
             last_usage,
             cumulative_usage,
+            mode,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
                 messages: Vec::new(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
+                mode: AgentMode::default(),
             });
             session.messages.extend(messages);
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
+            session.mode = mode;
         }
         StoredSessionEvent::Replace {
             messages,
             last_usage,
             cumulative_usage,
+            mode,
         } => {
             *snapshot = Some(SessionSnapshot {
                 id: session_id.to_owned(),
                 messages,
                 last_usage,
                 cumulative_usage,
+                mode,
             });
         }
+        StoredSessionEvent::ReplaceTail {
+            from,
+            messages,
+            last_usage,
+            cumulative_usage,
+            mode,
+        } => {
+            let session = snapshot.get_or_insert_with(|| SessionSnapshot {
+                id: session_id.to_owned(),
+                messages: Vec::new(),
+                last_usage: None,
+                cumulative_usage: TokenUsage::default(),
+                mode: AgentMode::default(),
+            });
+            if from > session.messages.len() {
+                return Err(StorageError::InvalidTranscript {
+                    session_id: session_id.to_owned(),
+                    message: format!(
+                        "tail replacement keeps {from} messages, but only {} have been stored",
+                        session.messages.len()
+                    ),
+                });
+            }
+            session.messages.truncate(from);
+            session.messages.extend(messages);
+            session.last_usage = last_usage;
+            session.cumulative_usage = cumulative_usage;
+            session.mode = mode;
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), StorageError> {
@@ -430,6 +899,7 @@ mod tests {
             ])],
             last_usage: Some(TokenUsage::new(10, 2, 1)),
             cumulative_usage: TokenUsage::new(20, 5, 2),
+            mode: AgentMode::Plan,
         }
     }
 
@@ -445,6 +915,44 @@ mod tests {
         );
         storage.delete(&session.id).await.unwrap();
         assert_eq!(storage.load(&session.id).await.unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_mode_defaults_to_normal_execution() {
+        let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "messages": [],
+            "last_usage": null,
+            "cumulative_usage": TokenUsage::default()
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.mode, AgentMode::Default);
+    }
+
+    #[tokio::test]
+    async fn legacy_disk_record_without_mode_still_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let path = storage.session_path("legacy-disk").unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "format_version": DISK_FORMAT_VERSION,
+                    "session_id": "legacy-disk",
+                    "type": "replace",
+                    "messages": [],
+                    "last_usage": null,
+                    "cumulative_usage": TokenUsage::default()
+                })
+            ),
+        )
+        .unwrap();
+
+        let snapshot = storage.load("legacy-disk").await.unwrap().unwrap();
+        assert_eq!(snapshot.mode, AgentMode::Default);
     }
 
     #[tokio::test]
@@ -534,5 +1042,129 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         storage.delete(&session.id).await.unwrap();
         assert_eq!(storage.load(&session.id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn disk_incremental_save_appends_deltas_and_repairs_partial_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let mut session = SessionSnapshot::new("incremental", vec![Message::user("one")]).unwrap();
+
+        storage.save_incremental(&session, 0).await.unwrap();
+        session.messages.push(Message::assistant(
+            Some(crate::types::Content::text("two")),
+            Vec::new(),
+        ));
+        storage.save_incremental(&session, 1).await.unwrap();
+
+        let path = storage.session_path(&session.id).unwrap();
+        let records = std::fs::read_to_string(&path).unwrap();
+        let records = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record["type"] == "append"));
+        assert_eq!(records[0]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(records[1]["messages"].as_array().unwrap().len(), 1);
+
+        // An unchanged checkpoint is a no-op rather than an empty log record.
+        storage.save_incremental(&session, 2).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"partial\":")
+            .unwrap();
+        session.messages.push(Message::user("three"));
+        storage.save_incremental(&session, 2).await.unwrap();
+
+        assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
+        let records = std::fs::read_to_string(path).unwrap();
+        assert_eq!(records.lines().count(), 3);
+        assert!(
+            records
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_tail_replacement_does_not_repeat_the_unchanged_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let mut session = SessionSnapshot::new(
+            "replace-tail",
+            vec![
+                Message::user("prompt"),
+                Message::assistant(
+                    None,
+                    vec![crate::types::ToolCall::new(
+                        "call-1",
+                        "side_effect",
+                        serde_json::json!({}),
+                    )],
+                ),
+                Message::tool_result("call-1", "outcome unknown", true),
+            ],
+        )
+        .unwrap();
+        storage.save_incremental(&session, 0).await.unwrap();
+
+        session.messages[2] = Message::tool_result("call-1", "completed", false);
+        storage.save_replacing_from(&session, 1).await.unwrap();
+
+        assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
+        let path = storage.session_path("replace-tail").unwrap();
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["type"], "append");
+        assert_eq!(records[1]["type"], "replace_tail");
+        assert_eq!(records[1]["from"], 1);
+        assert_eq!(records[1]["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_write_sync_error_keeps_a_complete_tail_replacement_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let mut session = SessionSnapshot::new(
+            "post-write-sync",
+            vec![
+                Message::user("approve"),
+                Message::assistant(
+                    None,
+                    vec![crate::types::ToolCall::new(
+                        "call-exit",
+                        "exit_plan_mode",
+                        serde_json::json!({}),
+                    )],
+                ),
+                Message::tool_result("call-exit", "outcome unknown", true),
+            ],
+        )
+        .unwrap();
+        session.mode = AgentMode::Plan;
+        storage.save_incremental(&session, 0).await.unwrap();
+
+        session.messages[2] = Message::tool_result("call-exit", "approved", false);
+        session.mode = AgentMode::Default;
+        storage.fail_next_post_write_sync();
+        storage.save_replacing_from(&session, 1).await.unwrap();
+
+        // Reopen through a new storage instance so the assertion observes only
+        // the journal, not the writer's in-memory cursor.
+        let reopened = DiskSessionStorage::new(directory.path());
+        assert_eq!(
+            reopened.load(&session.id).await.unwrap(),
+            Some(session),
+            "a complete post-write record must not be rolled back in memory while remaining visible after restart"
+        );
     }
 }

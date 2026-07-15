@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt, ops::AddAssign, time::Duration};
+use std::{collections::BTreeMap, fmt, ops::AddAssign, str::FromStr, time::Duration};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,7 +13,7 @@ pub enum Role {
 }
 
 /// Provider-neutral text or multimodal message content.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Content {
     Text(String),
@@ -63,11 +63,12 @@ impl From<&str> for Content {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
+    Document { document: Document },
 }
 
 impl ContentPart {
@@ -83,25 +84,63 @@ impl ContentPart {
         Self::ImageUrl { image_url }
     }
 
+    pub fn document(document: Document) -> Self {
+        Self::Document { document }
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
-            Self::ImageUrl { .. } => None,
+            Self::ImageUrl { .. } | Self::Document { .. } => None,
         }
     }
 
     fn into_text(self) -> Option<String> {
         match self {
             Self::Text { text } => Some(text),
-            Self::ImageUrl { .. } => None,
+            Self::ImageUrl { .. } | Self::Document { .. } => None,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
     pub detail: Option<ImageDetail>,
+}
+
+/// A provider-neutral document attachment.
+///
+/// `data` is either a data URL or a provider-supported remote URL. Keeping the
+/// filename and media type explicit lets adapters map the same block to their
+/// native file/document representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Document {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl Document {
+    pub fn new(
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            data: data.into(),
+        }
+    }
+
+    pub fn from_bytes(filename: impl Into<String>, mime_type: &str, bytes: &[u8]) -> Self {
+        Self::new(
+            filename,
+            mime_type,
+            format!("data:{mime_type};base64,{}", STANDARD.encode(bytes)),
+        )
+    }
 }
 
 impl ImageUrl {
@@ -151,8 +190,13 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
     pub tool_result_is_error: bool,
-    /// Opaque response state that must be replayed unmodified to the same API
-    /// adapter. Applications should retain this value when copying messages.
+    /// Optional machine-readable output from a tool. Providers ignore this
+    /// field; session storage and public runtime APIs retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_metadata: Option<Value>,
+    /// Provider response state used to preserve opaque reasoning data on
+    /// replay. Applications should retain it when copying messages; normalized
+    /// `content` and `tool_calls` remain authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<ProviderState>,
 }
@@ -173,6 +217,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_result_is_error: false,
+            tool_result_metadata: None,
             provider_state: None,
         }
     }
@@ -188,6 +233,7 @@ impl Message {
             tool_calls,
             tool_call_id: None,
             tool_result_is_error: false,
+            tool_result_metadata: None,
             provider_state: None,
         }
     }
@@ -201,12 +247,22 @@ impl Message {
         content: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        Self::tool_result_content(tool_call_id, Content::text(content), is_error, None)
+    }
+
+    pub fn tool_result_content(
+        tool_call_id: impl Into<String>,
+        content: Content,
+        is_error: bool,
+        metadata: Option<Value>,
+    ) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(Content::text(content)),
+            content: Some(content),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             tool_result_is_error: is_error,
+            tool_result_metadata: metadata,
             provider_state: None,
         }
     }
@@ -222,14 +278,17 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_result_is_error: false,
+            tool_result_metadata: None,
             provider_state: None,
         }
     }
 }
 
-/// Provider-specific assistant response data needed for lossless multi-turn
-/// replay. The payload is serialized with sessions but redacted from `Debug`
-/// output so reasoning text is not printed accidentally.
+/// Provider-specific assistant response data needed for multi-turn replay.
+/// Adapters retain opaque items from this payload while rebuilding public text
+/// and tool calls from the normalized message fields. The payload is serialized
+/// with sessions but redacted from `Debug` output so reasoning text is not
+/// printed accidentally.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum ProviderState {
@@ -413,6 +472,7 @@ impl AssistantMessage {
             tool_calls: self.tool_calls,
             tool_call_id: None,
             tool_result_is_error: false,
+            tool_result_metadata: None,
             provider_state: self.provider_state,
         }
     }
@@ -436,10 +496,17 @@ impl ToolDefinition {
 }
 
 /// Generation settings understood by the agent core and mapped by each adapter.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerationConfig {
+    /// Per-request model override. When omitted, providers use the model they
+    /// were constructed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -447,7 +514,8 @@ pub struct GenerationConfig {
 ///
 /// Provider and model support varies. Adapters map levels that their target
 /// protocol cannot represent to the closest supported intensity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
     Minimal,
@@ -456,6 +524,38 @@ pub enum ReasoningEffort {
     High,
     XHigh,
     Max,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseReasoningEffortError {
+    value: String,
+}
+
+impl fmt::Display for ParseReasoningEffortError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown reasoning effort {:?}", self.value)
+    }
+}
+
+impl std::error::Error for ParseReasoningEffortError {}
+
+impl FromStr for ReasoningEffort {
+    type Err = ParseReasoningEffortError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            _ => Err(ParseReasoningEffortError {
+                value: value.to_owned(),
+            }),
+        }
+    }
 }
 
 impl ReasoningEffort {
@@ -510,13 +610,22 @@ pub enum AgentEvent {
     MessageUpdate {
         delta: AssistantDelta,
     },
+    /// The in-progress message announced by `MessageStart` was discarded and
+    /// must not be added to the transcript.
+    MessageAborted,
     ToolExecutionStart {
         call: ToolCall,
+    },
+    ToolExecutionProgress {
+        call: ToolCall,
+        progress: crate::tool::ToolProgress,
     },
     ToolExecutionEnd {
         call: ToolCall,
         content: String,
         is_error: bool,
+        content_parts: Vec<ContentPart>,
+        metadata: Option<Value>,
     },
     UsageUpdate {
         usage: TokenUsage,
@@ -527,6 +636,11 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+    },
+    /// A controlled run stopped after its last protocol-safe transcript state
+    /// was persisted.
+    AgentStopped {
+        messages: Vec<Message>,
     },
 }
 
@@ -539,6 +653,13 @@ pub struct AgentRun {
     pub run_usage: TokenUsage,
     /// Current conversation occupancy measured by the final provider response.
     pub context_usage: Option<ContextUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AgentRunOutcome {
+    Completed(AgentRun),
+    Stopped,
 }
 
 impl AgentRun {
@@ -566,6 +687,40 @@ mod tests {
         for (effort, expected) in cases {
             assert_eq!(effort.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn reasoning_effort_parses_and_serializes_with_wire_names() {
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(effort.as_str().parse::<ReasoningEffort>().unwrap(), effort);
+            assert_eq!(
+                serde_json::to_string(&effort).unwrap(),
+                format!("\"{}\"", effort.as_str())
+            );
+        }
+        assert!("unknown".parse::<ReasoningEffort>().is_err());
+    }
+
+    #[test]
+    fn generation_config_round_trips_a_model_override() {
+        let config = GenerationConfig {
+            model: Some("runtime-model".to_owned()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..GenerationConfig::default()
+        };
+
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: GenerationConfig = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, config);
     }
 
     #[test]

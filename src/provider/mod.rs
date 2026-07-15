@@ -19,8 +19,10 @@ use crate::{
 pub use anthropic::AnthropicMessagesProvider;
 pub use openai_chat::OpenAiChatProvider;
 pub use openai_responses::OpenAiResponsesProvider;
-pub use retry::{DEFAULT_MAX_RETRIES, RetryConfig};
-pub(crate) use retry::{HttpRequestEvent, send_with_retry};
+pub use retry::{
+    DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT, RetryConfig,
+};
+pub(crate) use retry::{HttpRequestEvent, next_stream_item, send_with_retry};
 
 pub(crate) type ExtraBody = Map<String, Value>;
 
@@ -101,9 +103,9 @@ pub(crate) fn text_only(message: &Message, label: &str) -> Result<String, Provid
             for part in parts {
                 match part {
                     ContentPart::Text { text: part } => text.push_str(part),
-                    ContentPart::ImageUrl { .. } => {
+                    ContentPart::ImageUrl { .. } | ContentPart::Document { .. } => {
                         return Err(ProviderError::InvalidRequest(format!(
-                            "{label} message cannot contain images"
+                            "{label} message cannot contain attachments"
                         )));
                     }
                 }

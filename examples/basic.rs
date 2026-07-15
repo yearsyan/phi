@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             messages: vec![Message::user(prompt)],
             tools: Vec::new(),
             config: GenerationConfig {
+                model: None,
                 temperature: None,
                 max_tokens: Some(4096),
                 reasoning_effort: None,

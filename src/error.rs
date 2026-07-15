@@ -75,14 +75,87 @@ pub enum ProviderError {
     #[error("provider stream failed: {0}")]
     Stream(String),
 
+    #[error("provider stream was idle for {timeout:?}")]
+    StreamIdleTimeout { timeout: Duration },
+
     #[error("provider API returned {status}: {body}")]
     Api { status: StatusCode, body: String },
+
+    /// The provider rejected a request because the model context window was
+    /// exceeded. Custom providers should return this variant when they can
+    /// classify the condition without relying on message matching.
+    #[error("provider context length exceeded: {message}")]
+    ContextLengthExceeded { message: String },
 
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
 
     #[error("provider hook failed: {0}")]
     Hook(#[from] HookError),
+}
+
+impl ProviderError {
+    pub fn context_length_exceeded(message: impl Into<String>) -> Self {
+        Self::ContextLengthExceeded {
+            message: message.into(),
+        }
+    }
+
+    /// Returns whether this error represents a provider context-window
+    /// rejection. Explicitly typed errors are preferred; API and stream error
+    /// bodies are also recognized for compatibility with common gateways.
+    pub fn is_context_length_exceeded(&self) -> bool {
+        match self {
+            Self::ContextLengthExceeded { .. } => true,
+            Self::Api { body, .. }
+            | Self::InvalidRequest(body)
+            | Self::Stream(body)
+            | Self::InvalidResponse(body) => looks_like_context_length_error(body),
+            Self::MissingApiKey
+            | Self::InvalidConfiguration(_)
+            | Self::Http(_)
+            | Self::RequestTimeout { .. }
+            | Self::StreamIdleTimeout { .. }
+            | Self::Hook(_) => false,
+        }
+    }
+
+    pub(crate) fn from_api_response(status: StatusCode, body: String) -> Self {
+        if looks_like_context_length_error(&body) {
+            Self::context_length_exceeded(format!("HTTP {status}: {body}"))
+        } else {
+            Self::Api { status, body }
+        }
+    }
+
+    pub(crate) fn from_stream_response_error(message: String) -> Self {
+        if looks_like_context_length_error(&message) {
+            Self::context_length_exceeded(message)
+        } else {
+            Self::InvalidResponse(message)
+        }
+    }
+}
+
+fn looks_like_context_length_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "exceeds the context window",
+        "exceeded the context window",
+        "prompt is too long",
+        "prompt_too_long",
+        "input is too long",
+        "input_too_long",
+        "input tokens exceed",
+        "too many tokens for",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 #[derive(Debug, Error)]
@@ -106,9 +179,6 @@ pub enum AgentError {
 
     #[error(transparent)]
     Storage(#[from] StorageError),
-
-    #[error("agent exceeded its limit of {max_turns} turns")]
-    MaxTurnsExceeded { max_turns: usize },
 
     #[error("agent hook failed: {0}")]
     Hook(#[from] HookError),

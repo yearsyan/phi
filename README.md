@@ -15,14 +15,19 @@
 - 跨协议思考强度（reasoning effort）配置
 - 可插拔 session 持久化，内置 in-memory 与 disk storage
 - 规范化工具调用与增量参数事件
-- 文本、图片 URL 和 base64 data URL 多模态 `content`
-- 顺序或并行工具执行，工具结果按调用顺序写回上下文
-- 默认关闭、可按需启用的 `read`、`bash`、`edit`、`write` 内置工具
+- 文本、图片和文档组成的 provider-neutral 富 `content`
+- 保守副作用分类、并发上限可调的工具调度，结果仍按调用顺序写回上下文
+- 带协作取消、进度事件、结构化 metadata 和富内容结果的工具执行上下文
+- 默认关闭、可按需启用的 `read`、`bash`、`edit`、`write` 内置工具，以及后台 Bash 查询/停止工具
 - MCP client：支持 stdio 与 Streamable HTTP server 的工具发现和调用
+- 默认关闭、支持多目录与渐进式正文加载的 Skills catalog/tool
 - 可配置 HTTP 超时、错误重试和指数退避
 - 可修改请求、响应和 turn 数据的异步生命周期 Hooks
-- `agent_start`、turn、message、tool 和 error 生命周期事件
-- 最大轮数保护与可复用对话历史
+- `agent_start`、turn、message、tool progress 和 error 生命周期事件
+- 可协作停止的 run control，以及协议安全的停止检查点
+- 可持久化的 Default/Plan 模式、工具能力硬限制与独立版本化计划文件
+- 持续工具轮次与可复用对话历史
+- 独立 `phi-daemon` 二进制：session registry、HTTP 列表、new/attach WebSocket、可重连的 `askuser` 与 Plan Exit 审批
 
 ## 快速运行
 
@@ -38,6 +43,25 @@ cargo run --example agent
 ```bash
 cargo run --example agent -- "调用 character_count 统计 hello世界 的字符数"
 ```
+
+需要常驻进程和多客户端会话管理时，使用 workspace 内的 daemon：
+
+```bash
+mkdir -p .phi/daemon
+openssl rand -hex 32 > .phi/daemon/auth.key
+chmod 600 .phi/daemon/auth.key
+export PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key
+DAEMON_KEY="$(cat "$PHI_DAEMON_AUTH_KEY_FILE")"
+cargo run -p phi-daemon
+
+curl -X PUT http://127.0.0.1:8787/v1/providers/default \
+  -H "Authorization: Bearer $DAEMON_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"provider":"openai_chat","api_key":"...","base_url":"https://example.com/v1","model":"model-name"}'
+```
+
+Provider 配置、HTTP/WS 协议和停止语义见
+[`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。
 
 ## SDK 用法
 
@@ -97,6 +121,55 @@ println!("{}", result.text().unwrap_or_default());
 # }
 ```
 
+已有工具只实现 `execute` 即可保持兼容。需要长任务协作时可以覆盖 `execute_with_context`，通过 `ToolExecutionContext` 检查取消、发送进度并查看当前 transcript 中仍可见的 tool result；`ToolOutput` 还可以附带 `ContentPart` 和 JSON metadata，这些数据会进入事件、session storage 与 daemon API。
+
+## Skills
+
+Skills 属于 library 能力且默认关闭。调用方显式提供一个或多个根目录；每个根目录只扫描 `<root>/<name>/SKILL.md`，后配置的目录可确定性覆盖前面的同名 skill。catalog 是不可变快照，tool schema 只暴露有界的名称/描述索引，完整正文仅在模型调用 `skill` tool 或调用方显式选择 skill 时进入上下文：
+
+```rust
+use phi::{Agent, SkillCatalog, SkillDirectory, SkillInvocation, SkillsConfig};
+
+# async fn build(provider: impl phi::LlmProvider + 'static) -> Result<(), phi::SkillError> {
+let config = SkillsConfig::new()
+    .skill_directory(SkillDirectory::new("/home/user/.phy/skills").source("global"))
+    .skill_directory(SkillDirectory::new("/workspace/.claude/skills").source("workspace"));
+let catalog = SkillCatalog::load(&config).await?;
+let agent = Agent::builder(provider).skills(catalog.clone()).build();
+
+// 显式选择时由 library 展开，不依赖模型再次决定是否调用 skill。
+let prompt = catalog.apply_to_prompt(
+    &SkillInvocation::new("code-review"),
+    "检查认证逻辑".into(),
+)?;
+# let _ = (agent, prompt);
+# Ok(())
+# }
+```
+
+支持 Claude 常用的 `description`、`when_to_use`、`argument-hint`、`arguments`、`version`、`disable-model-invocation` 和 `user-invocable` frontmatter，以及 `$ARGUMENTS`、索引/命名参数和 `${CLAUDE_SKILL_DIR}` 替换。Skills 不执行 markdown 内嵌 shell、hooks，也不把 `allowed-tools` 等 frontmatter 当作授权；这些字段只产生诊断。live catalog 不自动监听文件变化，需要重新构建 Agent 才会更新。
+
+## Plan 模式与计划文件
+
+`AgentMode::Plan` 是执行权限边界，不只是额外提示词。Agent 会在 lifecycle hook 之后再次过滤 Provider 可见的工具，并在真正执行 tool call 时再次校验；因此 hook 重新加入工具或模型伪造调用都不能绕过限制。模式保存在 session snapshot 中，恢复会话后仍然生效：
+
+```rust
+use phi::{Agent, AgentMode, OpenAiChatProvider};
+
+# let provider = OpenAiChatProvider::new("key", "https://example.com/v1", "model")?;
+let mut agent = Agent::builder(provider)
+    .mode(AgentMode::Plan)
+    .build();
+
+// 对已 attach session 的 Agent，这个异步入口会立即持久化模式。
+agent.set_mode(AgentMode::Default).await?;
+# Ok::<(), phi::AgentError>(())
+```
+
+每个 `Tool` 通过 `effect()` 声明最大副作用。Plan 只允许 `ReadOnly`、`Internal` 和 `PlanOnly`；`edit`/`write`、`bash` 分别被归类为 workspace write 和 external side effect。自定义与 MCP 工具默认是 `ExternalSideEffect`，需要实现者审计后显式降权，才会在 Plan 中可用。`PlanOnly` 工具只在 Plan 中可见。
+
+`InMemoryPlanStore` 和 `DiskPlanStore` 提供独立于 transcript 的 session-scoped Markdown 计划文件。更新使用 `expected_revision` 做乐观并发控制，revision `0` 表示计划尚不存在；磁盘实现按 session 分文件并原子替换。daemon 在此基础上注入 `read_plan`、`write_plan`、`exit_plan_mode`：退出请求绑定计划的完整 revision/content，只有客户端显式批准同一版本才会切回 Default，拒绝或计划已变化都会留在 Plan。协议示例见 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。
+
 任意 OpenAI 兼容服务都可以通过下列构造器接入：
 
 ```rust
@@ -136,14 +209,16 @@ let agent = Agent::builder(provider).builtin_tools(tools).build();
 # Ok::<(), phi::ProviderError>(())
 ```
 
-`AgentBuilder::all_builtin_tools(cwd)` 是启用全部四项能力的快捷方式。各工具类型也可单独注册并配置，例如 `.tool(BashTool::new(cwd).shell("/bin/zsh"))`。
+`AgentBuilder::all_builtin_tools(cwd)` 是启用 `read`、`bash`、`edit`、`write` 四类能力的快捷方式；启用 Bash 时还会安装共享状态的 `bash_task_output` 和 `bash_task_stop`。各工具类型也可单独注册并配置，例如 `.tool(BashTool::new(cwd).shell("/bin/zsh").timeout(Duration::from_secs(90)))`。
 
-- `read`：读取文本，支持 1-based `offset` 和 `limit`；默认保留头部最多 2000 行或 50KB，并返回继续读取提示。
-- `bash`：在配置目录中执行 shell 命令，合并 stdout/stderr；可传入 `timeout` 秒数。默认保留尾部最多 2000 行或 50KB，发生截断时把完整输出保存到临时文件。非零退出码和超时会作为 tool error 返回。
-- `edit`：一个调用可提交多个精确替换；每个 `oldText` 必须在原文件中唯一，各替换不能重叠。保留 UTF-8 BOM 和原有 CRLF/LF 换行风格。
+- `read`：流式读取普通 UTF-8 文本，支持 1-based `offset` 和 `limit`，大文件只扫描请求范围并返回继续读取提示；也能验证并返回 PNG/JPEG/GIF/WebP、PDF，以及按 cell 渲染 Jupyter notebook（包括受限的内嵌图片）。同一可见 tool result 对未变化文件的相同范围重复读取会返回轻量引用。FIFO、设备、伪装媒体和不支持的二进制文件会被拒绝。
+- `bash`：在配置目录中执行 shell 命令并合并 stdout/stderr；默认超时 120 秒，调用参数中的 `timeout` 可覆盖，`BashTool::timeout`、`set_timeout` 和 `without_timeout` 可修改默认值。输出默认保留尾部 2000 行或 50KB，截断时完整内容写入临时文件。`run_in_background=true` 会立即返回 task id，随后可查询实时尾部输出或停止整个进程组；Agent/registry 释放时也会取消遗留任务。
+- `edit`：一个调用可提交多个基于原文件快照的精确替换，默认要求 `oldText` 唯一，也可逐项设置 `replaceAll`；各替换不能重叠。它限制输入文件大小，保留 UTF-8 BOM 和未编辑区域的 CRLF/LF/CR 混合换行，并返回紧凑 diff 与结构化修改统计。
 - `write`：创建或完全覆盖文件，并递归创建父目录。
 
-`edit` 与 `write` 会按目标文件串行化，因此即使 Agent 使用并行工具执行，同一文件也不会同时写入。不同文件仍可并行。
+Agent 默认最多同时执行 8 个被分类为 `Safe` 的调用，可通过 `max_parallel_tools` / `set_max_parallel_tools` 调整。只读内置工具可并行；Bash 仅对保守 allowlist 能证明为只读的命令开放并行，解析不明、后台命令和任何写入/副作用工具都会让整批调用串行。`edit` 与 `write` 还会按目标文件串行化。
+
+Agent 还会对每个工具调用施加默认 300 秒的外层超时，可通过 Builder 的 `tool_call_timeout` / `without_tool_call_timeout`，或运行期的 `Agent::set_tool_call_timeout` 修改。外层超时和 stop 会把已开始但未确认完成的调用标记为 `unknown`；对于 Bash，取消时还会终止其进程组。
 
 这些工具遵循 Pi 的本地工具语义：工作目录只用于解析相对路径，不是安全沙箱；绝对路径和包含 `..` 的路径仍可访问工作目录以外的位置，`bash` 也可以执行当前进程权限允许的任意命令。只应向可信 Agent 显式开放所需的最小能力。
 
@@ -201,7 +276,7 @@ let agent = Agent::builder(provider)
 - 默认连接超时为 30 秒，`tools/list` 和 `tools/call` 超时为 60 秒，均可配置；通过 `McpClientOptions::without_request_timeout()` 可以关闭请求超时。
 - 工具列表是连接时的快照。MCP server 后续发送 `tools/list_changed` 时，需要重新连接并构建 Agent 才会更新。
 - MCP 的 tool-level `isError`、JSON-RPC/transport 错误和超时都会转为现有 tool error，因此调用方会收到 `AgentEvent::ToolExecutionEnd { is_error: true, .. }`。
-- 文本和 structured content 会写回模型上下文，默认限制为 2000 行或 50KB。由于当前 `ToolOutput` 是文本，image、audio 和二进制 resource 只返回类型与大小摘要，不把 base64 数据写进上下文。
+- 文本和 structured content 会写回模型上下文，默认限制为 2000 行或 50KB；structured content 还以有界 metadata 保留。MCP image 会作为 provider-neutral 富内容返回（超限时省略），audio 和二进制 resource 仍只返回安全摘要。
 - stdio 子进程和远端 server 都拥有其进程或服务端权限。工具 schema、描述和执行结果也属于不可信输入；只应连接可信 MCP server，并为不同 server 设置前缀以避免工具名冲突。
 
 ## Provider 边界
@@ -226,7 +301,7 @@ pub trait LlmProvider: Send + Sync {
 
 - `messages: Vec<Message>`
 - `tools: Vec<ToolDefinition>`
-- `config: GenerationConfig`，目前包括 `temperature`、`max_tokens` 和 `reasoning_effort`
+- `config: GenerationConfig`，包括可选的每请求 `model` override、`temperature`、`max_tokens` 和 `reasoning_effort`
 
 Provider 返回 `ProviderResponse`：规范化的 `AssistantMessage` 加可选 `TokenUsage`。Agent 不需要知道上游响应字段叫 `prompt_tokens`、`input_tokens` 还是缓存 token 字段。
 
@@ -349,7 +424,7 @@ let _agent = Agent::builder(provider)
 
 ## HTTP 超时与重试
 
-三个内置 Provider 共用同一套重试策略。默认在首次请求失败后最多重试 10 次；该数字由 `RetryConfig` 管理，不写死在请求循环中。`max_retries` 表示“额外重试次数”，所以配置为 10 时最多会发送 11 次 HTTP 请求，配置为 0 时关闭重试：
+三个内置 Provider 共用同一套重试策略。对于可以确认安全重试的失败，默认在首次请求失败后最多重试 10 次；该数字由 `RetryConfig` 管理，不写死在请求循环中。`max_retries` 表示“额外重试次数”，所以配置为 10 时最多会发送 11 次 HTTP 请求，配置为 0 时关闭重试：
 
 ```rust
 use std::time::Duration;
@@ -358,6 +433,7 @@ use phi::{OpenAiChatProvider, RetryConfig};
 let retry = RetryConfig::default()
     .with_max_retries(5)
     .with_request_timeout(Duration::from_secs(20))
+    .with_stream_idle_timeout(Duration::from_secs(90))
     .with_initial_backoff(Duration::from_millis(250))
     .with_max_backoff(Duration::from_secs(8))
     .with_rate_limit_backoff(Duration::from_secs(1));
@@ -370,15 +446,18 @@ let provider = OpenAiChatProvider::new(
 # Ok::<(), phi::ProviderError>(())
 ```
 
+三个内置 Provider 都支持链式 `.http_client(reqwest::Client)` 注入，也提供直接接收 Client 的 `new_with_client`（Anthropic 自定义 endpoint 使用 `with_base_url_and_client`）。需要构建多个 Agent/session 时应 clone 同一个 Client，以复用 DNS、TLS 和连接池；daemon 的默认 factory 使用直接构造入口，所有 session 共享一个 Client，且不会先创建临时 Client。
+
 重试分类如下：
 
-- 连接、请求传输和响应头超时：带随机抖动的指数退避。
+- 建立连接阶段的失败：请求尚未送达，使用带随机抖动的指数退避。
+- 已建立连接后的传输错误和响应头超时：结果可能已经被服务端处理，因此立即返回错误，不自动重试。
 - HTTP 408、409、425，以及除 501/505 外的 5xx：带随机抖动的指数退避，且受 `max_backoff` 限制。
 - HTTP 429：优先使用 `Retry-After`（同时支持秒数和 HTTP 日期）；缺失或无效时使用固定的 `rate_limit_backoff`，不做指数增长。等待时间同样受 `max_backoff` 限制。
-- 其他非 2xx 响应均作为 `ProviderError::Api` 返回，但不会重试。包括 400、401、403、404 等永久性客户端错误，以及无法正常跟随的 3xx。
+- 其他非 2xx 响应不会重试。常见上下文窗口超限响应会归一化为 `ProviderError::ContextLengthExceeded`，其余响应作为 `ProviderError::Api` 返回；包括 400、401、403、404 等永久性客户端错误，以及无法正常跟随的 3xx。
 - 请求构造、响应解码和重定向错误不会重试。
 
-请求超时只覆盖建立连接到收到响应头的阶段。SSE 流一旦建立就不会自动重放，因为重放已经输出一部分的流可能造成重复文本、重复计费或重复工具调用。`examples/agent.rs` 可以通过 `LLM_MAX_RETRIES` 和 `LLM_REQUEST_TIMEOUT_SECS` 覆盖默认配置。
+请求超时覆盖建立连接到收到响应头的阶段。这个阶段一旦超时，客户端无法判断 POST 是否已经被接收，所以即使仍有 retry budget 也不会重发，避免重复生成、计费或工具调用。已经建立的 SSE 流另有默认 120 秒的 event idle timeout，可通过 `with_stream_idle_timeout` 修改或通过 `without_stream_idle_timeout` 关闭；idle timeout 和非正常 EOF 同样只返回错误，不重放已输出的流。OpenAI Chat 只有收到 `[DONE]` 或明确正常的 `finish_reason` 才会接受响应。`examples/agent.rs` 可以通过 `LLM_MAX_RETRIES`、`LLM_REQUEST_TIMEOUT_SECS` 和 `LLM_STREAM_IDLE_TIMEOUT_SECS` 覆盖默认配置。
 
 每次准备重试时，Agent 会实时发出 `AgentEvent::ProviderRetry`。调用方可以通过已有的事件订阅机制记录日志、更新 UI 或上报监控：
 
@@ -398,7 +477,7 @@ agent.subscribe(|event| {
 });
 ```
 
-`ProviderRetryReason` 会区分响应头超时、传输错误和 HTTP 状态错误；HTTP 错误同时包含状态码与响应体。事件在退避等待之前发出。重试次数耗尽或遇到不可重试错误时，仍会发出原有的 `AgentEvent::Error`，并从 `Agent::prompt()` 返回 `AgentError::Provider`。直接使用 `provider.stream()` 时，同一个通知以 `ProviderEvent::Retry` 返回。
+`ProviderRetryReason` 会区分安全的连接传输错误和 HTTP 状态错误；HTTP 错误同时包含状态码与响应体。事件在退避等待之前发出。响应头超时和结果不明确的传输错误不会发出 retry 事件，而是直接进入原有的 `AgentEvent::Error`，并从 `Agent::prompt()` 返回 `AgentError::Provider`。直接使用 `provider.stream()` 时，同一个重试通知以 `ProviderEvent::Retry` 返回。
 
 ## Session 持久化
 
@@ -413,9 +492,21 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<Option<SessionSnapshot>, StorageError>;
 
     async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError>;
+    async fn save_incremental(
+        &self,
+        session: &SessionSnapshot,
+        previous_message_count: usize,
+    ) -> Result<(), StorageError>;
+    async fn save_replacing_from(
+        &self,
+        session: &SessionSnapshot,
+        unchanged_message_count: usize,
+    ) -> Result<(), StorageError>;
     async fn delete(&self, session_id: &str) -> Result<(), StorageError>;
 }
 ```
+
+两个增量方法都有回退到 `save` 的默认实现，因此已有自定义 storage 不需要改动；追加型实现可以利用消息游标避免反复加载完整快照。
 
 内存 storage 适合测试或单进程临时会话；clone 后共享同一份状态：
 
@@ -445,7 +536,7 @@ agent
 # }
 ```
 
-每个同步点对应一条 JSONL 记录。第一条以及历史发生改写时使用 `replace`，正常对话增长使用 `append`，其中只包含相对上一状态新增的消息和最新 usage。加载时按行回放；如果进程在写最后一行时中断，未完成的尾行会被忽略，并在下次保存前截断，因此不会破坏此前已完成的 session。JSONL 更适合当前追加式同步和审计场景，代价是长 session 的加载需要回放多条记录；需要长期保留大量轮次时可在业务层定期归档或重建 session。
+每个同步点只向 JSONL 尾部写入一条记录。正常增长使用 `append`，只包含新增消息和最新 usage；工具 journal 或清空历史需要更新尾部时使用 `replace_tail`，只包含变化起点及新尾部；完整 `replace` 保留给通用 snapshot 保存。`DiskSessionStorage` 会缓存每个已加载 session 的文件游标，正常 Agent checkpoint 不再重新读取和重建整个 JSONL；检测到文件被外部修改或有残缺尾行时才重新校验。加载时仍按行回放，未完成的最后一行会被忽略并在下次保存前截断。
 
 `attach_session` 会恢复已有的 `messages`、最后一次 usage 和累计 usage；session 不存在时则把当前 Agent 状态关联到这个新 ID。也可以在构建后链式恢复：
 
@@ -460,12 +551,14 @@ let mut agent = Agent::builder(provider)
 # }
 ```
 
-自动同步点严格为：
+自动同步点为：
 
 1. 用户的完整消息加入历史之后、调用 LLM 之前。
-2. 每次 LLM 流结束并得到完整 `ProviderResponse`、assistant 消息加入历史之后。
+2. Provider 返回工具调用后、任何工具开始前，先持久化 assistant 调用和 `unknown` 结果占位。
+3. 工具完成、取消或超时后，用真实结果、`cancelled` 或 `unknown` 原子更新本轮尾部。
+4. 无工具的完整 assistant 响应，以及 turn-end hook 对本轮尾部的修改完成之后。
 
-流式 delta 和工具执行过程不会单独写 storage。工具结果会先保留在内存中，并随下一次完整 LLM 响应一起进入快照。保存失败会返回 `AgentError::Storage`，不会静默继续调用后续 LLM 或工具。
+流式 delta 不写 storage。工具执行前的 journal 保存失败时不会启动工具；如果工具可能已经产生副作用但结果未能确认，恢复后会保留 `unknown` 结果且不会自动重放该调用。这样避免 transcript 回滚导致重复执行，但并不声称外部副作用具备 exactly-once 语义；支付、消息发送等工具仍应使用 `tool_call.id` 作为幂等键。保存失败会返回 `AgentError::Storage`，不会静默继续后续 LLM 或工具。
 
 Session 持久化消息、usage 以及 assistant 消息携带的 opaque `ProviderState`，因此恢复后仍能无损续接推理/工具上下文。API key、model、base URL、system prompt 与工具实现不会写入 session 文件。Provider state 可能包含明文思考内容或可回放的加密块，应按敏感数据保护 session 文件。`examples/agent.rs` 可通过 `LLM_SESSION_ID` 开启磁盘 session，并用 `LLM_SESSION_DIR` 指定目录。
 
@@ -570,9 +663,39 @@ println!("Agent 累计 API 用量：{}", agent.cumulative_usage().total_tokens);
 
 `run_usage` 是本次 Agent loop 内所有模型请求的 token 总和，适合用量/成本统计；`context_usage` 只采用最后一次模型响应的 `total_tokens`，用于衡量当前对话实际占用，二者不能混用。
 
-## 图片输入
+### 异步上下文管理
 
-`content` 可以是普通文本或规范化的文本/图片内容块；每个 adapter 会转换成目标协议的图片结构：
+`ContextManager` 是独立于生命周期 `Hook` 的异步 hook 类型。Agent 默认在成功响应报告的上下文占用达到 `80%` 时运行 manager 链；可以通过 `context_management_threshold_percent` 调整阈值，并通过多次 `context_manager` 或一个 `ContextManagerRegistry` 注册多个 manager：
+
+```rust
+use async_trait::async_trait;
+use phi::{ContextManagementContext, ContextManager, HookError};
+
+struct ApplicationContextManager;
+
+#[async_trait]
+impl ContextManager for ApplicationContextManager {
+    async fn manage_context(
+        &self,
+        context: &mut ContextManagementContext<'_>,
+    ) -> Result<bool, HookError> {
+        // 应用可以异步生成摘要，然后通过 replace_prefix、
+        // replace_messages、truncate、clear_messages 或 messages_mut 改写 transcript。
+        let _ = context.messages();
+        Ok(false)
+    }
+}
+```
+
+返回 `true` 会继续运行下一个已注册 manager，返回 `false` 会终止同类 hook 链。完整链执行后 Agent 会验证 assistant tool call 与 tool result 仍然成组；合法修改会在继续下一次模型请求前持久化，非法修改或 hook 错误会回滚。
+
+当 Provider 在尚未产生任何 assistant delta 时返回上下文超限错误，同一条 manager 链也会以 `ContextManagementTrigger::ContextLengthExceeded` 触发。内置 HTTP Provider 会识别常见的上下文超限错误码和消息；自定义 Provider 可以返回 `ProviderError::context_length_exceeded(...)`。错误触发完成后原请求仍返回该 Provider 错误，不会隐式重试。没有配置 `max_context_tokens` 或 Provider 没有返回 usage 时，成功响应无法进行百分比判断，但显式的上下文超限错误仍可触发 manager。
+
+SDK 暂不提供具体的摘要、滑动窗口或裁剪策略，策略由注册的 `ContextManager` 实现。
+
+## 图片与文档输入
+
+`content` 可以是普通文本或规范化的文本、图片、文档内容块；每个 adapter 会转换成目标协议支持的原生结构：
 
 ```rust
 use phi::{Agent, ImageDetail, ImageUrl};
@@ -613,6 +736,8 @@ agent.prompt_content(content).await?;
 # };
 ```
 
+文档同样可以从本地字节构造；例如 `ContentPart::document(Document::from_bytes("report.pdf", "application/pdf", &bytes))`。工具返回的图片和文档也使用同一套内容块，adapter 会在保持 tool-call 协议顺序的前提下映射或安全降级。
+
 通用视觉示例同时支持本地路径、HTTP URL 和现成 data URL：
 
 ```bash
@@ -625,21 +750,42 @@ cargo run --example vision -- ./image.png "图片里有什么？"
 
 注意：SDK 会生成目标 adapter 对应的图片内容结构，但 Provider 对图片的实际支持仍取决于调用方传入的模型。
 
-## Daemon 骨架
+## Daemon
 
-仓库同时包含独立的 `phi-daemon` workspace package。它目前只提供可启动、可优雅退出的 HTTP/WS transport 外壳，以及 `api`、`service`、`runtime`、`store` 分层；公开业务路由尚未启用，所有请求都会返回 `404 Not Found`。
+仓库同时包含独立的 `phi-daemon` workspace package。它在进程内维护
+`session_id -> Agent actor` 映射，并提供 session 列表、延迟创建和恢复会话的
+HTTP/WebSocket 接口：
+
+- `GET /v1/providers`：列出 daemon 的命名 Provider profiles（密钥不回显）。
+- `GET/PUT /v1/providers/{profile_id}`：查询或原子更新指定 Provider profile。
+- `GET /v1/sessions`：列出已经持久化的 session。
+- `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
+- `POST /v1/auth/token`：使用长期 bearer key 换取 60 秒有效、单次使用的 WebSocket subprotocol token。
+- `GET /v1/ws/new?profile_id=...`：用指定 profile 构建 Agent，首个 prompt 才初始化并持久化 session。
+- `GET /v1/ws/attach/{session_id}`：返回历史与当前快照，并持续订阅流式事件。
+
+同一 session 可以被多个 WebSocket 同时 attach；运行期间的新 prompt 会进入有界
+FIFO，stop、状态和模型配置变化会同步广播。每个 session 由单独 actor 串行拥有
+`Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会自动获得
+`askuser` 以及三个 Plan 工具；问题和 Exit 审批通过广播发送，任一 attach 客户端可
+处理，断线重连可从 snapshot 的 pending 状态恢复。
 
 ```bash
-cargo run -p phi-daemon
+PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key cargo run -p phi-daemon
 ```
 
-默认监听 `127.0.0.1:8787`，可以通过环境变量修改：
+daemon 要求 key 文件至少包含 32 个可打印非空白 ASCII 字节，建议权限为 `0600`。所有 HTTP API 通过 `Authorization: Bearer <key>` 鉴权；WebSocket 客户端同时 offer `phi.v1` 与 `phi.auth.<temporary-token>`，服务端只选择固定的 `phi.v1`。默认监听 `127.0.0.1:8787`，可以通过环境变量修改：
 
 ```bash
-PHI_DAEMON_BIND=127.0.0.1:9000 cargo run -p phi-daemon
+PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
+  PHI_DAEMON_BIND=127.0.0.1:9000 \
+  cargo run -p phi-daemon
 ```
 
-daemon 的 runtime 已建立每个 session 独占一个 `Agent` 的 actor/handle 边界，并为后续的 Agent factory、运行时 registry、WS event bus 和 control store 预留稳定落点。目前使用进程内 control store；Provider profile、持久化数据库以及具体 HTTP/WS 接口将在后续接入。
+完整 Provider/启动配置、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
+[`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon 自带的 factory
+按 `profile_id` 读取由 HTTP 管理并持久化的 Provider 配置；若需要 MCP 或 workspace
+read/edit/write/bash 等工具，可提供自定义 `AgentFactory`。
 
 ## 模块结构
 
@@ -650,6 +796,7 @@ daemon 的 runtime 已建立每个 session 独占一个 `Agent` 的 actor/handle
 - `error`：Provider、工具及 Agent 错误
 - `storage`：session 快照持久化接口与内存、JSONL 实现
 - `mcp`：stdio 与 Streamable HTTP MCP client
-- `crates/phi-daemon`：daemon 进程、transport 外壳与运行时编排边界
+- `crates/phi-daemon`：daemon 进程、HTTP/WS transport、session actor 与持久化编排
 
-这是精简的 agent-core，而不是 Pi coding-agent CLI 的完整复刻；TUI、上下文压缩、运行取消和 daemon 业务接口尚未包含。
+这是精简的 agent-core 与单进程 daemon，而不是 Pi coding-agent CLI 的完整复刻；
+TUI、上下文压缩、TLS/origin 校验、多租户和分布式 actor 协调尚未包含。
