@@ -1,3 +1,4 @@
+mod agent_profile;
 mod disk;
 mod memory;
 mod provider;
@@ -5,12 +6,15 @@ mod provider;
 use std::{fmt, io, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
-use phi::ReasoningEffort;
+use phi::{ReasoningEffort, Workspace};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::runtime::SessionId;
+use crate::runtime::{PinnedAgentProfile, SessionId};
 
+pub use agent_profile::{
+    AgentProfileStore, AgentProfileStoreError, DiskAgentProfileStore, MemoryAgentProfileStore,
+};
 pub use disk::DiskControlStore;
 pub use memory::MemoryControlStore;
 pub use provider::{DiskProviderStore, MemoryProviderStore};
@@ -152,7 +156,14 @@ fn default_stream_idle_timeout_secs() -> u64 {
 pub struct SessionRecord {
     pub id: SessionId,
     pub profile_id: String,
+    /// Complete Agent Profile snapshot selected before this session was
+    /// activated. Old metadata omits it and resumes with the built-in
+    /// `default@0` profile.
+    #[serde(default)]
+    pub agent_profile: Option<PinnedAgentProfile>,
     pub model: String,
+    #[serde(default)]
+    pub workspace: Option<Workspace>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -169,10 +180,17 @@ impl SessionRecord {
         Self {
             id,
             profile_id: profile_id.into(),
+            agent_profile: None,
             model: model.into(),
+            workspace: None,
             reasoning_effort,
             config_revision: 0,
         }
+    }
+
+    pub fn with_workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 }
 

@@ -8,7 +8,7 @@ use axum::{
 };
 
 use crate::service::ApplicationService;
-use crate::{runtime::AgentFactoryError, service::ServiceError};
+use crate::{runtime::AgentFactoryError, service::ServiceError, store::AgentProfileStoreError};
 
 mod auth;
 mod dto;
@@ -77,6 +77,14 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
     fn service(error: ServiceError) -> Self {
         let (status, code) = match &error {
             ServiceError::SessionNotFound { .. } => (StatusCode::NOT_FOUND, "session_not_found"),
@@ -84,6 +92,15 @@ impl ApiError {
                 StatusCode::NOT_IMPLEMENTED,
                 "provider_management_unavailable",
             ),
+            ServiceError::AgentProfileManagementUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
+                "agent_profile_management_unavailable",
+            ),
+            ServiceError::AgentProfileStore(AgentProfileStoreError::Validation(_))
+            | ServiceError::Factory(
+                AgentFactoryError::AgentProfile(_)
+                | AgentFactoryError::AgentProfileUnavailable { .. },
+            ) => (StatusCode::BAD_REQUEST, "invalid_agent_profile"),
             ServiceError::Factory(
                 AgentFactoryError::InvalidProviderConfig { .. } | AgentFactoryError::Provider(_),
             ) => (StatusCode::BAD_REQUEST, "invalid_provider_config"),

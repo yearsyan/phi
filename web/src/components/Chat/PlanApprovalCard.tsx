@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
 import type { PlanApprovalRequest } from '../../types/wire.ts';
 import { Markdown } from '../common/Markdown.tsx';
@@ -11,7 +11,7 @@ interface PlanApprovalCardProps {
     decision:
       | { type: 'approve'; revision: number }
       | { type: 'reject'; revision: number; feedback?: string | null },
-  ) => void;
+  ) => boolean;
 }
 
 /**
@@ -24,17 +24,44 @@ export function PlanApprovalCard({ request, onDecide }: PlanApprovalCardProps) {
   const { approval_id, plan } = request;
   const [feedback, setFeedback] = useState('');
   const [mode, setMode] = useState<'idle' | 'reject'>('idle');
+  const [submitting, setSubmitting] = useState(false);
+  const retryTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (retryTimer.current !== null) {
+        window.clearTimeout(retryTimer.current);
+      }
+    },
+    [],
+  );
+
+  const markSubmitting = (sent: boolean) => {
+    if (!sent) return;
+    setSubmitting(true);
+    retryTimer.current = window.setTimeout(() => {
+      retryTimer.current = null;
+      setSubmitting(false);
+    }, 2_000);
+  };
 
   const approve = () => {
-    onDecide(approval_id, { type: 'approve', revision: plan.revision });
+    markSubmitting(
+      onDecide(approval_id, {
+        type: 'approve',
+        revision: plan.revision,
+      }),
+    );
   };
 
   const reject = () => {
-    onDecide(approval_id, {
-      type: 'reject',
-      revision: plan.revision,
-      feedback: feedback.trim().length > 0 ? feedback.trim() : null,
-    });
+    markSubmitting(
+      onDecide(approval_id, {
+        type: 'reject',
+        revision: plan.revision,
+        feedback: feedback.trim().length > 0 ? feedback.trim() : null,
+      }),
+    );
   };
 
   return (
@@ -64,6 +91,7 @@ export function PlanApprovalCard({ request, onDecide }: PlanApprovalCardProps) {
               type="button"
               className={styles.rejectBtn}
               onClick={() => setMode('reject')}
+              disabled={submitting}
             >
               {t('plan.requestChanges')}
             </button>
@@ -71,6 +99,7 @@ export function PlanApprovalCard({ request, onDecide }: PlanApprovalCardProps) {
               type="button"
               className={styles.approveBtn}
               onClick={approve}
+              disabled={submitting}
             >
               {t('plan.approve')}
             </button>
@@ -81,11 +110,17 @@ export function PlanApprovalCard({ request, onDecide }: PlanApprovalCardProps) {
               type="button"
               className={styles.cancelBtn}
               onClick={() => setMode('idle')}
+              disabled={submitting}
             >
               {t('plan.back')}
             </button>
-            <button type="button" className={styles.rejectBtn} onClick={reject}>
-              {t('plan.sendFeedback')}
+            <button
+              type="button"
+              className={styles.rejectBtn}
+              onClick={reject}
+              disabled={submitting}
+            >
+              {submitting ? t('plan.submitting') : t('plan.sendFeedback')}
             </button>
           </>
         )}

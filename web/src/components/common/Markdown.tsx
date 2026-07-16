@@ -1,4 +1,10 @@
-import { memo, type ReactNode, useState } from 'react';
+import {
+  Children,
+  isValidElement,
+  memo,
+  type ReactNode,
+  useState,
+} from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import styles from './Markdown.module.css';
@@ -19,10 +25,8 @@ function MarkdownImpl({ children, compact }: MarkdownProps) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          code: codeComponent,
-          pre({ children }) {
-            return <div className={styles.pre}>{children}</div>;
-          },
+          code: InlineCode,
+          pre: PreBlock,
           a({ children, href }) {
             return (
               <a
@@ -46,18 +50,26 @@ function MarkdownImpl({ children, compact }: MarkdownProps) {
 export const Markdown = memo(MarkdownImpl);
 
 interface CodeProps {
-  inline?: boolean;
   className?: string;
   children?: ReactNode;
 }
 
-function codeComponent({ inline, className, children }: CodeProps) {
-  const text = String(children ?? '');
-  if (inline) {
-    return <code className={styles.inlineCode}>{text}</code>;
+function InlineCode({ className, children }: CodeProps) {
+  return (
+    <code className={`${styles.inlineCode} ${className ?? ''}`.trim()}>
+      {children}
+    </code>
+  );
+}
+
+function PreBlock({ children }: { children?: ReactNode }) {
+  const child = Children.count(children) === 1 ? Children.only(children) : null;
+  if (isValidElement<CodeProps>(child)) {
+    const language = /language-([\w-]+)/.exec(child.props.className ?? '')?.[1];
+    const text = String(child.props.children ?? '').replace(/\n$/, '');
+    return <CodeBlock language={language} text={text} />;
   }
-  const language = /language-(\w+)/.exec(className ?? '')?.[1];
-  return <CodeBlock language={language} text={text} />;
+  return <pre className={styles.fallbackPre}>{children}</pre>;
 }
 
 function CodeBlock({ language, text }: { language?: string; text: string }) {

@@ -13,7 +13,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use super::{
-    common::{invalid_arguments, io_error, normalize_cwd, resolve_path},
+    common::{invalid_arguments, io_error, normalize_cwd, resolve_path_for_context},
     truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, truncate_head},
 };
 use crate::{
@@ -263,7 +263,7 @@ impl ReadTool {
             return Err(ToolError::new("read limit must be at least 1"));
         }
 
-        let requested_path = resolve_path(&self.cwd, &arguments.path)?;
+        let requested_path = resolve_path_for_context(&self.cwd, &arguments.path, context).await?;
         let metadata = match tokio::fs::metadata(&requested_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {

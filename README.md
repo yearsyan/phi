@@ -25,10 +25,13 @@
 - 可修改请求、响应和 turn 数据的异步生命周期 Hooks
 - `agent_start`、turn、message、tool progress 和 error 生命周期事件
 - 可协作停止的 run control，以及协议安全的停止检查点
-- 可持久化的 Default/Plan 模式、工具能力硬限制与独立版本化计划文件
-- 可显式启用的异步 subagent runtime，支持双向通知、安全边界消息注入和永久关闭
+- 可持久化的 Default/Plan 模式，以及独立的 `ReadOnly` / `WorkspaceEdit` / `FullAccess`
+  capability 边界、工具名称策略和版本化计划文件
+- 可显式启用的异步 subagent runtime，支持 `general` / `explore` / `plan` 类型、模型与
+  reasoning override、输出契约、host-owned workspace isolation、双向通知和永久关闭
 - 持续工具轮次与可复用对话历史
-- 独立 `phi-daemon` 二进制：session registry、HTTP 列表、new/attach WebSocket、可重连的 `askuser` 与 Plan Exit 审批
+- 独立 `phi-daemon` 二进制：版本化 Agent Profile、session registry、HTTP 列表、
+  new/attach WebSocket、可重连的 `askuser` 与 Plan Exit 审批
 
 ## 快速运行
 
@@ -171,6 +174,32 @@ agent.set_mode(AgentMode::Default).await?;
 
 `InMemoryPlanStore` 和 `DiskPlanStore` 提供独立于 transcript 的 session-scoped Markdown 计划文件。更新使用 `expected_revision` 做乐观并发控制，revision `0` 表示计划尚不存在；磁盘实现按 session 分文件并原子替换。daemon 在此基础上注入 `read_plan`、`write_plan`、`exit_plan_mode`：退出请求绑定计划的完整 revision/content，只有客户端显式批准同一版本才会切回 Default，拒绝或计划已变化都会留在 Plan。协议示例见 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。
 
+## Capability 模式与工具策略
+
+`CapabilityMode` 与 Default/Plan 正交，并在 Provider 请求、hook 修改之后和工具真正执行前
+重复校验。最终权限是 Agent mode、capability mode、`ToolPolicy` 和工具自身
+`ToolEffect` 的交集：
+
+- `ReadOnly`：只允许只读、Agent 内部协调及 Plan-only 工具。
+- `WorkspaceEdit`：在 `ReadOnly` 基础上允许 `WorkspaceWrite`，但不允许 shell、网络等
+  `ExternalSideEffect`。
+- `FullAccess`：不额外屏蔽 effect；Plan Mode 仍然保持更严格的只读/计划边界。
+
+`ToolPolicy` 可用精确工具名配置 allow-list 和 deny-list；deny 对普通工具优先。daemon
+的 `askuser`、计划读取/写入/审批和关闭 child 等 harness 工具可以标记为 mandatory，
+从而绕过名称筛选，但仍然受 Agent mode 与 capability mode 限制。capability 存入
+session snapshot；持久化失败时运行时只会保留更窄的模式，不会意外升权。
+
+模式切换约束之后的工具暴露/执行，并会收紧或关闭权限过宽的 child；它不会回滚已经完成
+的外部副作用。先前已获准启动的 background Bash 也不是 OS sandbox 中的进程，
+需要通过 `bash_task_stop` 或 session shutdown 显式终止。
+
+这是应用层 capability sandbox，不是操作系统沙盒。`ReadOnly`/`WorkspaceEdit` 下，
+内置 `read`、`edit`、`write` 会 canonicalize 路径并拒绝绝对路径、`..` 或 symlink
+逃逸到 session workspace 之外；但它不提供进程隔离、系统调用过滤、网络 namespace
+或对自定义/MCP 工具实现的自动审计。`FullAccess` 仍保留原有“workspace 作为默认工作
+目录”的语义，`bash` 也按 daemon 进程本身的操作系统权限执行。
+
 任意 OpenAI 兼容服务都可以通过下列构造器接入：
 
 ```rust
@@ -185,14 +214,18 @@ let provider = OpenAiChatProvider::new(
 
 ## 内置工具
 
-内置工具默认全部关闭，不会因为构建 `Agent` 而自动获得文件系统或 shell 权限。需要在 Builder 中显式启用，并指定相对路径和命令使用的工作目录：
+内置工具默认全部关闭，不会因为构建 `Agent` 而自动获得文件系统或 shell 权限。library
+使用 `Workspace` 表示 Agent/session 绑定的工作目录；相对根路径在创建 `Workspace`
+时解析为绝对路径：
 
 ```rust
-use phi::{Agent, BuiltinTools, OpenAiChatProvider};
+use phi::{Agent, BuiltinTools, OpenAiChatProvider, Workspace};
 
 # let provider = OpenAiChatProvider::new("key", "https://example.com/v1", "model")?;
+let workspace = Workspace::new("/workspace/project");
 let agent = Agent::builder(provider)
-    .builtin_tools(BuiltinTools::all("/workspace/project"))
+    .workspace(workspace.clone())
+    .builtin_tools(BuiltinTools::all_in(workspace))
     .build();
 # Ok::<(), phi::ProviderError>(())
 ```
@@ -210,7 +243,11 @@ let agent = Agent::builder(provider).builtin_tools(tools).build();
 # Ok::<(), phi::ProviderError>(())
 ```
 
-`AgentBuilder::all_builtin_tools(cwd)` 是启用 `read`、`bash`、`edit`、`write` 四类能力的快捷方式；启用 Bash 时还会安装共享状态的 `bash_task_output` 和 `bash_task_stop`。各工具类型也可单独注册并配置，例如 `.tool(BashTool::new(cwd).shell("/bin/zsh").timeout(Duration::from_secs(90)))`。
+`AgentBuilder::all_builtin_tools(cwd)` 是兼容的快捷方式：它同时绑定 session workspace
+并启用 `read`、`bash`、`edit`、`write` 四类能力；启用 Bash 时还会安装共享状态的
+`bash_task_output` 和 `bash_task_stop`。若 Builder 同时显式设置 `workspace`，所有
+`BuiltinTools` 都会重定向到该 workspace，与调用顺序无关。各工具类型也可单独注册并
+配置，例如 `.tool(BashTool::new(cwd).shell("/bin/zsh").timeout(Duration::from_secs(90)))`。
 
 - `read`：流式读取普通 UTF-8 文本，支持 1-based `offset` 和 `limit`，大文件只扫描请求范围并返回继续读取提示；也能验证并返回 PNG/JPEG/GIF/WebP、PDF，以及按 cell 渲染 Jupyter notebook（包括受限的内嵌图片）。同一可见 tool result 对未变化文件的相同范围重复读取会返回轻量引用。FIFO、设备、伪装媒体和不支持的二进制文件会被拒绝。
 - `bash`：在配置目录中执行 shell 命令并合并 stdout/stderr；默认超时 120 秒，调用参数中的 `timeout` 可覆盖，`BashTool::timeout`、`set_timeout` 和 `without_timeout` 可修改默认值。输出默认保留尾部 2000 行或 50KB，截断时完整内容写入临时文件。`run_in_background=true` 会立即返回 task id，随后可查询实时尾部输出或停止整个进程组；Agent/registry 释放时也会取消遗留任务。
@@ -221,7 +258,10 @@ Agent 默认最多同时执行 8 个被分类为 `Safe` 的调用，可通过 `m
 
 Agent 还会对每个工具调用施加默认 300 秒的外层超时，可通过 Builder 的 `tool_call_timeout` / `without_tool_call_timeout`，或运行期的 `Agent::set_tool_call_timeout` 修改。外层超时和 stop 会把已开始但未确认完成的调用标记为 `unknown`；对于 Bash，取消时还会终止其进程组。
 
-这些工具遵循 Pi 的本地工具语义：工作目录只用于解析相对路径，不是安全沙箱；绝对路径和包含 `..` 的路径仍可访问工作目录以外的位置，`bash` 也可以执行当前进程权限允许的任意命令。只应向可信 Agent 显式开放所需的最小能力。
+在 `FullAccess` 下，这些工具遵循原有本地工具语义：workspace 主要作为相对路径和 shell
+的默认工作目录，绝对路径仍可能访问其外，`bash` 也可以执行当前进程权限允许的命令。
+`ReadOnly`/`WorkspaceEdit` 会额外限制内置文件工具的 canonical path，但仍不是 OS
+sandbox。只应向可信 Agent 显式开放完成任务所需的最小能力。
 
 ## Subagent
 
@@ -241,9 +281,26 @@ parent.add_tool(close_agent);
 # }
 ```
 
-`spawn_agent` 立即返回稳定 ID，child 在独立 task 中继续运行；`send_agent_message` 在 provider/tool 协议安全边界注入消息，idle child 会被唤醒。runtime 自动只给 child 注入 `notify_parent`：`progress` 可观察但不唤醒父 Agent，`blocker`/`result` 会唤醒；失败和关闭也会产生 runtime 通知。`close_agent` 可关闭 Starting、Running 或 Idle child，永久拒绝后续消息且幂等。child 默认不会得到 `spawn_agent`，因此不能递归创建下一级 Agent。
+`spawn_agent` 立即返回稳定 ID，child 在独立 task 中继续运行。配置化入口可选择：
 
-daemon 默认注册这组父工具，可用 `PHI_DAEMON_SUBAGENTS_ENABLED=false` 关闭；library 本身始终保持显式启用。
+- `general`、`explore` 或 `plan`；`explore`/`plan` 的 capability 上限固定为
+  `ReadOnly`，请求不能把它们升宽。
+- 更窄的 capability、model/reasoning override。
+- 文本输出，或带必需顶层字段的 JSON 输出契约；最终响应不满足契约时 child 以失败结束。
+- `shared` workspace，或由 host 明确实现的 `worktree` isolation；library 不执行 Git
+  操作，也不会在 host 不支持时静默退回 shared。
+
+`send_agent_message` 在 provider/tool 协议安全边界注入消息，idle child 会被唤醒。
+runtime 自动只给 child 注入 `notify_parent`：`progress` 可观察但不唤醒父 Agent，
+`blocker`/`result` 会唤醒；失败、输出校验和资源 finalization 也会产生结构化事件。
+`close_agent` 可关闭 Starting、Running 或 Idle child，永久拒绝后续消息且幂等。child
+默认不会得到 `spawn_agent`，因此不能递归创建下一级 Agent。
+
+daemon 默认注册这组父工具，可用 `PHI_DAEMON_SUBAGENTS_ENABLED=false` 关闭，并为
+`worktree` isolation 提供 detached Git worktree。clean worktree 在 child 关闭时移除；
+存在 tracked/untracked 修改、HEAD 已产生新 commit，或无法安全检查状态时会保留目录
+并在 finalization 事件中返回位置，不会用强制删除丢弃 child 的工作。library 本身始终
+保持显式启用。
 
 ## MCP Server
 
@@ -561,7 +618,11 @@ agent
 
 每个同步点只向 JSONL 尾部写入一条记录。正常增长使用 `append`，只包含新增消息和最新 usage；工具 journal 或清空历史需要更新尾部时使用 `replace_tail`，只包含变化起点及新尾部；完整 `replace` 保留给通用 snapshot 保存。`DiskSessionStorage` 会缓存每个已加载 session 的文件游标，正常 Agent checkpoint 不再重新读取和重建整个 JSONL；检测到文件被外部修改或有残缺尾行时才重新校验。加载时仍按行回放，未完成的最后一行会被忽略并在下次保存前截断。
 
-`attach_session` 会恢复已有的 `messages`、最后一次 usage 和累计 usage；session 不存在时则把当前 Agent 状态关联到这个新 ID。也可以在构建后链式恢复：
+`attach_session` 会恢复已有的 `messages`、最后一次 usage、累计 usage、执行模式和
+workspace；session 不存在时则把当前 Agent 状态关联到这个新 ID。workspace 一旦写入
+session snapshot 就不可重绑定：使用不同 workspace 构建的 Agent 恢复该 session 会
+返回 `StorageError::WorkspaceMismatch`。旧 snapshot 没有 workspace 字段时可由首次
+绑定的 Agent 补写迁移。也可以在构建后链式恢复：
 
 ```rust
 # use phi::{Agent, DiskSessionStorage, OpenAiChatProvider};
@@ -780,15 +841,18 @@ HTTP/WebSocket 接口：
 
 - `GET /v1/providers`：列出 daemon 的命名 Provider profiles（密钥不回显）。
 - `GET/PUT /v1/providers/{profile_id}`：查询或原子更新指定 Provider profile。
+- `GET /v1/agent-profiles`、`GET/PUT /v1/agent-profiles/{agent_profile_id}`：管理
+  prompt、工具/skill 筛选、初始模式和生成 override；revision 按 profile 独立递增。
 - `GET /v1/sessions`：列出已经持久化的 session。
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
 - `POST /v1/auth/token`：使用长期 bearer key 换取 60 秒有效、单次使用的 WebSocket subprotocol token。
-- `GET /v1/ws/new?profile_id=...`：用指定 profile 构建 Agent，首个 prompt 才初始化并持久化 session。
+- `GET /v1/ws/new?profile_id=...&agent_profile_id=...&capability_mode=...`：选择
+  Provider、Agent Profile 和可选 capability override；首 prompt 才初始化并持久化。
 - `GET /v1/ws/attach/{session_id}`：返回历史与当前快照，并持续订阅流式事件；可发送 `compact` 主动触发默认上下文压缩。
 - `GET /v1/ws/attach/{session_id}/subagents/{agent_id}`：只读观察 child Agent；任何 text/binary 输入都以 `1008` 拒绝。
 
 同一 session 可以被多个 WebSocket 同时 attach；运行期间的新 prompt 会进入有界
-FIFO，stop、状态和模型配置变化会同步广播。每个 session 由单独 actor 串行拥有
+FIFO，stop、状态、模型和 capability 变化会同步广播。每个 session 由单独 actor 串行拥有
 `Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会自动获得
 `askuser`、subagent 工具以及三个 Plan 工具；父 Agent 创建 child 时会向 session
 调用方广播结构化事件，child 的流式过程可通过独立只读 WebSocket 观察。问题和 Exit
@@ -820,16 +884,25 @@ pnpm dev
 
 首次使用需在设置中保存 daemon 长期 key 和 Provider profile。已有本地配置时，页面会
 自动连接一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
-客户端会区分连接、准备、就绪与失败状态，连接或 Agent 准备超过 15 秒会进入可重试的
-错误状态，WebSocket 断开后也会立即禁止继续发送。
+客户端在 `session_created` 后继续复用原 WebSocket，不会在首条消息开始时强制重连；
+连接中断后，已激活 session 会通过 attach 自动退避恢复。prompt 使用 `request_id`
+维护本地发送/接纳/排队状态，可连续加入 daemon FIFO；压缩 replacement patch、
+usage、AskUser 多选和多 turn 工具轨迹都会实时投影。界面提供 Plan/Build 模式切换、
+主动压缩、独立 Stop/Queue 操作、响应式会话导航和移动端布局。
 
-完整 Provider/启动配置、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
-[`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon 自带的 factory
-按 `profile_id` 读取由 HTTP 管理并持久化的 Provider 配置，并使用固定的 Phi
-coding-agent system prompt。standalone daemon 默认以 `PHI_DAEMON_WORKSPACE_DIR`
-为根目录安装 `read`、`edit`、`write`、`bash` 及后台 bash task 工具；Web 不允许
-修改 system prompt。daemon key 因而同时具备工作区读写和命令执行权限，应只提供给
-可信客户端。
+完整 Provider/Agent Profile、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
+[`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon factory 按
+`profile_id` 读取 Provider 配置，并按 `agent_profile_id` 编译 `extend`/`full` prompt、
+工具/skill policy、初始 capability 与可选 model/reasoning override。首 prompt 激活时
+会把完整 resolved Agent Profile 与 revision pin 到 session metadata；之后 profile
+更新只影响新 session，重启恢复仍使用原 pin。
+
+standalone daemon 默认以 `PHI_DAEMON_WORKSPACE_DIR` 为根目录安装 `read`、`edit`、
+`write`、`bash` 及后台 bash task 工具。该目录是新 session 的默认 `Workspace`；
+激活时会同时写入 daemon metadata 与 library session snapshot，child 的 shared
+workspace 继承该目录，worktree isolation 则使用独立 detached checkout。daemon key
+可能授予工作区读写和命令执行权限，应只提供给可信客户端；capability mode 是应用层
+边界，不替代 OS sandbox。
 
 ## 模块结构
 

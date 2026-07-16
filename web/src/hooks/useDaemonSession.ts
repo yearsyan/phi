@@ -8,6 +8,7 @@ import {
 import type {
   AgentMode,
   AskUserAnswer,
+  CapabilityMode,
   ClientCommand,
   PlanApprovalDecision,
   ServerMessage,
@@ -15,35 +16,42 @@ import type {
 import type { SessionSocket } from '../ws/connection.ts';
 import { attachSession, openNewSession } from '../ws/sessionConnection.ts';
 
-/** What kind of session to open. */
 export type SessionTarget =
-  | { kind: 'new'; profileId: string }
+  | {
+      kind: 'new';
+      profileId: string;
+      agentProfileId?: string;
+      capabilityMode?: CapabilityMode;
+      instanceId: number;
+    }
   | { kind: 'attach'; sessionId: string };
 
 export type ConnectionPhase =
   | 'idle'
   | 'connecting'
   | 'preparing'
+  | 'reconnecting'
   | 'ready'
   | 'error';
 
 export const SESSION_CONNECT_TIMEOUT_MS = 15_000;
+export const SESSION_RECONNECT_DELAYS_MS = [800, 1_600, 3_200, 5_000] as const;
 
 export interface DaemonSessionControls {
   state: SessionState;
-  /** Connection lifecycle for the current target. */
   connectionPhase: ConnectionPhase;
   connectionError: string | null;
+  createdSessionRevision: number;
   retry: () => void;
-  /** Send a text prompt. */
-  sendPrompt: (text: string) => void;
-  /** Stop the active run (no-op if none). */
+  sendPrompt: (text: string) => boolean;
   stop: () => void;
-  answerAsk: (askId: string, answers: AskUserAnswer[]) => void;
-  decidePlan: (approvalId: string, decision: PlanApprovalDecision) => void;
+  answerAsk: (askId: string, answers: AskUserAnswer[]) => boolean;
+  decidePlan: (approvalId: string, decision: PlanApprovalDecision) => boolean;
   setModel: (model: string) => void;
   setMode: (mode: AgentMode) => void;
+  setCapabilityMode: (mode: CapabilityMode) => void;
   compact: (instructions?: string) => void;
+  clearNotice: (index: number) => void;
 }
 
 let requestCounter = 0;
@@ -53,11 +61,11 @@ function nextRequestId(prefix: string): string {
 }
 
 /**
- * Owns the WebSocket lifecycle and the projection for a single session target.
+ * Owns one durable browser-to-session relationship.
  *
- * Opening a new target closes any existing socket and resets the reducer. On
- * unexpected close, the connection is surfaced via `connectionError` and can
- * be retried without changing the target.
+ * A prepared session stays on its original socket after `session_created`.
+ * Should that socket later drop, retries attach to the activated session id
+ * rather than accidentally creating a second session.
  */
 export function useDaemonSession(
   authKey: string,
@@ -68,23 +76,34 @@ export function useDaemonSession(
     useState<ConnectionPhase>('idle');
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [createdSessionRevision, setCreatedSessionRevision] = useState(0);
 
   const socketRef = useRef<SessionSocket | null>(null);
+  const promotedSessionIdRef = useRef<string | null>(null);
+  const preparedPromptRequestIdRef = useRef<string | null>(null);
+  const targetIdentityRef = useRef<string | null>(null);
+  const lastSequenceRef = useRef(0);
+  const reconnectCountRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+
+  const cancelReconnect = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
 
   const teardown = useCallback(() => {
     const socket = socketRef.current;
-    if (socket !== null) {
-      socket.close();
-      socketRef.current = null;
-    }
+    socketRef.current = null;
+    socket?.close();
   }, []);
 
   const send = useCallback((command: ClientCommand): boolean => {
     const socket = socketRef.current;
     if (socket === null || !socket.isOpen) {
       setConnectionPhase('error');
-      setConnectionError('WebSocket is not open');
-      dispatch({ type: 'disconnected' });
+      setConnectionError('The session connection is not open.');
       return false;
     }
     try {
@@ -95,14 +114,27 @@ export function useDaemonSession(
       setConnectionError(
         error instanceof Error ? error.message : String(error),
       );
-      dispatch({ type: 'disconnected' });
       return false;
     }
   }, []);
 
-  // Open the socket whenever the target changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: connectionAttempt intentionally restarts the same target
+  // biome-ignore lint/correctness/useExhaustiveDependencies: connectionAttempt intentionally reopens the same logical target
   useEffect(() => {
+    const targetIdentity =
+      target === null
+        ? null
+        : target.kind === 'new'
+          ? `new:${target.instanceId}:${target.profileId}:${target.agentProfileId ?? ''}:${target.capabilityMode ?? ''}`
+          : `attach:${target.sessionId}`;
+    if (targetIdentityRef.current !== targetIdentity) {
+      targetIdentityRef.current = targetIdentity;
+      promotedSessionIdRef.current = null;
+      preparedPromptRequestIdRef.current = null;
+      lastSequenceRef.current = 0;
+      reconnectCountRef.current = 0;
+      cancelReconnect();
+    }
+
     if (target === null) {
       teardown();
       dispatch({ type: 'reset' });
@@ -111,20 +143,21 @@ export function useDaemonSession(
       return;
     }
 
-    if (!authKey) {
+    if (!authKey.trim()) {
       teardown();
       dispatch({ type: 'reset' });
       setConnectionPhase('error');
-      setConnectionError(
-        'Missing daemon auth key. Open Settings to configure it.',
-      );
+      setConnectionError('Configure the daemon key before opening a session.');
       return;
     }
 
     let cancelled = false;
     let timedOut = false;
+    let terminal = false;
+    let reconnectScheduled = false;
     const controller = new AbortController();
     let deadline: number | null = null;
+
     const clearDeadline = () => {
       if (deadline !== null) {
         window.clearTimeout(deadline);
@@ -132,93 +165,158 @@ export function useDaemonSession(
       }
     };
 
-    setConnectionPhase('connecting');
+    const scheduleReconnect = (message: string) => {
+      if (cancelled || terminal || reconnectScheduled) return;
+      clearDeadline();
+      teardown();
+      dispatch({ type: 'disconnected' });
+
+      if (
+        target.kind === 'new' &&
+        promotedSessionIdRef.current === null &&
+        preparedPromptRequestIdRef.current !== null
+      ) {
+        terminal = true;
+        setConnectionPhase('error');
+        setConnectionError(
+          `${message} The first prompt may already be running; the client will not resend it automatically.`,
+        );
+        return;
+      }
+
+      const delay =
+        SESSION_RECONNECT_DELAYS_MS[reconnectCountRef.current] ?? null;
+      if (delay === null) {
+        setConnectionPhase('error');
+        setConnectionError(message);
+        return;
+      }
+
+      reconnectScheduled = true;
+      reconnectCountRef.current += 1;
+      setConnectionPhase('reconnecting');
+      setConnectionError(message);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        setConnectionAttempt((attempt) => attempt + 1);
+      }, delay);
+    };
+
+    setConnectionPhase(
+      reconnectCountRef.current > 0 ? 'reconnecting' : 'connecting',
+    );
     setConnectionError(null);
-    dispatch({
-      type: 'reset',
-      profileId: target.kind === 'new' ? target.profileId : undefined,
-    });
+    if (reconnectCountRef.current === 0) {
+      dispatch({
+        type: 'reset',
+        profileId: target.kind === 'new' ? target.profileId : undefined,
+      });
+    }
 
     deadline = window.setTimeout(() => {
       if (cancelled) return;
       timedOut = true;
-      const error = new Error(
-        `Session connection timed out after ${SESSION_CONNECT_TIMEOUT_MS / 1000} seconds`,
-      );
-      controller.abort(error);
-      teardown();
-      dispatch({ type: 'disconnected' });
-      setConnectionPhase('error');
-      setConnectionError(error.message);
+      const message = `Session connection timed out after ${SESSION_CONNECT_TIMEOUT_MS / 1000} seconds.`;
+      controller.abort(new Error(message));
+      scheduleReconnect(message);
     }, SESSION_CONNECT_TIMEOUT_MS);
 
     const handlers = {
       onMessage: (message: ServerMessage) => {
         if (cancelled) return;
+        if (message.type === 'event') {
+          if (message.sequence <= lastSequenceRef.current) return;
+          if (message.sequence !== lastSequenceRef.current + 1) {
+            scheduleReconnect(
+              `Session events became out of sync at sequence ${message.sequence}.`,
+            );
+            return;
+          }
+          lastSequenceRef.current = message.sequence;
+        } else if (
+          message.type === 'snapshot' ||
+          message.type === 'resync_required'
+        ) {
+          lastSequenceRef.current = message.session.last_sequence;
+        }
         switch (message.type) {
           case 'building':
             setConnectionPhase('preparing');
+            break;
+          case 'session_created':
+            promotedSessionIdRef.current = message.session_id;
+            preparedPromptRequestIdRef.current = null;
+            setCreatedSessionRevision((revision) => revision + 1);
             break;
           case 'ready':
           case 'snapshot':
           case 'resync_required':
             clearDeadline();
+            reconnectCountRef.current = 0;
             setConnectionPhase('ready');
             setConnectionError(null);
             break;
           case 'fatal_error':
+            terminal = true;
             clearDeadline();
             setConnectionPhase('error');
             setConnectionError(message.message);
             break;
         }
         const action = serverMessageToAction(message);
-        if (action !== null) {
-          dispatch(action);
+        if (
+          message.type === 'command_rejected' &&
+          message.request_id === preparedPromptRequestIdRef.current
+        ) {
+          preparedPromptRequestIdRef.current = null;
         }
+        if (action !== null) dispatch(action);
       },
       onClose: (event: CloseEvent) => {
-        if (cancelled) return;
-        clearDeadline();
+        if (cancelled || terminal) return;
         socketRef.current = null;
-        dispatch({ type: 'disconnected' });
-        setConnectionPhase('error');
-        setConnectionError(
-          (current) =>
-            current || event.reason || `WebSocket closed (code ${event.code})`,
+        scheduleReconnect(
+          event.reason || `Session connection closed (code ${event.code}).`,
         );
       },
       onError: (error: Error) => {
-        if (cancelled) return;
-        clearDeadline();
-        teardown();
-        dispatch({ type: 'disconnected' });
-        setConnectionPhase('error');
-        setConnectionError(error.message);
+        if (cancelled || terminal) return;
+        scheduleReconnect(error.message);
       },
     };
 
     (async () => {
       try {
+        const promotedSessionId =
+          target.kind === 'new' ? promotedSessionIdRef.current : null;
         const socket =
-          target.kind === 'new'
-            ? await openNewSession(authKey, target.profileId, handlers, {
+          promotedSessionId !== null
+            ? await attachSession(authKey, promotedSessionId, handlers, {
                 signal: controller.signal,
               })
-            : await attachSession(authKey, target.sessionId, handlers, {
-                signal: controller.signal,
-              });
-        if (cancelled) {
+            : target.kind === 'new'
+              ? await openNewSession(authKey, target.profileId, handlers, {
+                  signal: controller.signal,
+                  agentProfileId: target.agentProfileId,
+                  capabilityMode: target.capabilityMode,
+                })
+              : await attachSession(authKey, target.sessionId, handlers, {
+                  signal: controller.signal,
+                });
+        if (cancelled || terminal) {
           socket.close();
           return;
         }
         socketRef.current = socket;
         setConnectionPhase((current) =>
-          current === 'connecting' ? 'preparing' : current,
+          current === 'connecting' || current === 'reconnecting'
+            ? 'preparing'
+            : current,
         );
       } catch (error) {
-        if (cancelled || timedOut) return;
+        if (cancelled || timedOut || reconnectScheduled) return;
         clearDeadline();
+        terminal = true;
         dispatch({ type: 'disconnected' });
         setConnectionPhase('error');
         setConnectionError(
@@ -231,25 +329,31 @@ export function useDaemonSession(
       cancelled = true;
       clearDeadline();
       controller.abort();
+      cancelReconnect();
       teardown();
     };
-  }, [authKey, target, teardown, connectionAttempt]);
+  }, [authKey, target, teardown, cancelReconnect, connectionAttempt]);
 
   const sendPrompt = useCallback(
-    (text: string) => {
+    (text: string): boolean => {
       const trimmed = text.trim();
-      if (!trimmed) return;
+      if (!trimmed) return false;
+      const requestId = nextRequestId('prompt');
       const content = { type: 'text' as const, value: trimmed };
       const sent = send({
         type: 'prompt',
-        request_id: nextRequestId('prompt'),
+        request_id: requestId,
         content,
       });
       if (sent) {
-        dispatch({ type: 'local_send_prompt', content });
+        if (target?.kind === 'new' && promotedSessionIdRef.current === null) {
+          preparedPromptRequestIdRef.current = requestId;
+        }
+        dispatch({ type: 'local_send_prompt', requestId, content });
       }
+      return sent;
     },
-    [send],
+    [send, target],
   );
 
   const stop = useCallback(() => {
@@ -259,33 +363,36 @@ export function useDaemonSession(
   }, [send, state.activeRunId]);
 
   const answerAsk = useCallback(
-    (askId: string, answers: AskUserAnswer[]) => {
+    (askId: string, answers: AskUserAnswer[]): boolean =>
       send({
         type: 'answer_askuser',
         request_id: nextRequestId('answer'),
         ask_id: askId,
         answers,
-      });
-    },
+      }),
     [send],
   );
 
   const decidePlan = useCallback(
-    (approvalId: string, decision: PlanApprovalDecision) => {
+    (approvalId: string, decision: PlanApprovalDecision): boolean =>
       send({
         type: 'decide_plan_approval',
         request_id: nextRequestId('plan'),
         approval_id: approvalId,
         decision,
-      });
-    },
+      }),
     [send],
   );
 
   const setModel = useCallback(
     (model: string) => {
-      if (!model.trim()) return;
-      send({ type: 'set_model', request_id: nextRequestId('model'), model });
+      const value = model.trim();
+      if (!value) return;
+      send({
+        type: 'set_model',
+        request_id: nextRequestId('model'),
+        model: value,
+      });
     },
     [send],
   );
@@ -297,25 +404,43 @@ export function useDaemonSession(
     [send],
   );
 
+  const setCapabilityMode = useCallback(
+    (capabilityMode: CapabilityMode) => {
+      send({
+        type: 'set_capability_mode',
+        request_id: nextRequestId('capability'),
+        capability_mode: capabilityMode,
+      });
+    },
+    [send],
+  );
+
   const compact = useCallback(
     (instructions?: string) => {
       send({
         type: 'compact',
         request_id: nextRequestId('compact'),
-        instructions: instructions ?? null,
+        instructions: instructions?.trim() || null,
       });
     },
     [send],
   );
 
   const retry = useCallback(() => {
+    cancelReconnect();
+    reconnectCountRef.current = 0;
     setConnectionAttempt((attempt) => attempt + 1);
+  }, [cancelReconnect]);
+
+  const clearNotice = useCallback((index: number) => {
+    dispatch({ type: 'clear_notice', index });
   }, []);
 
   return {
     state,
     connectionPhase,
     connectionError,
+    createdSessionRevision,
     retry,
     sendPrompt,
     stop,
@@ -323,18 +448,22 @@ export function useDaemonSession(
     decidePlan,
     setModel,
     setMode,
+    setCapabilityMode,
     compact,
+    clearNotice,
   };
 }
 
-/**
- * Translate a server frame into a reducer action, or `null` when the frame
- * does not affect session state (control frames, direct command responses).
- */
 function serverMessageToAction(message: ServerMessage): SessionAction | null {
   switch (message.type) {
     case 'ready':
-      return { type: 'ready', config: message.config, mode: message.mode };
+      return {
+        type: 'ready',
+        config: message.config,
+        mode: message.mode,
+        capabilityMode: message.capability_mode,
+        agentProfile: message.agent_profile,
+      };
     case 'session_created':
       return { type: 'session_created', sessionId: message.session_id };
     case 'snapshot':
@@ -356,10 +485,18 @@ function serverMessageToAction(message: ServerMessage): SessionAction | null {
           event: message.event,
         },
       };
+    case 'command_accepted':
+      return {
+        type: 'command_accepted',
+        requestId: message.request_id,
+        queuePosition: message.queue_position ?? null,
+      };
     case 'command_rejected':
-      // Surface the rejection as a transient notice, not a blocking error.
-      return { type: 'notice', message: `${message.code}: ${message.message}` };
-    // Control frames and direct command responses carry no session-state change.
+      return {
+        type: 'command_rejected',
+        requestId: message.request_id,
+        message: `${message.code}: ${message.message}`,
+      };
     default:
       return null;
   }

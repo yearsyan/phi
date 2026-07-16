@@ -1,13 +1,14 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     routing::get,
 };
 
 use super::{
     ApiError, AppState,
     dto::{
-        ProviderResponse, ProvidersResponse, PublicProviderConfig, PutProviderRequest,
+        AgentProfileResponse, AgentProfilesResponse, ProviderResponse, ProvidersResponse,
+        PublicAgentProfile, PublicProviderConfig, PutAgentProfileRequest, PutProviderRequest,
         SessionSummaryDto, SessionsResponse, SkillDiagnosticDto, SkillSummaryDto, SkillsResponse,
     },
 };
@@ -17,6 +18,11 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/provider", get(get_provider).put(put_provider))
         .route("/v1/providers", get(list_providers))
+        .route("/v1/agent-profiles", get(list_agent_profiles))
+        .route(
+            "/v1/agent-profiles/{agent_profile_id}",
+            get(get_agent_profile).put(put_agent_profile),
+        )
         .route(
             "/v1/providers/{profile_id}",
             get(get_provider_by_id).put(put_provider_by_id),
@@ -96,6 +102,47 @@ async fn put_provider_by_id(
         profile_id.trim(),
         Some(&config),
     )))
+}
+
+async fn list_agent_profiles(
+    State(state): State<AppState>,
+) -> Result<Json<AgentProfilesResponse>, ApiError> {
+    let agent_profiles = state
+        .service()
+        .agent_profiles()
+        .await
+        .map_err(ApiError::service)?
+        .into_iter()
+        .map(PublicAgentProfile::from)
+        .collect();
+    Ok(Json(AgentProfilesResponse { agent_profiles }))
+}
+
+async fn get_agent_profile(
+    State(state): State<AppState>,
+    Path(agent_profile_id): Path<String>,
+) -> Result<Json<AgentProfileResponse>, ApiError> {
+    let profile = state
+        .service()
+        .agent_profile(&agent_profile_id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(AgentProfileResponse::from_profile(profile)))
+}
+
+async fn put_agent_profile(
+    State(state): State<AppState>,
+    Path(agent_profile_id): Path<String>,
+    request: Result<Json<PutAgentProfileRequest>, JsonRejection>,
+) -> Result<Json<AgentProfileResponse>, ApiError> {
+    let Json(request) = request
+        .map_err(|error| ApiError::bad_request("invalid_agent_profile", error.body_text()))?;
+    let profile = state
+        .service()
+        .configure_agent_profile(&agent_profile_id, request.into())
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(AgentProfileResponse::from_profile(Some(profile))))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<SessionsResponse>, ApiError> {

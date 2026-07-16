@@ -7,15 +7,14 @@ use std::{
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::error::ToolError;
+use crate::{
+    Workspace,
+    error::ToolError,
+    tool::{CapabilityMode, ToolExecutionContext},
+};
 
 pub(super) fn normalize_cwd(cwd: impl Into<PathBuf>) -> PathBuf {
-    let cwd = cwd.into();
-    if cwd.is_absolute() {
-        cwd
-    } else {
-        env::current_dir().map_or(cwd.clone(), |current| current.join(cwd))
-    }
+    Workspace::new(cwd).root().to_owned()
 }
 
 pub(super) fn resolve_path(cwd: &Path, raw_path: &str) -> Result<PathBuf, ToolError> {
@@ -41,6 +40,36 @@ pub(super) fn resolve_path(cwd: &Path, raw_path: &str) -> Result<PathBuf, ToolEr
     } else {
         cwd.join(expanded)
     })
+}
+
+pub(super) async fn resolve_path_for_context(
+    cwd: &Path,
+    raw_path: &str,
+    context: Option<&ToolExecutionContext>,
+) -> Result<PathBuf, ToolError> {
+    let path = resolve_path(cwd, raw_path)?;
+    let Some(context) = context else {
+        return Ok(path);
+    };
+    if context.capability_mode() == CapabilityMode::FullAccess {
+        return Ok(path);
+    }
+
+    let workspace = context.workspace().ok_or_else(|| {
+        ToolError::new("restricted capability mode requires a configured workspace")
+    })?;
+    let canonical_workspace = tokio::fs::canonicalize(workspace.root())
+        .await
+        .map_err(|error| io_error("could not canonicalize workspace", workspace.root(), error))?;
+    let canonical_target = canonical_mutation_key(&path).await;
+    if !canonical_target.starts_with(&canonical_workspace) {
+        return Err(ToolError::new(format!(
+            "path {} is outside the configured workspace {}",
+            path.display(),
+            workspace.root().display()
+        )));
+    }
+    Ok(path)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -119,6 +148,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::tool::{AgentMode, CapabilityMode, ToolExecutionContext};
+
+    fn restricted_context(
+        workspace: &Path,
+        capability_mode: CapabilityMode,
+    ) -> ToolExecutionContext {
+        ToolExecutionContext::detached("test").with_workspace_policy(
+            Some(Workspace::new(workspace)),
+            AgentMode::Default,
+            capability_mode,
+        )
+    }
 
     #[test]
     fn leading_at_is_a_literal_file_name() {
@@ -155,6 +196,70 @@ mod tests {
         assert_eq!(
             canonical_mutation_key(&real.join("new/file.txt")).await,
             canonical_mutation_key(&link.join("new/file.txt")).await
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_capabilities_confine_paths_to_the_workspace() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("outside.txt");
+        let context = restricted_context(&workspace, CapabilityMode::WorkspaceEdit);
+
+        assert!(
+            resolve_path_for_context(&workspace, outside.to_str().unwrap(), Some(&context))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("outside the configured workspace")
+        );
+        assert!(
+            resolve_path_for_context(&workspace, "../outside.txt", Some(&context))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolve_path_for_context(&workspace, "nested/file.txt", Some(&context))
+                .await
+                .unwrap(),
+            workspace.join("nested/file.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_access_preserves_absolute_path_compatibility() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("outside.txt");
+        let context = restricted_context(&workspace, CapabilityMode::FullAccess);
+
+        assert_eq!(
+            resolve_path_for_context(&workspace, outside.to_str().unwrap(), Some(&context))
+                .await
+                .unwrap(),
+            outside
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_capabilities_reject_a_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, workspace.join("link")).unwrap();
+        let context = restricted_context(&workspace, CapabilityMode::WorkspaceEdit);
+
+        assert!(
+            resolve_path_for_context(&workspace, "link/new.txt", Some(&context))
+                .await
+                .is_err()
         );
     }
 }

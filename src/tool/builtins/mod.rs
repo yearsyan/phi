@@ -7,7 +7,10 @@ mod read;
 pub(crate) mod truncate;
 mod write;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub use bash::{BashTool, DEFAULT_BASH_TIMEOUT};
 pub use bash_classifier::{classify_bash_arguments_concurrency, classify_bash_concurrency};
@@ -17,8 +20,8 @@ pub use truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 pub use write::WriteTool;
 
 use self::bash_task::{BashTaskOutputTool, BashTaskRegistry, BashTaskStopTool};
-use self::common::normalize_cwd;
 use super::Tool;
+use crate::Workspace;
 
 /// Selection of built-in local tools to install on an [`AgentBuilder`](crate::AgentBuilder).
 ///
@@ -27,7 +30,7 @@ use super::Tool;
 /// individual capabilities.
 #[derive(Clone, Debug)]
 pub struct BuiltinTools {
-    cwd: PathBuf,
+    workspace: Workspace,
     read: bool,
     bash: bool,
     edit: bool,
@@ -36,8 +39,12 @@ pub struct BuiltinTools {
 
 impl BuiltinTools {
     pub fn all(cwd: impl Into<PathBuf>) -> Self {
+        Self::all_in(Workspace::new(cwd))
+    }
+
+    pub fn all_in(workspace: Workspace) -> Self {
         Self {
-            cwd: normalize_cwd(cwd),
+            workspace,
             read: true,
             bash: true,
             edit: true,
@@ -46,13 +53,32 @@ impl BuiltinTools {
     }
 
     pub fn none(cwd: impl Into<PathBuf>) -> Self {
+        Self::none_in(Workspace::new(cwd))
+    }
+
+    pub fn none_in(workspace: Workspace) -> Self {
         Self {
-            cwd: normalize_cwd(cwd),
+            workspace,
             read: false,
             bash: false,
             edit: false,
             write: false,
         }
+    }
+
+    /// Returns the normalized working directory shared by the selected tools.
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    pub fn workspace_dir(&self) -> &Path {
+        self.workspace.root()
+    }
+
+    /// Retargets the selected capabilities to another session workspace.
+    pub fn in_workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     pub fn with_read(mut self) -> Self {
@@ -78,21 +104,21 @@ impl BuiltinTools {
     pub(crate) fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(6);
         if self.read {
-            tools.push(Arc::new(ReadTool::new(self.cwd.clone())));
+            tools.push(Arc::new(ReadTool::new(self.workspace.root())));
         }
         if self.bash {
             let registry = BashTaskRegistry::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
             tools.push(Arc::new(
-                BashTool::new(self.cwd.clone()).task_registry(registry.clone()),
+                BashTool::new(self.workspace.root()).task_registry(registry.clone()),
             ));
             tools.push(Arc::new(BashTaskOutputTool::new(registry.clone())));
             tools.push(Arc::new(BashTaskStopTool::new(registry)));
         }
         if self.edit {
-            tools.push(Arc::new(EditTool::new(self.cwd.clone())));
+            tools.push(Arc::new(EditTool::new(self.workspace.root())));
         }
         if self.write {
-            tools.push(Arc::new(WriteTool::new(self.cwd)));
+            tools.push(Arc::new(WriteTool::new(self.workspace.root())));
         }
         tools
     }
@@ -111,6 +137,15 @@ mod tests {
             .map(|tool| tool.definition().name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["read", "edit"]);
+    }
+
+    #[test]
+    fn exposes_the_normalized_workspace_directory() {
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(
+            BuiltinTools::none("relative-workspace").workspace_dir(),
+            current.join("relative-workspace")
+        );
     }
 
     #[test]

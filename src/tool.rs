@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::{
+    Workspace,
     error::ToolError,
     types::{Content, ContentPart, ToolDefinition},
 };
@@ -50,6 +51,122 @@ impl AgentMode {
         } else {
             Self::Default
         }
+    }
+}
+
+/// The maximum tool capability granted to an agent.
+///
+/// This boundary is independent from [`AgentMode`]. In particular, Plan mode
+/// remains more restrictive than every capability mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMode {
+    /// Read-only and agent-local coordination tools.
+    ReadOnly,
+    /// Read-only, coordination, and workspace-scoped file mutation tools.
+    WorkspaceEdit,
+    /// Every registered tool allowed by the current [`AgentMode`].
+    #[default]
+    FullAccess,
+}
+
+impl CapabilityMode {
+    pub fn allows(self, effect: ToolEffect) -> bool {
+        match self {
+            Self::ReadOnly => matches!(
+                effect,
+                ToolEffect::ReadOnly | ToolEffect::Internal | ToolEffect::PlanOnly
+            ),
+            Self::WorkspaceEdit => matches!(
+                effect,
+                ToolEffect::ReadOnly
+                    | ToolEffect::Internal
+                    | ToolEffect::PlanOnly
+                    | ToolEffect::WorkspaceWrite
+            ),
+            Self::FullAccess => true,
+        }
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.rank() <= other.rank()
+    }
+
+    pub(crate) fn safest(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WorkspaceEdit => 1,
+            Self::FullAccess => 2,
+        }
+    }
+}
+
+/// Name-based tool selection applied before execution-mode boundaries.
+///
+/// A configured deny takes precedence over the allow-list. Mandatory harness
+/// tools bypass only this name policy; their effects remain subject to
+/// [`AgentMode`] and [`CapabilityMode`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_tools: Option<HashSet<String>>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    denied_tools: HashSet<String>,
+}
+
+impl ToolPolicy {
+    pub fn allow_only<I, S>(tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed_tools: Some(tools.into_iter().map(Into::into).collect()),
+            denied_tools: HashSet::new(),
+        }
+    }
+
+    pub fn with_allowed_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_denied_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.denied_tools.extend(tools.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn allowed_tools(&self) -> Option<&HashSet<String>> {
+        self.allowed_tools.as_ref()
+    }
+
+    pub fn denied_tools(&self) -> &HashSet<String> {
+        &self.denied_tools
+    }
+
+    pub fn allows(&self, tool_name: &str, mandatory: bool) -> bool {
+        mandatory
+            || (!self.denied_tools.contains(tool_name)
+                && self
+                    .allowed_tools
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(tool_name)))
     }
 }
 
@@ -237,6 +354,9 @@ pub struct ToolExecutionContext {
     visible_tool_results: Arc<HashSet<String>>,
     progress: Option<ProgressReporter>,
     progress_active: Arc<AtomicBool>,
+    workspace: Option<Workspace>,
+    mode: AgentMode,
+    capability_mode: CapabilityMode,
 }
 
 impl ToolExecutionContext {
@@ -247,6 +367,9 @@ impl ToolExecutionContext {
             visible_tool_results: Arc::new(HashSet::new()),
             progress: None,
             progress_active: Arc::new(AtomicBool::new(true)),
+            workspace: None,
+            mode: AgentMode::default(),
+            capability_mode: CapabilityMode::default(),
         }
     }
 
@@ -262,7 +385,22 @@ impl ToolExecutionContext {
             visible_tool_results,
             progress,
             progress_active: Arc::new(AtomicBool::new(true)),
+            workspace: None,
+            mode: AgentMode::default(),
+            capability_mode: CapabilityMode::default(),
         }
+    }
+
+    pub(crate) fn with_workspace_policy(
+        mut self,
+        workspace: Option<Workspace>,
+        mode: AgentMode,
+        capability_mode: CapabilityMode,
+    ) -> Self {
+        self.workspace = workspace;
+        self.mode = mode;
+        self.capability_mode = capability_mode;
+        self
     }
 
     pub fn call_id(&self) -> &str {
@@ -283,6 +421,18 @@ impl ToolExecutionContext {
 
     pub fn has_visible_tool_result(&self, call_id: &str) -> bool {
         self.visible_tool_results.contains(call_id)
+    }
+
+    pub fn workspace(&self) -> Option<&Workspace> {
+        self.workspace.as_ref()
+    }
+
+    pub fn mode(&self) -> AgentMode {
+        self.mode
+    }
+
+    pub fn capability_mode(&self) -> CapabilityMode {
+        self.capability_mode
     }
 
     pub fn report_progress(&self, progress: impl Into<ToolProgress>) {
@@ -311,6 +461,9 @@ impl fmt::Debug for ToolExecutionContext {
             .field("cancelled", &self.is_cancelled())
             .field("visible_tool_results", &self.visible_tool_results.len())
             .field("progress_enabled", &self.progress.is_some())
+            .field("workspace", &self.workspace)
+            .field("mode", &self.mode)
+            .field("capability_mode", &self.capability_mode)
             .finish()
     }
 }
@@ -421,12 +574,20 @@ pub trait Tool: Send + Sync {
         ToolEffect::ExternalSideEffect
     }
 
+    /// Declares the maximum possible effect for one invocation.
+    ///
+    /// Definitions are filtered with [`Tool::effect`], while scheduling and
+    /// execution use this argument-aware value.
+    fn effect_for(&self, _arguments: &Value) -> ToolEffect {
+        self.effect()
+    }
+
     /// Classifies this invocation for in-batch scheduling.
     ///
     /// Tools such as a shell may conservatively inspect `arguments` and return
     /// [`ToolConcurrency::Safe`] only for commands proven read-only.
     fn concurrency(&self, _arguments: &Value) -> ToolConcurrency {
-        match self.effect() {
+        match self.effect_for(_arguments) {
             ToolEffect::ReadOnly => ToolConcurrency::Safe,
             ToolEffect::Internal
             | ToolEffect::PlanOnly
@@ -445,5 +606,39 @@ pub trait Tool: Send + Sync {
         _context: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         self.execute(arguments).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_modes_form_a_conservative_linear_boundary() {
+        assert!(CapabilityMode::ReadOnly.is_subset_of(CapabilityMode::WorkspaceEdit));
+        assert!(CapabilityMode::WorkspaceEdit.is_subset_of(CapabilityMode::FullAccess));
+        assert!(!CapabilityMode::FullAccess.is_subset_of(CapabilityMode::WorkspaceEdit));
+
+        assert!(CapabilityMode::ReadOnly.allows(ToolEffect::ReadOnly));
+        assert!(!CapabilityMode::ReadOnly.allows(ToolEffect::WorkspaceWrite));
+        assert!(CapabilityMode::WorkspaceEdit.allows(ToolEffect::WorkspaceWrite));
+        assert!(!CapabilityMode::WorkspaceEdit.allows(ToolEffect::ExternalSideEffect));
+        assert!(CapabilityMode::FullAccess.allows(ToolEffect::ExternalSideEffect));
+        assert!(!AgentMode::Plan.allows(ToolEffect::WorkspaceWrite));
+    }
+
+    #[test]
+    fn mandatory_tools_bypass_name_policy_but_denies_win_for_ordinary_tools() {
+        let policy = ToolPolicy::allow_only(["read", "write"]).with_denied_tools(["write"]);
+        assert!(policy.allows("read", false));
+        assert!(!policy.allows("write", false));
+        assert!(!policy.allows("bash", false));
+        assert!(policy.allows("bash", true));
+
+        let serialized = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolPolicy>(serialized).unwrap(),
+            policy
+        );
     }
 }

@@ -18,9 +18,11 @@
  */
 import type {
   AgentMode,
+  AgentProfileRef,
   AskUserRequest,
   AssistantDelta,
   AssistantDraft,
+  CapabilityMode,
   Content,
   ContextUsage,
   EventDto,
@@ -31,6 +33,7 @@ import type {
   SessionDto,
   SessionStatus,
   SubagentSummary,
+  TokenUsage,
   ToolCall,
   ToolCallDraft,
   ToolProgress,
@@ -97,6 +100,15 @@ export interface RunActivity {
   status: 'queued' | 'running' | 'completed' | 'stopped' | 'failed';
   turns: TurnActivity[];
   errorMessage: string | null;
+  /** Transcript length when this run began, used to place live activity. */
+  historyStart: number;
+}
+
+export interface PendingPrompt {
+  requestId: string;
+  content: Content;
+  status: 'sending' | 'accepted' | 'queued';
+  queuePosition: number | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -106,9 +118,11 @@ export interface RunActivity {
 export interface SessionState {
   sessionId: string | null;
   profileId: string | null;
+  agentProfile: AgentProfileRef | null;
   ready: boolean;
   status: SessionStatus;
   mode: AgentMode;
+  capabilityMode: CapabilityMode;
   config: SessionConfig | null;
   usage: Usage | null;
   contextUsage: ContextUsage | null;
@@ -121,8 +135,8 @@ export interface SessionState {
   subagents: SubagentSummary[];
   history: PublicMessage[];
   activeRun: RunActivity | null;
-  /** Optimistic user message echoed before the server acknowledges it. */
-  pendingUser: Content | null;
+  /** Optimistic prompts waiting for their durable user-message echo. */
+  pendingPrompts: PendingPrompt[];
   fatalError: { code: string; message: string } | null;
   notices: string[];
   lastSequence: number;
@@ -133,9 +147,11 @@ export interface SessionState {
 export const initialSessionState: SessionState = {
   sessionId: null,
   profileId: null,
+  agentProfile: null,
   ready: false,
   status: 'awaiting_first_prompt',
   mode: 'default',
+  capabilityMode: 'full_access',
   config: null,
   usage: null,
   contextUsage: null,
@@ -147,7 +163,7 @@ export const initialSessionState: SessionState = {
   subagents: [],
   history: [],
   activeRun: null,
-  pendingUser: null,
+  pendingPrompts: [],
   fatalError: null,
   notices: [],
   lastSequence: 0,
@@ -160,7 +176,13 @@ export const initialSessionState: SessionState = {
 
 export type SessionAction =
   | { type: 'reset'; profileId?: string }
-  | { type: 'ready'; config: SessionConfig; mode: AgentMode }
+  | {
+      type: 'ready';
+      config: SessionConfig;
+      mode: AgentMode;
+      capabilityMode: CapabilityMode;
+      agentProfile: AgentProfileRef;
+    }
   | { type: 'session_created'; sessionId: string }
   | { type: 'snapshot'; session: SessionDto }
   | { type: 'resync'; session: SessionDto }
@@ -168,7 +190,13 @@ export type SessionAction =
   | { type: 'event'; envelope: EventEnvelopeInput }
   | { type: 'fatal_error'; code: string; message: string }
   | { type: 'notice'; message: string }
-  | { type: 'local_send_prompt'; content: Content }
+  | { type: 'local_send_prompt'; requestId: string; content: Content }
+  | {
+      type: 'command_accepted';
+      requestId: string;
+      queuePosition: number | null;
+    }
+  | { type: 'command_rejected'; requestId: string; message: string }
   | { type: 'clear_notice'; index: number };
 
 export interface EventEnvelopeInput {
@@ -202,13 +230,16 @@ function fromSnapshot(session: SessionDto): SessionState {
           status: 'running',
           turns: [],
           errorMessage: null,
+          historyStart: session.history.length,
         };
   return {
     sessionId: session.session_id,
     profileId: session.profile_id,
+    agentProfile: session.agent_profile,
     ready: true,
     status: session.status,
     mode: session.mode,
+    capabilityMode: session.capability_mode,
     config: session.config,
     usage: session.usage,
     contextUsage: session.usage.context,
@@ -220,7 +251,7 @@ function fromSnapshot(session: SessionDto): SessionState {
     subagents: session.subagents,
     history: session.history,
     activeRun,
-    pendingUser: null,
+    pendingPrompts: [],
     fatalError: null,
     notices: [],
     lastSequence: session.last_sequence,
@@ -248,12 +279,6 @@ function shallowEqualContent(a: Content | null, b: Content | null): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function shallowEqualUser(a: Content | null, b: PublicMessage): boolean {
-  return (
-    b.role === 'user' && b.content !== null && shallowEqualContent(a, b.content)
-  );
-}
-
 /* -------------------------------------------------------------------------- */
 /* Run / turn immutable helpers                                               */
 /* -------------------------------------------------------------------------- */
@@ -265,7 +290,13 @@ function startRun(state: SessionState, runId: string): SessionState {
     status: 'running',
     queuedRuns: Math.max(0, state.queuedRuns - 1),
     draft: null,
-    activeRun: { runId, status: 'running', turns: [], errorMessage: null },
+    activeRun: {
+      runId,
+      status: 'running',
+      turns: [],
+      errorMessage: null,
+      historyStart: state.history.length,
+    },
   };
 }
 
@@ -313,13 +344,21 @@ function ensureTurn(
   runId: string | undefined,
   turnNumber: number,
 ): SessionState {
-  return updateCurrentTurn(state, runId, (turn, current) => {
-    if (current === turnNumber) return { turn, turnNumber };
-    return {
-      turn: { turn: turnNumber, steps: [], finished: false },
-      turnNumber,
-    };
-  });
+  if (state.activeRun === null) return state;
+  if (runId !== undefined && state.activeRun.runId !== runId) return state;
+  if (state.activeRun.turns.some((turn) => turn.turn === turnNumber)) {
+    return state;
+  }
+  return {
+    ...state,
+    activeRun: {
+      ...state.activeRun,
+      turns: [
+        ...state.activeRun.turns,
+        { turn: turnNumber, steps: [], finished: false },
+      ],
+    },
+  };
 }
 
 function recordToolStep(
@@ -372,11 +411,19 @@ function pushStep(
 
 function finalizeRun(
   state: SessionState,
+  runId: string,
   status: 'completed' | 'stopped' | 'failed',
   message?: string,
 ): SessionState {
-  if (state.activeRun === null) {
-    return { ...state, status: 'idle', activeRunId: null, draft: null };
+  if (
+    state.activeRun === null ||
+    state.activeRun.runId !== runId ||
+    state.activeRunId !== runId
+  ) {
+    return {
+      ...state,
+      queuedRuns: Math.max(0, state.queuedRuns - 1),
+    };
   }
   return {
     ...state,
@@ -413,6 +460,8 @@ export function sessionReducer(
         ready: true,
         config: action.config,
         mode: action.mode,
+        capabilityMode: action.capabilityMode,
+        agentProfile: action.agentProfile,
       };
 
     case 'session_created':
@@ -426,11 +475,7 @@ export function sessionReducer(
       return {
         ...state,
         ready: false,
-        status: 'offline',
-        activeRunId: null,
-        queuedRuns: 0,
-        draft: null,
-        pendingUser: null,
+        pendingPrompts: [],
       };
 
     case 'fatal_error':
@@ -438,7 +483,7 @@ export function sessionReducer(
         ...state,
         ready: false,
         status: 'offline',
-        pendingUser: null,
+        pendingPrompts: [],
         fatalError: { code: action.code, message: action.message },
       };
 
@@ -446,7 +491,42 @@ export function sessionReducer(
       return { ...state, notices: [...state.notices, action.message] };
 
     case 'local_send_prompt':
-      return { ...state, pendingUser: action.content };
+      return {
+        ...state,
+        pendingPrompts: [
+          ...state.pendingPrompts,
+          {
+            requestId: action.requestId,
+            content: action.content,
+            status: 'sending',
+            queuePosition: null,
+          },
+        ],
+      };
+
+    case 'command_accepted':
+      return {
+        ...state,
+        pendingPrompts: state.pendingPrompts.map((prompt) =>
+          prompt.requestId === action.requestId
+            ? {
+                ...prompt,
+                status: action.queuePosition !== null ? 'queued' : 'accepted',
+                queuePosition: action.queuePosition,
+              }
+            : prompt,
+        ),
+      };
+
+    case 'command_rejected': {
+      return {
+        ...state,
+        pendingPrompts: state.pendingPrompts.filter(
+          (prompt) => prompt.requestId !== action.requestId,
+        ),
+        notices: [...state.notices, action.message],
+      };
+    }
 
     case 'clear_notice': {
       const notices = state.notices.slice();
@@ -461,8 +541,8 @@ export function sessionReducer(
       if (sequence <= state.lastSequence) {
         return state;
       }
-      if (sequence !== state.lastSequence + 1) {
-        return { ...state, resyncNeeded: true, lastSequence: sequence };
+      if (state.resyncNeeded || sequence !== state.lastSequence + 1) {
+        return { ...state, resyncNeeded: true };
       }
       const next = applyEvent(state, event, run_id);
       return { ...next, lastSequence: sequence };
@@ -489,19 +569,22 @@ function applyEvent(
       return startRun(state, event.run_id);
 
     case 'run_completed':
-      return finalizeRun(state, 'completed');
+      return finalizeRun(state, event.run_id, 'completed');
 
     case 'run_stopped':
-      return finalizeRun(state, 'stopped');
+      return finalizeRun(state, event.run_id, 'stopped');
 
     case 'run_failed':
-      return finalizeRun(state, 'failed', event.message);
+      return finalizeRun(state, event.run_id, 'failed', event.message);
 
     case 'config_changed':
       return { ...state, config: event.config };
 
     case 'mode_changed':
       return { ...state, mode: event.mode };
+
+    case 'capability_mode_changed':
+      return { ...state, capabilityMode: event.capability_mode };
 
     case 'askuser_requested':
       return { ...state, pendingAsks: [...state.pendingAsks, event.request] };
@@ -561,7 +644,9 @@ function applyEvent(
     }
 
     case 'message_end':
-      return handleRoleMessage(state, event.message);
+      // User/tool messages are already projected at message_start or turn_end.
+      // Assistant final content is committed atomically by turn_end.
+      return state;
 
     case 'message_aborted':
       return { ...state, draft: null };
@@ -666,12 +751,36 @@ function applyEvent(
         message: 'compacting context…',
       });
 
-    case 'context_compaction_completed':
-      return pushStep(state, runId, {
+    case 'context_compaction_completed': {
+      const withStep = pushStep(state, runId, {
         kind: 'compaction',
         phase: 'completed',
         message: `context compacted (${event.before_message_count} → ${event.after_message_count} messages)`,
       });
+      const history =
+        event.changed_from <= withStep.history.length
+          ? [
+              ...withStep.history.slice(0, event.changed_from),
+              ...event.replacement,
+            ]
+          : withStep.history;
+      return {
+        ...withStep,
+        history,
+        draft: null,
+        usage: withStep.usage
+          ? {
+              ...withStep.usage,
+              last: null,
+              context: null,
+              cumulative: event.usage
+                ? addUsage(withStep.usage.cumulative, event.usage)
+                : withStep.usage.cumulative,
+            }
+          : null,
+        contextUsage: null,
+      };
+    }
 
     case 'context_compaction_failed':
       return pushStep(state, runId, {
@@ -685,15 +794,13 @@ function applyEvent(
         ...state,
         usage: {
           last: event.usage,
-          context: event.context_usage ?? state.contextUsage,
-          cumulative: state.usage?.cumulative ?? {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            cached_input_tokens: 0,
-          },
+          context: event.context_usage,
+          cumulative: addUsage(
+            state.usage?.cumulative ?? emptyUsage(),
+            event.usage,
+          ),
         },
-        contextUsage: event.context_usage ?? state.contextUsage,
+        contextUsage: event.context_usage,
       };
 
     case 'error':
@@ -709,16 +816,25 @@ function handleRoleMessage(
   message: PublicMessage,
 ): SessionState {
   if (message.role === 'user') {
-    // The server echoes the committed user prompt; drop the optimistic
-    // placeholder and append once if not already present.
+    // The server echoes each committed user prompt. Remove exactly one matching
+    // optimistic entry so identical queued prompts remain distinct.
+    const pendingIndex = state.pendingPrompts.findIndex((prompt) =>
+      shallowEqualContent(prompt.content, message.content),
+    );
+    const pendingPrompts =
+      pendingIndex < 0
+        ? state.pendingPrompts
+        : state.pendingPrompts.filter((_, index) => index !== pendingIndex);
     const last = state.history[state.history.length - 1];
-    const alreadyEchoed =
-      last !== undefined && shallowEqualUser(state.pendingUser, last);
-    const history =
-      alreadyEchoed || shallowEqualUser(state.pendingUser, message)
-        ? state.history
-        : [...state.history, message];
-    return { ...state, history, pendingUser: null };
+    const duplicateFrame =
+      pendingIndex < 0 &&
+      last !== undefined &&
+      last.role === 'user' &&
+      shallowEqualContent(last.content, message.content);
+    const history = duplicateFrame
+      ? state.history
+      : [...state.history, message];
+    return { ...state, history, pendingPrompts };
   }
   if (message.role === 'assistant') {
     // Begin a fresh assistant draft (text/tool_calls stream via message_update).
@@ -751,6 +867,24 @@ function applyDelta(
     toolCalls.sort((a, b) => a.index - b.index);
   }
   return { ...draft, tool_calls: toolCalls };
+}
+
+function emptyUsage(): TokenUsage {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    cached_input_tokens: 0,
+  };
+}
+
+function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
+  return {
+    input_tokens: left.input_tokens + right.input_tokens,
+    output_tokens: left.output_tokens + right.output_tokens,
+    total_tokens: left.total_tokens + right.total_tokens,
+    cached_input_tokens: left.cached_input_tokens + right.cached_input_tokens,
+  };
 }
 
 // Re-exported for tests / type narrowing.

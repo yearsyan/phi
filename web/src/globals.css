@@ -1,92 +1,85 @@
-/*
- * Global design tokens and base styles for the Phi web client.
- *
- * Color tokens are scoped under [data-theme="dark"] / [data-theme="light"] on
- * the root element; every CSS module references the same `--phi-*` custom
- * properties, so a theme switch is a single attribute change. Component styling
- * stays in CSS Modules (no Tailwind).
- */
-
 :root {
-  /* Shared (non-color) tokens. */
-  --phi-mono:
-    "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
   --phi-sans:
-    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-
-  --phi-radius: 8px;
-  --phi-radius-lg: 12px;
-
-  /* Color tokens are set per-theme below; default to dark so the page is
-     legible before the pre-paint script runs. */
+  --phi-mono:
+    "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+  --phi-serif: Georgia, "Times New Roman", serif;
+  --phi-radius-sm: 4px;
+  --phi-radius: 6px;
+  --phi-radius-lg: 8px;
   color-scheme: dark;
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-
-  --phi-bg: #0d1117;
-  --phi-bg-elevated: #11161f;
-  --phi-surface: #161b22;
-  --phi-surface-2: #1c2230;
-  --phi-surface-hover: #222a39;
-  --phi-border: #2a313c;
-  --phi-border-strong: #3a4150;
-
-  --phi-text: #d7dde6;
-  --phi-text-strong: #f1f4f8;
-  --phi-text-muted: #8b94a3;
-
-  --phi-accent: #4f8cff;
-  --phi-accent-hover: #6a9eff;
-  --phi-accent-soft: rgba(79, 140, 255, 0.16);
-
-  --phi-user-bubble: #1c2740;
-
-  --phi-success: #2ea043;
-  --phi-warning: #d29922;
-  --phi-danger: #f85149;
-  --phi-danger-soft: rgba(248, 81, 73, 0.14);
-
-  --phi-code-bg: #0a0e14;
-  --phi-code-text: #c9d1d9;
-
-  --phi-shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.55);
-  --phi-overlay: rgba(0, 0, 0, 0.55);
+  --phi-bg: #090909;
+  --phi-sidebar: #0d0d0d;
+  --phi-bg-elevated: #101010;
+  --phi-surface: #151515;
+  --phi-surface-2: #1b1b1b;
+  --phi-surface-3: #222222;
+  --phi-surface-hover: #1d1d1d;
+  --phi-border: #292929;
+  --phi-border-strong: #3b3b3b;
+  --phi-text: #d4d4d4;
+  --phi-text-strong: #fafafa;
+  --phi-text-muted: #a0a0a0;
+  --phi-text-dim: #707070;
+  --phi-accent: #f2f2f2;
+  --phi-accent-hover: #ffffff;
+  --phi-accent-contrast: #0a0a0a;
+  --phi-accent-soft: rgba(255, 255, 255, 0.05);
+  --phi-accent-soft-strong: rgba(255, 255, 255, 0.09);
+  --phi-accent-border: rgba(255, 255, 255, 0.18);
+  --phi-success: #8c9990;
+  --phi-success-soft: rgba(140, 153, 144, 0.1);
+  --phi-warning: #b19c75;
+  --phi-warning-soft: rgba(177, 156, 117, 0.1);
+  --phi-danger: #b97878;
+  --phi-danger-soft: rgba(185, 120, 120, 0.1);
+  --phi-user-bubble: #1b1b1b;
+  --phi-code-bg: #060606;
+  --phi-code-text: #dedede;
+  --phi-overlay: rgba(0, 0, 0, 0.72);
+  --phi-shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.46);
+  --phi-shadow-composer: 0 8px 24px rgba(0, 0, 0, 0.28);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-
-  --phi-bg: #f6f8fa;
+  --phi-bg: #f5f5f5;
+  --phi-sidebar: #eeeeee;
   --phi-bg-elevated: #ffffff;
   --phi-surface: #ffffff;
-  --phi-surface-2: #eef1f5;
-  --phi-surface-hover: #e4e8ee;
-  --phi-border: #d3d9e0;
-  --phi-border-strong: #b9c1cc;
-
-  --phi-text: #2f363d;
-  --phi-text-strong: #11161c;
-  --phi-text-muted: #5c6571;
-
-  --phi-accent: #2f6fd8;
-  --phi-accent-hover: #2558b8;
-  --phi-accent-soft: rgba(47, 111, 216, 0.1);
-
-  --phi-user-bubble: #e3ecfb;
-
-  --phi-success: #1c7e34;
-  --phi-warning: #9a6700;
-  --phi-danger: #cf222e;
-  --phi-danger-soft: rgba(207, 34, 46, 0.08);
-
-  --phi-code-bg: #f3f5f8;
-  --phi-code-text: #1f242b;
-
-  --phi-shadow-modal: 0 20px 50px rgba(15, 23, 42, 0.18);
-  --phi-overlay: rgba(15, 23, 42, 0.35);
+  --phi-surface-2: #f2f2f2;
+  --phi-surface-3: #e8e8e8;
+  --phi-surface-hover: #eaeaea;
+  --phi-border: #d9d9d9;
+  --phi-border-strong: #bdbdbd;
+  --phi-text: #333333;
+  --phi-text-strong: #111111;
+  --phi-text-muted: #686868;
+  --phi-text-dim: #929292;
+  --phi-accent: #171717;
+  --phi-accent-hover: #000000;
+  --phi-accent-contrast: #ffffff;
+  --phi-accent-soft: rgba(0, 0, 0, 0.04);
+  --phi-accent-soft-strong: rgba(0, 0, 0, 0.08);
+  --phi-accent-border: rgba(0, 0, 0, 0.18);
+  --phi-success: #5f6d63;
+  --phi-success-soft: rgba(95, 109, 99, 0.08);
+  --phi-warning: #816f4c;
+  --phi-warning-soft: rgba(129, 111, 76, 0.08);
+  --phi-danger: #945b5b;
+  --phi-danger-soft: rgba(148, 91, 91, 0.08);
+  --phi-user-bubble: #e8e8e8;
+  --phi-code-bg: #161616;
+  --phi-code-text: #f2f2f2;
+  --phi-overlay: rgba(0, 0, 0, 0.34);
+  --phi-shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.16);
+  --phi-shadow-composer: 0 8px 20px rgba(0, 0, 0, 0.1);
 }
 
 * {
@@ -96,45 +89,78 @@
 html,
 body,
 #root {
+  width: 100%;
+  min-width: 0;
   height: 100%;
   margin: 0;
 }
 
 body {
+  overflow: hidden;
   background: var(--phi-bg);
   color: var(--phi-text);
   font-family: var(--phi-sans);
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  transition:
-    background-color 0.16s ease,
-    color 0.16s ease;
 }
 
-button {
-  font-family: inherit;
-}
-
+button,
 textarea,
 input,
 select {
-  font-family: inherit;
+  font: inherit;
+}
+
+button,
+input,
+textarea,
+select {
   color: inherit;
 }
 
-/* Thin scrollbars to match the dense coding-agent aesthetic. */
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--phi-accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--phi-accent-soft-strong);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--phi-border-strong) transparent;
+}
+
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 9px;
+  height: 9px;
 }
+
 *::-webkit-scrollbar-thumb {
-  background: var(--phi-border);
-  border-radius: 4px;
-}
-*::-webkit-scrollbar-thumb:hover {
+  border: 2px solid transparent;
+  border-radius: 999px;
   background: var(--phi-border-strong);
+  background-clip: padding-box;
 }
+
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto;
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
 }

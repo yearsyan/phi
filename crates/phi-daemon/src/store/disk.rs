@@ -128,9 +128,7 @@ impl ControlStore for DiskControlStore {
         let path = self.session_path(session.id);
         let bytes = serialize_record(&path, &session)?;
         let temporary = self.temporary_path(session.id);
-        let file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let file = private_file_options()
             .open(&temporary)
             .await
             .map_err(|source| ControlStoreError::Io {
@@ -185,9 +183,7 @@ impl ControlStore for DiskControlStore {
 
         let bytes = serialize_record(&path, &session)?;
         let temporary = self.temporary_path(session.id);
-        let file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let file = private_file_options()
             .open(&temporary)
             .await
             .map_err(|source| ControlStoreError::Io {
@@ -288,6 +284,16 @@ fn serialize_record(path: &Path, session: &SessionRecord) -> Result<Vec<u8>, Con
     Ok(bytes)
 }
 
+fn private_file_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    options
+}
+
 async fn write_and_sync(file: fs::File, bytes: &[u8]) -> Result<(), std::io::Error> {
     let mut writer = BufWriter::new(file);
     writer.write_all(bytes).await?;
@@ -315,7 +321,7 @@ fn session_id_from_path(path: &Path) -> Option<SessionId> {
 
 #[cfg(test)]
 mod tests {
-    use phi::ReasoningEffort;
+    use phi::{ReasoningEffort, Workspace};
 
     use super::*;
 
@@ -330,6 +336,7 @@ mod tests {
             "model-1",
             Some(ReasoningEffort::Medium),
         )
+        .with_workspace(Workspace::new("/workspace/project"))
     }
 
     #[tokio::test]
@@ -342,6 +349,20 @@ mod tests {
         assert!(store.list_sessions().await.unwrap().is_empty());
         store.create_session(second.clone()).await.unwrap();
         store.create_session(first.clone()).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(store.session_path(first.id))
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             store.get_session(first.id).await.unwrap(),
             Some(first.clone())
@@ -351,6 +372,20 @@ mod tests {
         first.reasoning_effort = Some(ReasoningEffort::High);
         first.config_revision = 1;
         store.update_session(first.clone()).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(store.session_path(first.id))
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             store.get_session(first.id).await.unwrap(),
             Some(first.clone())
@@ -380,6 +415,34 @@ mod tests {
             Err(ControlStoreError::AlreadyExists { session_id }) if session_id == record.id
         ));
         assert_eq!(store.get_session(record.id).await.unwrap(), Some(record));
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_legacy_session_metadata_without_workspace() {
+        let root = temporary_directory();
+        let store = DiskControlStore::new(&root);
+        let session_id = SessionId::new();
+        fs::create_dir_all(&root).await.unwrap();
+        let path = store.session_path(session_id);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": session_id,
+                "profile_id": "default",
+                "model": "legacy-model",
+                "reasoning_effort": null,
+                "config_revision": 0
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let record = store.get_session(session_id).await.unwrap().unwrap();
+        assert_eq!(record.workspace, None);
+        assert_eq!(record.agent_profile, None);
 
         fs::remove_dir_all(root).await.unwrap();
     }

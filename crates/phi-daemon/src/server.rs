@@ -10,13 +10,14 @@ use crate::{
     config::{ConfigError, DaemonConfig},
     runtime::AgentRegistry,
     service::ApplicationService,
-    store::{DiskControlStore, DiskProviderStore},
+    store::{DiskAgentProfileStore, DiskControlStore, DiskProviderStore},
 };
 
 const CONTROL_DIRECTORY: &str = "control";
 const SESSION_DIRECTORY: &str = "sessions";
 const PLAN_DIRECTORY: &str = "plans";
 const PROVIDER_CONFIG_FILE: &str = "provider.json";
+const AGENT_PROFILE_CONFIG_FILE: &str = "agent-profiles.json";
 
 pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
     let service = Arc::new(application_service(&config));
@@ -30,6 +31,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
     info!(
         %local_address,
         data_dir = %config.data_dir().display(),
+        workspace_dir = %config.workspace_dir().display(),
         "phi daemon listening"
     );
     let (begin_graceful_shutdown, graceful_shutdown) = oneshot::channel();
@@ -74,16 +76,21 @@ fn application_service(config: &DaemonConfig) -> ApplicationService {
     let session_storage = Arc::new(DiskSessionStorage::new(data_dir.join(SESSION_DIRECTORY)));
     let plan_store = Arc::new(DiskPlanStore::new(data_dir.join(PLAN_DIRECTORY)));
     let provider_store = Arc::new(DiskProviderStore::new(data_dir.join(PROVIDER_CONFIG_FILE)));
+    let agent_profile_store = Arc::new(DiskAgentProfileStore::new(
+        data_dir.join(AGENT_PROFILE_CONFIG_FILE),
+    ));
 
-    ApplicationService::managed_with_plan_store_skills_and_builtin_tools(
+    ApplicationService::managed_with_plan_store_profiles_skills_and_builtin_tools(
         AgentRegistry::new(),
         control_store,
         session_storage,
         plan_store,
         provider_store,
-        config.skills_config(),
+        agent_profile_store,
+        config.skills_config_template(),
         BuiltinTools::all(config.workspace_dir()),
     )
+    .with_subagent_worktree_root(data_dir.join("subagent-worktrees"))
     .with_subagents_enabled(config.subagents_enabled())
 }
 

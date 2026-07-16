@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import styles from './App.module.css';
 import {
   isConfigured,
   readDaemonConfig,
+  writeAgentProfileId,
   writeAuthKey,
+  writeCapabilityMode,
   writeProfileId,
 } from './api/config.ts';
 import { Chat } from './components/Chat/Chat.tsx';
@@ -18,24 +20,33 @@ import { initialTheme, useTheme } from './hooks/useTheme.ts';
 import { I18nProvider, useI18n } from './i18n/I18nProvider.tsx';
 import { LOCALES, type Locale } from './i18n/translations.ts';
 import { readLocale, type Theme, writeLocale } from './prefs.ts';
+import type { CapabilityMode } from './types/wire.ts';
 
 type Selection =
   | { kind: 'none' }
-  | { kind: 'new' }
+  | { kind: 'new'; instanceId: number }
   | { kind: 'session'; sessionId: string };
 
 function selectionToTarget(
   selection: Selection,
   profileId: string,
+  agentProfileId: string,
+  capabilityMode: CapabilityMode | null,
 ): SessionTarget | null {
   if (selection.kind === 'none') return null;
-  if (selection.kind === 'new') return { kind: 'new', profileId };
+  if (selection.kind === 'new') {
+    return {
+      kind: 'new',
+      profileId,
+      agentProfileId: agentProfileId.trim() || undefined,
+      capabilityMode: capabilityMode ?? undefined,
+      instanceId: selection.instanceId,
+    };
+  }
   return { kind: 'attach', sessionId: selection.sessionId };
 }
 
 function App() {
-  // Read persisted prefs once for the initial render so the provider and theme
-  // hook start in sync with storage.
   const [initialLocale] = useState<Locale>(() => readLocale());
   const [themeState] = useState(() => initialTheme());
 
@@ -52,49 +63,51 @@ function App() {
 function AppShell({ initialTheme }: { initialTheme: Theme }) {
   const { locale, setLocale } = useI18n();
   const { theme, toggle: toggleTheme } = useTheme(initialTheme);
+  const nextSessionInstance = useRef(1);
 
   const [config, setConfig] = useState(() => readDaemonConfig());
   const [selection, setSelection] = useState<Selection>(() =>
-    isConfigured(config) ? { kind: 'new' } : { kind: 'none' },
+    isConfigured(config) ? { kind: 'new', instanceId: 1 } : { kind: 'none' },
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Open settings automatically on first load if no auth key is configured.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only check
   useEffect(() => {
-    if (!isConfigured(config)) {
-      setSettingsOpen(true);
-    }
-  }, []);
+    if (!isConfigured(config)) setSettingsOpen(true);
+  }, [config]);
 
-  // Memoize the target so its identity is stable across renders that don't
-  // change the selected session/profile — otherwise useDaemonSession's effect
-  // would tear down and reopen the WebSocket on every render.
   const target = useMemo(
-    () => selectionToTarget(selection, config.profileId),
-    [selection, config.profileId],
+    () =>
+      selectionToTarget(
+        selection,
+        config.profileId,
+        config.agentProfileId,
+        config.capabilityMode,
+      ),
+    [selection, config.profileId, config.agentProfileId, config.capabilityMode],
   );
   const controls = useDaemonSession(config.authKey, target);
+  const {
+    sessions,
+    loading: sessionsLoading,
+    error: listError,
+    refresh: refreshSessions,
+  } = useSessionList(config.authKey, isConfigured(config));
 
-  // Track the live session id so the sidebar can highlight the prepared session
-  // once it activates (after `session_created`).
+  const { createdSessionRevision } = controls;
+  useEffect(() => {
+    if (createdSessionRevision > 0) void refreshSessions();
+  }, [createdSessionRevision, refreshSessions]);
+
   const liveSessionId = controls.state.sessionId;
 
-  // Once a "new" target activates (session_created), flip the selection to that
-  // session id so reconnects/future targeting use attach semantics.
-  useEffect(() => {
-    if (selection.kind === 'new' && liveSessionId) {
-      setSelection({ kind: 'session', sessionId: liveSessionId });
-    }
-  }, [selection.kind, liveSessionId]);
-
-  const { sessions, error: listError } = useSessionList(
-    config.authKey,
-    isConfigured(config),
-  );
-
-  const handleNewChat = useCallback(() => {
-    setSelection({ kind: 'new' });
+  const startNewSession = useCallback(() => {
+    nextSessionInstance.current += 1;
+    setSelection({
+      kind: 'new',
+      instanceId: nextSessionInstance.current,
+    });
+    setSidebarOpen(false);
   }, []);
 
   const handleSelect = useCallback(
@@ -102,10 +115,9 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
       const alreadySelected =
         (selection.kind === 'session' && selection.sessionId === sessionId) ||
         liveSessionId === sessionId;
+      setSidebarOpen(false);
       if (alreadySelected) {
-        if (controls.connectionPhase === 'error') {
-          controls.retry();
-        }
+        if (controls.connectionPhase === 'error') controls.retry();
         return;
       }
       setSelection({ kind: 'session', sessionId });
@@ -115,68 +127,98 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
 
   const handleSaveAuthKey = useCallback((key: string) => {
     writeAuthKey(key);
-    setConfig((prev) => ({ ...prev, authKey: key }));
+    setConfig((current) => ({ ...current, authKey: key }));
   }, []);
 
   const handleSaveProfileId = useCallback((id: string) => {
     writeProfileId(id);
-    setConfig((prev) => ({ ...prev, profileId: id }));
+    setConfig((current) => ({ ...current, profileId: id }));
   }, []);
+
+  const handleSaveAgentProfileId = useCallback((id: string) => {
+    const value = id.trim();
+    writeAgentProfileId(value);
+    setConfig((current) => ({ ...current, agentProfileId: value }));
+  }, []);
+
+  const handleSaveCapabilityMode = useCallback(
+    (capabilityMode: CapabilityMode | null) => {
+      writeCapabilityMode(capabilityMode);
+      setConfig((current) => ({ ...current, capabilityMode }));
+    },
+    [],
+  );
 
   const handleConfigured = useCallback(() => {
-    setSelection((current) =>
-      current.kind === 'none' ? { kind: 'new' } : current,
-    );
+    setSettingsOpen(false);
+    setSelection((current) => {
+      if (current.kind !== 'none') return current;
+      nextSessionInstance.current += 1;
+      return {
+        kind: 'new',
+        instanceId: nextSessionInstance.current,
+      };
+    });
   }, []);
 
-  // Cycle en → zh → en (and any future locales) on each click.
   const cycleLocale = useCallback(() => {
     const currentIndex = LOCALES.indexOf(locale);
     const next = LOCALES[(currentIndex + 1) % LOCALES.length];
-    if (next) {
-      setLocale(next);
-      writeLocale(next);
-    }
+    if (next) setLocale(next);
   }, [locale, setLocale]);
 
-  // Keep <html lang> in sync with the active locale for a11y.
   useEffect(() => {
     document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
   }, [locale]);
 
   const activeSessionId =
     selection.kind === 'session' ? selection.sessionId : liveSessionId;
-  const newSessionPhase =
-    selection.kind === 'new' && !liveSessionId
-      ? controls.connectionPhase
-      : null;
+  const conversationKey =
+    selection.kind === 'new'
+      ? `new:${selection.instanceId}`
+      : selection.kind === 'session'
+        ? `session:${selection.sessionId}`
+        : 'none';
 
   return (
     <div className={styles.app}>
       <Sidebar
+        open={sidebarOpen}
         sessions={sessions}
+        loading={sessionsLoading}
         activeSessionId={activeSessionId}
-        newSessionPhase={newSessionPhase}
         listError={listError}
+        profileId={config.profileId}
+        theme={theme}
         onSelect={handleSelect}
-        onNewChat={handleNewChat}
+        onNewChat={startNewSession}
         onOpenSettings={() => setSettingsOpen(true)}
         onToggleTheme={toggleTheme}
         onCycleLocale={cycleLocale}
-        theme={theme}
-        profileId={config.profileId}
+        onClose={() => setSidebarOpen(false)}
       />
+
       <main className={styles.main}>
-        <Chat controls={controls} />
+        <Chat
+          controls={controls}
+          profileId={config.profileId}
+          conversationKey={conversationKey}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
       </main>
 
       {settingsOpen && (
         <SettingsModal
           authKey={config.authKey}
           profileId={config.profileId}
+          agentProfileId={config.agentProfileId}
+          capabilityMode={config.capabilityMode}
           onClose={() => setSettingsOpen(false)}
           onSaveAuthKey={handleSaveAuthKey}
           onSaveProfileId={handleSaveProfileId}
+          onSaveAgentProfileId={handleSaveAgentProfileId}
+          onSaveCapabilityMode={handleSaveCapabilityMode}
           onConfigured={handleConfigured}
         />
       )}

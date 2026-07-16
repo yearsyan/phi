@@ -11,22 +11,26 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use phi::{
-    Agent, AgentEvent, AgentMode, AssistantDelta, AssistantMessage, Content,
+    Agent, AgentEvent, AgentMode, AssistantDelta, AssistantMessage, CapabilityMode, Content,
     ContextCompactionError, ContextCompactionPlan, ContextCompactionRequest, ContextCompactor,
     InMemoryPlanStore, InMemorySessionStorage, LlmProvider, Message, PlanStore, ProviderError,
     ProviderEvent, ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot,
     SessionStorage, SkillCatalog, StorageError, TokenUsage, Tool, ToolCall, ToolDefinition,
-    ToolError, ToolOutput,
+    ToolError, ToolOutput, Workspace,
 };
 use phi_daemon::{
     api::AppState,
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandleError, AgentRegistry,
         AgentStatus, BuiltAgent, PlanApprovalDecision, RunId, RuntimeEvent, RuntimeEventKind,
+        compile_agent_profile, default_agent_profile,
     },
     serve,
     service::{ApplicationService, ServiceError},
-    store::{ControlStore, MemoryControlStore, MemoryProviderStore, ProviderStore},
+    store::{
+        AgentProfileStore, ControlStore, MemoryAgentProfileStore, MemoryControlStore,
+        MemoryProviderStore, ProviderStore, SessionRecord,
+    },
 };
 use serde_json::json;
 use tokio::{
@@ -638,6 +642,7 @@ struct TestFactory {
     builds: Arc<AtomicUsize>,
     tool: Option<BlockingTool>,
     context_compactor: Option<Arc<dyn ContextCompactor>>,
+    default_workspace: Option<Workspace>,
 }
 
 impl TestFactory {
@@ -648,6 +653,7 @@ impl TestFactory {
             builds: Arc::new(AtomicUsize::new(0)),
             tool: None,
             context_compactor: None,
+            default_workspace: None,
         }
     }
 
@@ -661,6 +667,11 @@ impl TestFactory {
         self
     }
 
+    fn with_default_workspace(mut self, workspace: Workspace) -> Self {
+        self.default_workspace = Some(workspace);
+        self
+    }
+
     fn build_count(&self) -> usize {
         self.builds.load(Ordering::SeqCst)
     }
@@ -670,12 +681,46 @@ impl TestFactory {
 impl AgentFactory for TestFactory {
     async fn build(&self, request: &AgentBuildRequest) -> Result<BuiltAgent, AgentFactoryError> {
         self.builds.fetch_add(1, Ordering::SeqCst);
-        let model = request.model.clone().unwrap_or_else(|| MODEL.to_owned());
+        let profile_workspace = request
+            .workspace
+            .as_ref()
+            .or(self.default_workspace.as_ref())
+            .cloned()
+            .unwrap_or_else(|| Workspace::new("."));
+        let agent_profile = request.pinned_agent_profile.clone().unwrap_or_else(|| {
+            compile_agent_profile(&default_agent_profile(), &profile_workspace).unwrap()
+        });
+        let model = request
+            .model
+            .clone()
+            .or_else(|| agent_profile.definition.model.clone())
+            .unwrap_or_else(|| MODEL.to_owned());
+        let capability_mode = request
+            .capability_mode
+            .unwrap_or(agent_profile.definition.initial_capability_mode);
+        let agent_mode = request
+            .agent_mode
+            .unwrap_or(agent_profile.definition.initial_agent_mode);
+        let reasoning_effort = if request.reasoning_effort_is_override {
+            request.reasoning_effort
+        } else {
+            agent_profile.definition.reasoning_effort
+        };
         let mut builder = Agent::builder(ScriptedProvider {
             script: self.script.clone(),
             calls: Arc::clone(&self.provider_calls),
         })
-        .model(model.clone());
+        .model(model.clone())
+        .system_prompt(agent_profile.compiled_system_prompt.clone())
+        .mode(agent_mode)
+        .capability_mode(capability_mode);
+        if let Some(workspace) = request
+            .workspace
+            .as_ref()
+            .or(self.default_workspace.as_ref())
+        {
+            builder = builder.workspace(workspace.clone());
+        }
         if let Some(tool) = self.tool.clone() {
             builder = builder.tool(tool);
         }
@@ -712,8 +757,9 @@ impl AgentFactory for TestFactory {
             agent,
             skills: SkillCatalog::default(),
             profile_id: request.profile_id.clone(),
+            agent_profile,
             model,
-            reasoning_effort: request.reasoning_effort,
+            reasoning_effort,
         })
     }
 }
@@ -1085,6 +1131,301 @@ async fn prepared_session_is_invisible_until_first_prompt_activation() {
 }
 
 #[tokio::test]
+async fn session_workspace_is_persisted_and_used_for_restore() {
+    let store = Arc::new(MemoryControlStore::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let workspace = Workspace::new("/workspace/session-project");
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::clone(&store),
+        Arc::clone(&storage),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    );
+
+    let prepared = service
+        .prepare_session_in_workspace(PROFILE, workspace.clone())
+        .await
+        .unwrap();
+    let session_id = prepared.handle().session_id();
+    let handle = service.activate_session(&prepared).await.unwrap();
+
+    assert_eq!(handle.summary().workspace.as_ref(), Some(&workspace));
+    assert_eq!(
+        store
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .as_ref(),
+        Some(&workspace)
+    );
+    assert!(service.shutdown().await.is_empty());
+
+    let restored_service = test_service(
+        AgentRegistry::new(),
+        Arc::clone(&store),
+        storage,
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    );
+    let restored = restored_service.attach_session(session_id).await.unwrap();
+    assert_eq!(restored.summary().workspace.as_ref(), Some(&workspace));
+    assert!(restored_service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_session_workspace_is_bound_on_first_restore() {
+    let session_id = phi_daemon::runtime::SessionId::new();
+    let store = Arc::new(MemoryControlStore::new());
+    store
+        .create_session(SessionRecord::new(session_id, PROFILE, MODEL, None))
+        .await
+        .unwrap();
+    let storage = Arc::new(InMemorySessionStorage::new());
+    storage
+        .save(&SessionSnapshot::new(session_id.to_string(), Vec::new()).unwrap())
+        .await
+        .unwrap();
+    let workspace = Workspace::new("/workspace/migrated-session");
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::clone(&store),
+        Arc::clone(&storage),
+        Arc::new(
+            TestFactory::new(ProviderScript::Immediate).with_default_workspace(workspace.clone()),
+        ),
+    );
+
+    let restored = service.attach_session(session_id).await.unwrap();
+
+    assert_eq!(restored.summary().workspace.as_ref(), Some(&workspace));
+    assert_eq!(
+        store
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .as_ref(),
+        Some(&workspace)
+    );
+    assert_eq!(
+        storage
+            .load(&session_id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .as_ref(),
+        Some(&workspace)
+    );
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_session_without_agent_profile_pins_builtin_default_zero_on_restore() {
+    let session_id = phi_daemon::runtime::SessionId::new();
+    let control = Arc::new(MemoryControlStore::new());
+    control
+        .create_session(SessionRecord::new(
+            session_id,
+            PROFILE,
+            "legacy-session-model",
+            None,
+        ))
+        .await
+        .unwrap();
+    let providers = Arc::new(MemoryProviderStore::new());
+    providers
+        .replace_provider(phi_daemon::store::ProviderConfig::new(
+            phi_daemon::store::ProviderKind::OpenAiResponses,
+            "legacy-profile-secret",
+            "http://127.0.0.1:9/v1",
+            "provider-model",
+            128_000,
+        ))
+        .await
+        .unwrap();
+    let service = ApplicationService::managed(
+        AgentRegistry::new(),
+        control.clone(),
+        Arc::new(InMemorySessionStorage::new()),
+        providers,
+    );
+    let later_default = phi_daemon::runtime::AgentProfileDefinition {
+        prompt: phi_daemon::runtime::PromptDefinition {
+            mode: phi_daemon::runtime::PromptMode::Full,
+            text: "THIS LATER DEFAULT MUST NOT AFFECT LEGACY SESSIONS".to_owned(),
+        },
+        initial_capability_mode: CapabilityMode::ReadOnly,
+        ..phi_daemon::runtime::AgentProfileDefinition::default()
+    };
+    let replacement = service
+        .configure_agent_profile(phi_daemon::runtime::DEFAULT_AGENT_PROFILE_ID, later_default)
+        .await
+        .unwrap();
+    assert_eq!(replacement.revision, 1);
+
+    let restored = service.attach_session(session_id).await.unwrap();
+    assert_eq!(
+        restored.summary().agent_profile_id,
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_ID
+    );
+    assert_eq!(
+        restored.summary().agent_profile_revision,
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_REVISION
+    );
+    assert_eq!(
+        restored.summary().capability_mode,
+        CapabilityMode::FullAccess
+    );
+    assert!(
+        !restored
+            .agent_profile()
+            .compiled_system_prompt
+            .contains("THIS LATER DEFAULT")
+    );
+
+    let migrated = control.get_session(session_id).await.unwrap().unwrap();
+    let pinned = migrated
+        .agent_profile
+        .expect("legacy metadata must pin default@0 after a successful restore");
+    assert_eq!(
+        pinned.agent_profile_id,
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_ID
+    );
+    assert_eq!(
+        pinned.revision,
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_REVISION
+    );
+    assert_eq!(
+        pinned.definition.initial_capability_mode,
+        CapabilityMode::FullAccess
+    );
+    assert!(!pinned.compiled_system_prompt.contains("THIS LATER DEFAULT"));
+
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn activated_session_restores_its_pinned_agent_profile_revision() {
+    let control = Arc::new(MemoryControlStore::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let providers = Arc::new(MemoryProviderStore::new());
+    providers
+        .replace_provider(phi_daemon::store::ProviderConfig::new(
+            phi_daemon::store::ProviderKind::OpenAiResponses,
+            "pinned-profile-secret",
+            "http://127.0.0.1:9/v1",
+            "provider-model",
+            128_000,
+        ))
+        .await
+        .unwrap();
+    let profiles = Arc::new(MemoryAgentProfileStore::new());
+    let first_definition = phi_daemon::runtime::AgentProfileDefinition {
+        prompt: phi_daemon::runtime::PromptDefinition {
+            mode: phi_daemon::runtime::PromptMode::Full,
+            text: "PINNED PROFILE REVISION ONE".to_owned(),
+        },
+        initial_capability_mode: CapabilityMode::WorkspaceEdit,
+        ..phi_daemon::runtime::AgentProfileDefinition::default()
+    };
+    let first_profile = profiles
+        .replace_agent_profile("reviewer", first_definition)
+        .await
+        .unwrap();
+    assert_eq!(first_profile.revision, 1);
+
+    let first_service =
+        ApplicationService::managed_with_plan_store_profiles_skills_and_builtin_tools(
+            AgentRegistry::new(),
+            control.clone(),
+            storage.clone(),
+            Arc::new(InMemoryPlanStore::new()),
+            providers.clone(),
+            profiles.clone(),
+            phi::SkillsConfig::disabled(),
+            phi::BuiltinTools::none("."),
+        );
+    let prepared = first_service
+        .prepare_session_configured(PROFILE, "reviewer", None)
+        .await
+        .unwrap();
+    let session_id = prepared.handle().session_id();
+    let first_handle = first_service.activate_session(&prepared).await.unwrap();
+    assert_eq!(first_handle.summary().agent_profile_revision, 1);
+    assert_eq!(
+        first_handle.summary().capability_mode,
+        CapabilityMode::WorkspaceEdit
+    );
+    assert!(
+        first_handle
+            .agent_profile()
+            .compiled_system_prompt
+            .contains("PINNED PROFILE REVISION ONE")
+    );
+
+    let second_definition = phi_daemon::runtime::AgentProfileDefinition {
+        prompt: phi_daemon::runtime::PromptDefinition {
+            mode: phi_daemon::runtime::PromptMode::Full,
+            text: "LATEST PROFILE REVISION TWO".to_owned(),
+        },
+        initial_capability_mode: CapabilityMode::ReadOnly,
+        ..phi_daemon::runtime::AgentProfileDefinition::default()
+    };
+    let second_profile = profiles
+        .replace_agent_profile("reviewer", second_definition)
+        .await
+        .unwrap();
+    assert_eq!(second_profile.revision, 2);
+    assert!(first_service.shutdown().await.is_empty());
+
+    let restarted = ApplicationService::managed_with_plan_store_profiles_skills_and_builtin_tools(
+        AgentRegistry::new(),
+        control.clone(),
+        storage,
+        Arc::new(InMemoryPlanStore::new()),
+        providers,
+        profiles,
+        phi::SkillsConfig::disabled(),
+        phi::BuiltinTools::none("."),
+    );
+    let restored = restarted.attach_session(session_id).await.unwrap();
+    assert_eq!(restored.summary().agent_profile_id, "reviewer");
+    assert_eq!(restored.summary().agent_profile_revision, 1);
+    assert_eq!(
+        restored.summary().capability_mode,
+        CapabilityMode::WorkspaceEdit
+    );
+    assert!(
+        restored
+            .agent_profile()
+            .compiled_system_prompt
+            .contains("PINNED PROFILE REVISION ONE")
+    );
+    assert!(
+        !restored
+            .agent_profile()
+            .compiled_system_prompt
+            .contains("LATEST PROFILE REVISION TWO")
+    );
+    assert_eq!(
+        control
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent_profile
+            .unwrap()
+            .revision,
+        1
+    );
+
+    assert!(restarted.shutdown().await.is_empty());
+}
+
+#[tokio::test]
 async fn service_shutdown_closes_and_forgets_unactivated_prepared_sessions() {
     let registry = AgentRegistry::new();
     let store = Arc::new(MemoryControlStore::new());
@@ -1248,11 +1589,18 @@ async fn expired_websocket_token_is_rejected_by_the_upgrade_route() {
 
 #[tokio::test]
 async fn new_websocket_creates_no_session_until_its_first_prompt() {
+    let compaction_started = Arc::new(Notify::new());
+    let release_compaction = Arc::new(Notify::new());
     let service = Arc::new(test_service(
         AgentRegistry::new(),
         Arc::new(MemoryControlStore::new()),
         Arc::new(InMemorySessionStorage::new()),
-        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+        Arc::new(
+            TestFactory::new(ProviderScript::Immediate).with_context_compactor(BlockingCompactor {
+                started: Arc::clone(&compaction_started),
+                release: Arc::clone(&release_compaction),
+            }),
+        ),
     ));
     let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
     let mut socket = RawWebSocket::connect(address, "/v1/ws/new").await;
@@ -1293,6 +1641,22 @@ async fn new_websocket_creates_no_session_until_its_first_prompt() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].record.id.to_string(), created_session_id);
     assert_eq!(sessions[0].state.as_ref().unwrap().message_count, 2);
+
+    socket
+        .send_json(json!({
+            "type": "compact",
+            "request_id": "compact-activated-new"
+        }))
+        .await;
+    let accepted = receive_command_response(&mut socket, "compact-activated-new").await;
+    assert_eq!(accepted["type"], "command_accepted");
+    assert_eq!(accepted["command"], "compact");
+    tokio::time::timeout(Duration::from_secs(2), compaction_started.notified())
+        .await
+        .expect("the activated new connection did not start compaction");
+    release_compaction.notify_one();
+    let completed = receive_wire_event(&mut socket, "context_compaction_completed").await;
+    assert_eq!(completed["event"]["after_message_count"], 1);
 
     drop(socket);
     stop.send(()).unwrap();
@@ -2603,7 +2967,11 @@ async fn http_session_list_exposes_the_activated_live_session() {
         Arc::new(InMemorySessionStorage::new()),
         Arc::new(TestFactory::new(ProviderScript::Immediate)),
     ));
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let workspace = Workspace::new("/workspace/http-session");
+    let prepared = service
+        .prepare_session_in_workspace(PROFILE, workspace.clone())
+        .await
+        .unwrap();
     let handle = service.activate_session(&prepared).await.unwrap();
     let mut events = handle.subscribe();
     let run = handle
@@ -2646,6 +3014,10 @@ async fn http_session_list_exposes_the_activated_live_session() {
         handle.session_id().to_string()
     );
     assert_eq!(payload["sessions"][0]["status"], "idle");
+    assert_eq!(
+        payload["sessions"][0]["workspace"],
+        workspace.root().to_string_lossy().as_ref()
+    );
     assert_eq!(payload["sessions"][0]["message_count"], 2);
 
     stop.send(()).unwrap();
@@ -2786,6 +3158,166 @@ async fn provider_http_manages_named_profiles_without_echoing_api_keys() {
 }
 
 #[tokio::test]
+async fn agent_profile_http_manages_revisions_and_configures_new_websockets() {
+    let providers = Arc::new(MemoryProviderStore::new());
+    providers
+        .replace_provider(phi_daemon::store::ProviderConfig::new(
+            phi_daemon::store::ProviderKind::OpenAiResponses,
+            "profile-test-secret",
+            "http://127.0.0.1:9/v1",
+            "provider-model",
+            128_000,
+        ))
+        .await
+        .unwrap();
+    let service = Arc::new(ApplicationService::managed(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        providers,
+    ));
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+
+    let (status, initial) = http_json(address, "GET", "/v1/agent-profiles", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(initial["agent_profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        initial["agent_profiles"][0]["agent_profile_id"],
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_ID
+    );
+    assert_eq!(
+        initial["agent_profiles"][0]["revision"],
+        phi_daemon::runtime::DEFAULT_AGENT_PROFILE_REVISION
+    );
+    assert_eq!(
+        initial["agent_profiles"][0]["initial_capability_mode"],
+        "full_access"
+    );
+
+    let (status, missing) = http_json(address, "GET", "/v1/agent-profiles/missing", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(missing["configured"], false);
+    assert_eq!(missing["agent_profile"], serde_json::Value::Null);
+
+    let definition = json!({
+        "prompt": {
+            "mode": "extend",
+            "text": "Act as a focused reviewer."
+        },
+        "tools": {
+            "allow": ["read", "edit"],
+            "deny": ["bash"]
+        },
+        "skills": {
+            "allow": null,
+            "deny": ["dangerous-skill"]
+        },
+        "initial_agent_mode": "default",
+        "initial_capability_mode": "workspace_edit",
+        "model": "profile-model",
+        "reasoning_effort": "high"
+    });
+    let (status, created) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/reviewer",
+        Some(definition.clone()),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(created["configured"], true);
+    assert_eq!(created["agent_profile"]["agent_profile_id"], "reviewer");
+    assert_eq!(created["agent_profile"]["revision"], 1);
+    assert_eq!(
+        created["agent_profile"]["initial_capability_mode"],
+        "workspace_edit"
+    );
+    assert_eq!(created["agent_profile"]["model"], "profile-model");
+    assert_eq!(
+        created["agent_profile"]["tools"]["allow"],
+        json!(["edit", "read"])
+    );
+
+    let (status, updated) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/reviewer",
+        Some(definition),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(updated["agent_profile"]["revision"], 2);
+
+    let (status, fetched) = http_json(address, "GET", "/v1/agent-profiles/reviewer", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(fetched, updated);
+    let (status, listed) = http_json(address, "GET", "/v1/agent-profiles", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(listed["agent_profiles"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["agent_profiles"][0]["agent_profile_id"], "default");
+    assert_eq!(listed["agent_profiles"][1]["agent_profile_id"], "reviewer");
+
+    let invalid = json!({
+        "prompt": {
+            "mode": "full",
+            "text": "   "
+        }
+    });
+    let (status, error) =
+        http_json(address, "PUT", "/v1/agent-profiles/invalid", Some(invalid)).await;
+    assert_eq!(status, 400);
+    assert_eq!(error["code"], "invalid_agent_profile");
+
+    let (status, error) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/unknown-field",
+        Some(json!({ "unexpected": true })),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(error["code"], "invalid_agent_profile");
+
+    let mut socket = RawWebSocket::connect(
+        address,
+        "/v1/ws/new?agent_profile_id=reviewer&capability_mode=read_only",
+    )
+    .await;
+    assert_eq!(socket.receive_json().await["type"], "building");
+    let ready = socket.receive_json().await;
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["config"]["model"], "profile-model");
+    assert_eq!(ready["config"]["reasoning_effort"], "high");
+    assert_eq!(ready["capability_mode"], "read_only");
+    assert_eq!(ready["agent_profile"]["agent_profile_id"], "reviewer");
+    assert_eq!(ready["agent_profile"]["revision"], 2);
+    drop(socket);
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn agent_profile_http_reports_management_unavailable_for_custom_services() {
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    ));
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+
+    let (status, error) = http_json(address, "GET", "/v1/agent-profiles", None).await;
+    assert_eq!(status, 501);
+    assert_eq!(error["code"], "agent_profile_management_unavailable");
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
 async fn websocket_model_change_is_visible_from_session_http_detail() {
     let control = Arc::new(MemoryControlStore::new());
     let service = Arc::new(test_service(
@@ -2833,6 +3365,99 @@ async fn websocket_model_change_is_visible_from_session_http_detail() {
             .model,
         "ws-selected-model"
     );
+
+    drop(socket);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_capability_change_is_broadcast_persisted_and_rejected_while_busy() {
+    let provider_started = Arc::new(Notify::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::clone(&storage),
+        Arc::new(TestFactory::new(ProviderScript::HangFirst {
+            started: Arc::clone(&provider_started),
+        })),
+    ));
+    let prepared = service
+        .prepare_session_configured(
+            PROFILE,
+            phi_daemon::runtime::DEFAULT_AGENT_PROFILE_ID,
+            Some(CapabilityMode::WorkspaceEdit),
+        )
+        .await
+        .unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let session_id = handle.session_id();
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let mut socket = RawWebSocket::connect(address, &format!("/v1/ws/attach/{session_id}")).await;
+    let snapshot = socket.receive_json().await;
+    assert_eq!(snapshot["type"], "snapshot");
+    assert_eq!(snapshot["session"]["capability_mode"], "workspace_edit");
+
+    socket
+        .send_json(json!({
+            "type": "set_capability_mode",
+            "request_id": "capability-idle",
+            "capability_mode": "full_access"
+        }))
+        .await;
+    let accepted = receive_command_response(&mut socket, "capability-idle").await;
+    assert_eq!(accepted["type"], "command_accepted");
+    assert_eq!(accepted["command"], "set_capability_mode");
+    let changed = receive_wire_event(&mut socket, "capability_mode_changed").await;
+    assert_eq!(changed["event"]["capability_mode"], "full_access");
+    assert_eq!(
+        handle.snapshot().capability_mode,
+        CapabilityMode::FullAccess
+    );
+    assert_eq!(
+        storage
+            .load(&session_id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .capability_mode,
+        CapabilityMode::FullAccess
+    );
+
+    socket
+        .send_json(json!({
+            "type": "prompt",
+            "request_id": "capability-running-prompt",
+            "content": { "type": "text", "value": "keep running" }
+        }))
+        .await;
+    let prompt = receive_command_response(&mut socket, "capability-running-prompt").await;
+    assert_eq!(prompt["type"], "command_accepted");
+    provider_started.notified().await;
+    assert_eq!(handle.status(), AgentStatus::Running);
+    let run_id = handle.snapshot().active_run_id.unwrap();
+    assert_eq!(prompt["run_id"], run_id.to_string());
+
+    socket
+        .send_json(json!({
+            "type": "set_capability_mode",
+            "request_id": "capability-busy",
+            "capability_mode": "read_only"
+        }))
+        .await;
+    let rejected = receive_command_response(&mut socket, "capability-busy").await;
+    assert_eq!(rejected["type"], "command_rejected");
+    assert_eq!(rejected["code"], "session_busy");
+    assert_eq!(
+        handle.snapshot().capability_mode,
+        CapabilityMode::FullAccess
+    );
+
+    let mut events = handle.subscribe();
+    handle.stop(run_id).unwrap();
+    wait_for_run_stopped(&mut events, run_id).await;
 
     drop(socket);
     stop.send(()).unwrap();

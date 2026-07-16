@@ -4,10 +4,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::common::{invalid_arguments, io_error, mutation_guard, normalize_cwd, resolve_path};
+use super::common::{
+    invalid_arguments, io_error, mutation_guard, normalize_cwd, resolve_path_for_context,
+};
 use crate::{
     error::ToolError,
-    tool::{Tool, ToolEffect, ToolOutput},
+    tool::{Tool, ToolEffect, ToolExecutionContext, ToolOutput},
     types::ToolDefinition,
 };
 
@@ -60,9 +62,27 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(arguments, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        arguments: serde_json::Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(arguments, Some(&context)).await
+    }
+}
+
+impl WriteTool {
+    async fn execute_inner(
+        &self,
+        arguments: serde_json::Value,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, ToolError> {
         let arguments: WriteArguments =
             serde_json::from_value(arguments).map_err(|error| invalid_arguments("write", error))?;
-        let path = resolve_path(&self.cwd, &arguments.path)?;
+        let path = resolve_path_for_context(&self.cwd, &arguments.path, context).await?;
         let _guard = mutation_guard(&path).await;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -86,6 +106,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::{
+        Workspace,
+        tool::{AgentMode, CapabilityMode, ToolExecutionContext},
+    };
 
     #[tokio::test]
     async fn creates_parent_directories_and_writes_content() {
@@ -119,5 +143,30 @@ mod tests {
             "literal"
         );
         assert!(!directory.path().join("notes.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_edit_context_rejects_an_outside_write() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("outside.txt");
+        let context = ToolExecutionContext::detached("write").with_workspace_policy(
+            Some(Workspace::new(&workspace)),
+            AgentMode::Default,
+            CapabilityMode::WorkspaceEdit,
+        );
+
+        let error = WriteTool::new(&workspace)
+            .execute_with_context(json!({ "path": outside, "content": "blocked" }), context)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("outside the configured workspace")
+        );
+        assert!(!outside.exists());
     }
 }

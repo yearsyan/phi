@@ -8,6 +8,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{Notify, watch};
 
 use crate::{
+    Workspace,
     context::{
         ContextCompactionOutcome, ContextCompactionRequest, ContextCompactionRunOutcome,
         ContextCompactionTrigger, ContextCompactor, estimate_messages_tokens,
@@ -16,10 +17,14 @@ use crate::{
     hook::{Hook, HookRegistry, LlmResponseContext, TurnEndContext, TurnStartContext},
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
     provider::LlmProvider,
-    storage::{SessionSnapshot, SessionStorage, StorageError, validate_session_id},
+    storage::{
+        SessionSnapshot, SessionStorage, StorageError, validate_session_id,
+        validate_workspace_binding,
+    },
     tool::{
-        AgentMode, AgentModeControl, Tool, ToolCancellation, ToolConcurrency, ToolEffect,
-        ToolExecutionContext, ToolOutput, ToolProgress, builtins::BuiltinTools,
+        AgentMode, AgentModeControl, CapabilityMode, Tool, ToolCancellation, ToolConcurrency,
+        ToolEffect, ToolExecutionContext, ToolOutput, ToolPolicy, ToolProgress,
+        builtins::BuiltinTools,
     },
     types::{
         AgentEvent, AgentRun, AgentRunOutcome, AssistantDelta, Content, ContentPart, ContextUsage,
@@ -384,15 +389,19 @@ pub struct AgentBuilder {
     provider: Box<dyn LlmProvider>,
     system_prompt: String,
     tools: Vec<Arc<dyn Tool>>,
+    builtin_tools: Vec<BuiltinTools>,
     tool_execution: ToolExecutionMode,
     tool_call_timeout: Option<Duration>,
     max_parallel_tools: usize,
     mode: AgentMode,
+    capability_mode: CapabilityMode,
+    tool_policy: ToolPolicy,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
     context_compactor: Option<Arc<dyn ContextCompactor>>,
     hooks: HookRegistry,
     mailbox: Option<AgentMailbox>,
+    workspace: Option<Workspace>,
 }
 
 impl AgentBuilder {
@@ -401,20 +410,30 @@ impl AgentBuilder {
             provider: Box::new(provider),
             system_prompt: "You are a helpful assistant.".to_owned(),
             tools: Vec::new(),
+            builtin_tools: Vec::new(),
             tool_execution: ToolExecutionMode::Parallel,
             tool_call_timeout: Some(DEFAULT_TOOL_CALL_TIMEOUT),
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             mode: AgentMode::default(),
+            capability_mode: CapabilityMode::default(),
+            tool_policy: ToolPolicy::default(),
             generation_config: GenerationConfig::default(),
             max_context_tokens: None,
             context_compactor: None,
             hooks: HookRegistry::default(),
             mailbox: None,
+            workspace: None,
         }
     }
 
     pub fn system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = system_prompt.into();
+        self
+    }
+
+    /// Associates the agent and any attached session with a working directory.
+    pub fn workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -425,7 +444,10 @@ impl AgentBuilder {
 
     /// Installs an explicitly selected set of built-in local tools.
     pub fn builtin_tools(mut self, tools: BuiltinTools) -> Self {
-        self.tools.extend(tools.into_tools());
+        if self.workspace.is_none() {
+            self.workspace = Some(tools.workspace().clone());
+        }
+        self.builtin_tools.push(tools);
         self
     }
 
@@ -484,6 +506,18 @@ impl AgentBuilder {
     /// Sets the agent's initial execution mode.
     pub fn mode(mut self, mode: AgentMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Sets the maximum tool capability granted to the agent.
+    pub fn capability_mode(mut self, capability_mode: CapabilityMode) -> Self {
+        self.capability_mode = capability_mode;
+        self
+    }
+
+    /// Applies a name-based allow/deny policy to ordinary tools.
+    pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
+        self.tool_policy = tool_policy;
         self
     }
 
@@ -572,6 +606,13 @@ impl AgentBuilder {
         if !self.hooks.is_empty() {
             self.provider.extend_hooks(self.hooks.clone());
         }
+        for tools in self.builtin_tools {
+            let tools = match &self.workspace {
+                Some(workspace) => tools.in_workspace(workspace.clone()),
+                None => tools,
+            };
+            self.tools.extend(tools.into_tools());
+        }
         let tools = self
             .tools
             .into_iter()
@@ -588,6 +629,9 @@ impl AgentBuilder {
             tool_call_timeout: self.tool_call_timeout,
             max_parallel_tools: self.max_parallel_tools,
             mode_control: AgentModeControl::new(self.mode),
+            capability_mode: self.capability_mode,
+            tool_policy: self.tool_policy,
+            mandatory_tools: HashSet::new(),
             generation_config: self.generation_config,
             max_context_tokens: self.max_context_tokens,
             context_compactor: self.context_compactor,
@@ -599,6 +643,7 @@ impl AgentBuilder {
             session: None,
             hooks: self.hooks,
             mailbox: self.mailbox,
+            workspace: self.workspace,
         }
     }
 }
@@ -614,6 +659,9 @@ pub struct Agent {
     tool_call_timeout: Option<Duration>,
     max_parallel_tools: usize,
     mode_control: AgentModeControl,
+    capability_mode: CapabilityMode,
+    tool_policy: ToolPolicy,
+    mandatory_tools: HashSet<String>,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
     context_compactor: Option<Arc<dyn ContextCompactor>>,
@@ -625,6 +673,7 @@ pub struct Agent {
     session: Option<SessionBinding>,
     hooks: HookRegistry,
     mailbox: Option<AgentMailbox>,
+    workspace: Option<Workspace>,
 }
 
 impl Agent {
@@ -636,7 +685,20 @@ impl Agent {
     /// is visible to the next provider request.
     pub fn add_tool(&mut self, tool: impl Tool + 'static) {
         let tool: Arc<dyn Tool> = Arc::new(tool);
-        self.tools.insert(tool.definition().name, tool);
+        let name = tool.definition().name;
+        self.mandatory_tools.remove(&name);
+        self.tools.insert(name, tool);
+    }
+
+    /// Installs a harness tool that bypasses only the name-based tool policy.
+    ///
+    /// Mandatory tools remain constrained by [`AgentMode`] and
+    /// [`CapabilityMode`] at definition and execution time.
+    pub fn add_mandatory_tool(&mut self, tool: impl Tool + 'static) {
+        let tool: Arc<dyn Tool> = Arc::new(tool);
+        let name = tool.definition().name;
+        self.mandatory_tools.insert(name.clone());
+        self.tools.insert(name, tool);
     }
 
     /// Installs or replaces this agent's mailbox while the agent is idle.
@@ -653,6 +715,10 @@ impl Agent {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub fn workspace(&self) -> Option<&Workspace> {
+        self.workspace.as_ref()
     }
 
     pub fn clear_messages(&mut self) {
@@ -703,6 +769,19 @@ impl Agent {
         self.mode_control.mode()
     }
 
+    pub fn capability_mode(&self) -> CapabilityMode {
+        self.capability_mode
+    }
+
+    pub fn tool_policy(&self) -> &ToolPolicy {
+        &self.tool_policy
+    }
+
+    /// Replaces the name-based tool policy while the agent is idle.
+    pub fn set_tool_policy(&mut self, tool_policy: ToolPolicy) {
+        self.tool_policy = tool_policy;
+    }
+
     /// Returns a clonable in-memory mode control for transition tools.
     ///
     /// Prefer [`Agent::set_mode`] when the agent owner changes mode while the
@@ -726,6 +805,28 @@ impl Agent {
         self.mode_control.set_mode(mode);
         if let Err(error) = self.synchronize_session().await {
             self.mode_control.restore_safely(checkpoint);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Changes capability in memory. The next checkpoint will persist it.
+    pub fn set_capability_mode_in_memory(&mut self, capability_mode: CapabilityMode) {
+        self.capability_mode = capability_mode;
+    }
+
+    /// Changes capability and immediately persists it for an attached session.
+    ///
+    /// A failed save leaves the agent at the more restrictive of the old and
+    /// requested boundaries.
+    pub async fn set_capability_mode(
+        &mut self,
+        capability_mode: CapabilityMode,
+    ) -> Result<(), AgentError> {
+        let checkpoint = self.capability_mode;
+        self.capability_mode = capability_mode;
+        if let Err(error) = self.synchronize_session().await {
+            self.capability_mode = self.capability_mode.safest(checkpoint);
             return Err(error.into());
         }
         Ok(())
@@ -794,7 +895,18 @@ impl Agent {
 
         let mut persisted_message_count = 0;
         if let Some(mut snapshot) = storage.load(&session_id).await? {
-            if repair_interrupted_tool_turn(&session_id, &mut snapshot.messages)? {
+            validate_workspace_binding(
+                &session_id,
+                snapshot.workspace.as_ref(),
+                self.workspace.as_ref(),
+            )?;
+            let workspace_migrated = snapshot.workspace.is_none() && self.workspace.is_some();
+            if workspace_migrated {
+                snapshot.workspace = self.workspace.clone();
+            }
+            if repair_interrupted_tool_turn(&session_id, &mut snapshot.messages)?
+                || workspace_migrated
+            {
                 storage.save(&snapshot).await?;
             }
             persisted_message_count = snapshot.messages.len();
@@ -802,6 +914,7 @@ impl Agent {
             self.last_usage = snapshot.last_usage;
             self.cumulative_usage = snapshot.cumulative_usage;
             self.mode_control.set_mode(snapshot.mode);
+            self.capability_mode = snapshot.capability_mode;
             self.context_usage = self.last_usage.and_then(|usage| {
                 self.max_context_tokens
                     .map(|max_tokens| ContextUsage::from_usage(max_tokens, usage))
@@ -1020,7 +1133,7 @@ impl Agent {
             self.emit(AgentEvent::TurnStart { turn });
 
             let mut context_overflow_recovery_attempted = false;
-            let (response, request_mode, message_started) = loop {
+            let (response, request_mode, request_capability_mode, message_started) = loop {
                 if let Some(trigger) = self.automatic_compaction_trigger() {
                     match self
                         .run_context_compactor(trigger, &control, Some(&mut run_usage))
@@ -1043,7 +1156,7 @@ impl Agent {
                         messages: std::iter::once(Message::system(self.system_prompt.clone()))
                             .chain(self.messages.iter().cloned())
                             .collect(),
-                        tools: self.tool_definitions_for_mode(self.mode()),
+                        tools: self.tool_definitions_for_policy(self.mode(), self.capability_mode),
                         config: self.generation_config.clone(),
                     },
                 };
@@ -1066,7 +1179,12 @@ impl Agent {
                 // after every hook and use the latest mode before the provider
                 // sees the request.
                 let request_mode = self.mode();
-                self.enforce_request_mode(&mut turn_start.request, request_mode);
+                let request_capability_mode = self.capability_mode;
+                self.enforce_request_policy(
+                    &mut turn_start.request,
+                    request_mode,
+                    request_capability_mode,
+                );
 
                 let mut stream = self.provider.stream(turn_start.request);
                 let mut message_started = false;
@@ -1112,7 +1230,14 @@ impl Agent {
                 };
 
                 match response {
-                    Ok(response) => break (response, request_mode, message_started),
+                    Ok(response) => {
+                        break (
+                            response,
+                            request_mode,
+                            request_capability_mode,
+                            message_started,
+                        );
+                    }
                     Err(error)
                         if !received_model_output
                             && error.is_context_length_exceeded()
@@ -1176,7 +1301,12 @@ impl Agent {
             // side-effecting tools. Every call also checks the live mode just
             // before it starts, so a transition cannot unlock or outlive a
             // sibling call in the same response.
-            let tool_batch_permissions = ToolBatchPermissions::new(request_mode, self.mode());
+            let tool_batch_permissions = ToolBatchPermissions::new(
+                request_mode,
+                request_capability_mode,
+                self.mode(),
+                self.capability_mode,
+            );
             let assistant_message = response.message.into_message();
 
             let had_tool_calls = !tool_calls.is_empty();
@@ -1331,19 +1461,46 @@ impl Agent {
         Ok(())
     }
 
-    fn tool_definitions_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
+    fn tool_definitions_for_policy(
+        &self,
+        mode: AgentMode,
+        capability_mode: CapabilityMode,
+    ) -> Vec<ToolDefinition> {
         self.tools
-            .values()
-            .filter(|tool| mode.allows(tool.effect()))
-            .map(|tool| tool.definition())
+            .iter()
+            .filter(|(name, tool)| {
+                self.tool_policy
+                    .allows(name, self.mandatory_tools.contains(*name))
+                    && mode.allows(tool.effect())
+                    && capability_mode.allows(tool.effect())
+            })
+            .map(|(_, tool)| tool.definition())
             .collect()
     }
 
-    fn enforce_request_mode(&self, request: &mut ProviderRequest, mode: AgentMode) {
+    fn tool_is_allowed(
+        &self,
+        name: &str,
+        effect: ToolEffect,
+        mode: AgentMode,
+        capability_mode: CapabilityMode,
+    ) -> bool {
+        self.tool_policy
+            .allows(name, self.mandatory_tools.contains(name))
+            && mode.allows(effect)
+            && capability_mode.allows(effect)
+    }
+
+    fn enforce_request_policy(
+        &self,
+        request: &mut ProviderRequest,
+        mode: AgentMode,
+        capability_mode: CapabilityMode,
+    ) {
         request.tools.retain(|definition| {
-            self.tools
-                .get(&definition.name)
-                .is_some_and(|tool| mode.allows(tool.effect()))
+            self.tools.get(&definition.name).is_some_and(|tool| {
+                self.tool_is_allowed(&definition.name, tool.effect(), mode, capability_mode)
+            })
         });
 
         request.messages.retain(|message| {
@@ -1552,10 +1709,12 @@ impl Agent {
         };
         let snapshot = SessionSnapshot {
             id: session.id.clone(),
+            workspace: self.workspace.clone(),
             messages: self.messages.clone(),
             last_usage: self.last_usage,
             cumulative_usage: self.cumulative_usage,
             mode: self.mode_control.mode(),
+            capability_mode: self.capability_mode,
         };
         if let Some(unchanged_message_count) = session.replace_from {
             session
@@ -1609,13 +1768,26 @@ impl Agent {
                     }
                     self.emit(AgentEvent::ToolExecutionStart { call: call.clone() });
                     results[index] = Self::unknown_tool(call.clone());
-                    let context =
-                        self.tool_execution_context(&call, control, visible_tool_results.clone());
+                    let context = self.tool_execution_context(
+                        &call,
+                        control,
+                        visible_tool_results.clone(),
+                        self.mode(),
+                        self.capability_mode,
+                    );
+                    let name_allowed = self
+                        .tool_policy
+                        .allows(&call.name, self.mandatory_tools.contains(&call.name));
+                    let authorization = ToolInvocationPermissions {
+                        frozen: permissions,
+                        live_capability_mode: self.capability_mode,
+                        name_allowed,
+                    };
                     let execution = Self::execute_one(
                         self.tools.get(&call.name),
                         call,
                         self.tool_call_timeout,
-                        permissions,
+                        authorization,
                         &self.mode_control,
                         context,
                     );
@@ -1667,17 +1839,28 @@ impl Agent {
                         let tool = self.tools.get(&call.name).cloned();
                         let timeout = self.tool_call_timeout;
                         let mode_control = self.mode_control.clone();
+                        let capability_mode = self.capability_mode;
+                        let name_allowed = self
+                            .tool_policy
+                            .allows(&call.name, self.mandatory_tools.contains(&call.name));
+                        let authorization = ToolInvocationPermissions {
+                            frozen: permissions,
+                            live_capability_mode: capability_mode,
+                            name_allowed,
+                        };
                         let context = self.tool_execution_context(
                             &call,
                             control,
                             visible_tool_results.clone(),
+                            self.mode(),
+                            capability_mode,
                         );
                         pending.push(async move {
                             let executed = Self::execute_one(
                                 tool.as_ref(),
                                 call,
                                 timeout,
-                                permissions,
+                                authorization,
                                 &mode_control,
                                 context,
                             )
@@ -1737,7 +1920,7 @@ impl Agent {
         tool: Option<&Arc<dyn Tool>>,
         call: ToolCall,
         timeout: Option<Duration>,
-        permissions: ToolBatchPermissions,
+        authorization: ToolInvocationPermissions,
         mode_control: &AgentModeControl,
         context: ToolExecutionContext,
     ) -> ExecutedTool {
@@ -1748,12 +1931,21 @@ impl Agent {
         let execution = async {
             match tool {
                 Some(tool) => {
-                    let effect = tool.effect();
+                    let effect = tool.effect_for(&arguments);
                     let current_mode = mode_control.mode();
-                    if !permissions.allows(effect) || !current_mode.allows(effect) {
+                    if !authorization.name_allowed
+                        || !authorization.frozen.allows(effect)
+                        || !current_mode.allows(effect)
+                        || !authorization.live_capability_mode.allows(effect)
+                    {
                         ToolOutput::error(format!(
-                            "tool {:?} is not available under the current mode boundary (request: {:?}, batch: {:?}, current: {current_mode:?}, effect: {effect:?})",
-                            call.name, permissions.request_mode, permissions.batch_mode,
+                            "tool {:?} is not available under the current policy boundary (request mode: {:?}, request capability: {:?}, batch mode: {:?}, batch capability: {:?}, current mode: {current_mode:?}, current capability: {:?}, effect: {effect:?})",
+                            call.name,
+                            authorization.frozen.request_mode,
+                            authorization.frozen.request_capability_mode,
+                            authorization.frozen.batch_mode,
+                            authorization.frozen.batch_capability_mode,
+                            authorization.live_capability_mode,
                         ))
                     } else {
                         match tool.execute_with_context(arguments, context).await {
@@ -1858,6 +2050,8 @@ impl Agent {
         call: &ToolCall,
         control: &AgentRunControl,
         visible_tool_results: Arc<HashSet<String>>,
+        mode: AgentMode,
+        capability_mode: CapabilityMode,
     ) -> ToolExecutionContext {
         let listeners = self.listeners.clone();
         let progress_call = call.clone();
@@ -1876,6 +2070,7 @@ impl Agent {
             visible_tool_results,
             Some(progress),
         )
+        .with_workspace_policy(self.workspace.clone(), mode, capability_mode)
     }
 
     fn hook_failure(&self, error: HookError) -> AgentError {
@@ -1926,19 +2121,38 @@ enum ContextCompactorRunOutcome {
 #[derive(Clone, Copy, Debug)]
 struct ToolBatchPermissions {
     request_mode: AgentMode,
+    request_capability_mode: CapabilityMode,
     batch_mode: AgentMode,
+    batch_capability_mode: CapabilityMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ToolInvocationPermissions {
+    frozen: ToolBatchPermissions,
+    live_capability_mode: CapabilityMode,
+    name_allowed: bool,
 }
 
 impl ToolBatchPermissions {
-    fn new(request_mode: AgentMode, batch_mode: AgentMode) -> Self {
+    fn new(
+        request_mode: AgentMode,
+        request_capability_mode: CapabilityMode,
+        batch_mode: AgentMode,
+        batch_capability_mode: CapabilityMode,
+    ) -> Self {
         Self {
             request_mode,
+            request_capability_mode,
             batch_mode,
+            batch_capability_mode,
         }
     }
 
     fn allows(self, effect: ToolEffect) -> bool {
-        self.request_mode.allows(effect) && self.batch_mode.allows(effect)
+        self.request_mode.allows(effect)
+            && self.request_capability_mode.allows(effect)
+            && self.batch_mode.allows(effect)
+            && self.batch_capability_mode.allows(effect)
     }
 
     fn requires_sequential(
@@ -1950,8 +2164,10 @@ impl ToolBatchPermissions {
             || self.batch_mode == AgentMode::Plan
             || calls.iter().any(|call| {
                 tools.get(&call.name).is_none_or(|tool| {
-                    matches!(tool.effect(), ToolEffect::Internal | ToolEffect::PlanOnly)
-                        || tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive
+                    matches!(
+                        tool.effect_for(&call.arguments),
+                        ToolEffect::Internal | ToolEffect::PlanOnly
+                    ) || tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive
                 })
             })
     }
@@ -1991,6 +2207,7 @@ struct AgentCheckpoint {
     consecutive_auto_compaction_failures: u8,
     cumulative_usage: TokenUsage,
     mode: AgentMode,
+    capability_mode: CapabilityMode,
 }
 
 impl AgentCheckpoint {
@@ -2003,6 +2220,7 @@ impl AgentCheckpoint {
             consecutive_auto_compaction_failures: agent.consecutive_auto_compaction_failures,
             cumulative_usage: agent.cumulative_usage,
             mode: agent.mode(),
+            capability_mode: agent.capability_mode,
         }
     }
 
@@ -2014,6 +2232,7 @@ impl AgentCheckpoint {
         agent.consecutive_auto_compaction_failures = self.consecutive_auto_compaction_failures;
         agent.cumulative_usage = self.cumulative_usage;
         agent.mode_control.restore_safely(self.mode);
+        agent.capability_mode = agent.capability_mode.safest(self.capability_mode);
     }
 }
 
@@ -2497,6 +2716,10 @@ mod tests {
 
     struct ReadOnlyTool;
 
+    struct ArgumentEffectTool {
+        executions: Arc<AtomicUsize>,
+    }
+
     struct ProgressTool;
 
     struct ConcurrencyProbeTool {
@@ -2709,6 +2932,34 @@ mod tests {
 
         async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::success("inspected"))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArgumentEffectTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(
+                "argument_effect",
+                "Varies its effect by argument",
+                json!({ "type": "object" }),
+            )
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::Internal
+        }
+
+        fn effect_for(&self, arguments: &serde_json::Value) -> ToolEffect {
+            match arguments.get("effect").and_then(serde_json::Value::as_str) {
+                Some("external") => ToolEffect::ExternalSideEffect,
+                Some("workspace_write") => ToolEffect::WorkspaceWrite,
+                _ => ToolEffect::Internal,
+            }
+        }
+
+        async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::success("executed"))
         }
     }
 
@@ -3173,6 +3424,33 @@ mod tests {
                 "read",
                 "write"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_workspace_retargets_builtin_tools_regardless_of_builder_order() {
+        let original = tempfile::tempdir().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        };
+        let agent = Agent::builder(provider)
+            .builtin_tools(BuiltinTools::all(original.path()))
+            .workspace(Workspace::new(selected.path()))
+            .build();
+
+        agent.tools["write"]
+            .execute(json!({
+                "path": "workspace.txt",
+                "content": "bound"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!original.path().join("workspace.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(selected.path().join("workspace.txt")).unwrap(),
+            "bound"
         );
     }
 
@@ -3695,10 +3973,12 @@ mod tests {
         storage
             .save(&SessionSnapshot {
                 id: session_id.to_owned(),
+                workspace: None,
                 messages: vec![Message::user("run it"), dangling.clone()],
                 last_usage: Some(TokenUsage::new(40, 5, 0)),
                 cumulative_usage: TokenUsage::new(40, 5, 0),
                 mode: AgentMode::default(),
+                capability_mode: CapabilityMode::default(),
             })
             .await
             .unwrap();
@@ -3742,10 +4022,12 @@ mod tests {
         storage
             .save(&SessionSnapshot {
                 id: session_id.to_owned(),
+                workspace: None,
                 messages: original.clone(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 mode: AgentMode::default(),
+                capability_mode: CapabilityMode::default(),
             })
             .await
             .unwrap();
@@ -4458,6 +4740,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_capability_refilters_hooks_and_rejects_forged_side_effects() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingQueueProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-count",
+                        "count",
+                        json!({}),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::ReadOnly)
+            .tool(ReadOnlyTool)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .hook(InjectToolDefinitionsHook)
+            .build();
+
+        agent.prompt("inspect only").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            requests.lock().unwrap()[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["inspect"]
+        );
+        let result = agent
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-count"))
+            .unwrap();
+        assert!(result.tool_result_is_error);
+        assert!(result.text_content().unwrap().contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn invocation_effect_is_checked_at_execution_time() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = RecordingQueueProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-effect",
+                        "argument_effect",
+                        json!({ "effect": "external" }),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::ReadOnly)
+            .tool(ArgumentEffectTool {
+                executions: Arc::clone(&executions),
+            })
+            .build();
+
+        agent.prompt("try dynamic effect").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let result = agent
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-effect"))
+            .unwrap();
+        assert!(result.tool_result_is_error);
+        assert!(result.text_content().unwrap().contains("not available"));
+    }
+
+    #[test]
+    fn mandatory_tools_bypass_only_the_name_policy() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::builder(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        })
+        .tool_policy(ToolPolicy::allow_only(["inspect"]))
+        .tool(ReadOnlyTool)
+        .build();
+        agent.add_mandatory_tool(CountingTool { executions });
+
+        assert_eq!(
+            agent
+                .tool_definitions_for_policy(AgentMode::Default, CapabilityMode::FullAccess)
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["inspect", "count"])
+        );
+        assert_eq!(
+            agent
+                .tool_definitions_for_policy(AgentMode::Default, CapabilityMode::ReadOnly)
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["inspect"]
+        );
+    }
+
+    #[tokio::test]
     async fn leaving_plan_while_a_request_is_streaming_cannot_unlock_its_tool_calls() {
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -4703,6 +5103,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_capability_mode_persists_without_a_transcript_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        };
+        let mut agent = Agent::builder(provider)
+            .build()
+            .with_session("capability-only", storage.clone())
+            .await
+            .unwrap();
+
+        agent
+            .set_capability_mode(CapabilityMode::WorkspaceEdit)
+            .await
+            .unwrap();
+
+        assert_eq!(agent.capability_mode(), CapabilityMode::WorkspaceEdit);
+        let snapshot = storage.load("capability-only").await.unwrap().unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(snapshot.capability_mode, CapabilityMode::WorkspaceEdit);
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_cannot_widen_capability_mode() {
+        let storage = FailOnSaveStorage::new(1);
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::ReadOnly)
+            .build()
+            .with_session("capability-save-fails", storage)
+            .await
+            .unwrap();
+
+        assert!(
+            agent
+                .set_capability_mode(CapabilityMode::FullAccess)
+                .await
+                .is_err()
+        );
+        assert_eq!(agent.capability_mode(), CapabilityMode::ReadOnly);
+    }
+
+    #[tokio::test]
     async fn synchronizes_after_user_llm_responses_and_tool_results() {
         let provider = MockProvider {
             responses: Mutex::new(VecDeque::from([
@@ -4806,10 +5252,12 @@ mod tests {
         storage
             .save(&SessionSnapshot {
                 id: "saved".to_owned(),
+                workspace: None,
                 messages: vec![Message::user("before restart")],
                 last_usage: Some(TokenUsage::new(100, 20, 0)),
                 cumulative_usage: TokenUsage::new(250, 50, 0),
                 mode: AgentMode::Plan,
+                capability_mode: CapabilityMode::WorkspaceEdit,
             })
             .await
             .unwrap();
@@ -4831,6 +5279,33 @@ mod tests {
         assert_eq!(agent.context_usage_message_count, Some(0));
         assert_eq!(agent.cumulative_usage().total_tokens, 300);
         assert_eq!(agent.mode(), AgentMode::Plan);
+        assert_eq!(agent.capability_mode(), CapabilityMode::WorkspaceEdit);
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_a_different_session_workspace() {
+        let storage = InMemorySessionStorage::new();
+        storage
+            .save(
+                &SessionSnapshot::new("workspace-mismatch", Vec::new())
+                    .unwrap()
+                    .with_workspace(Workspace::new("/workspace/one")),
+            )
+            .await
+            .unwrap();
+
+        let result = Agent::builder(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        })
+        .workspace(Workspace::new("/workspace/two"))
+        .build()
+        .with_session("workspace-mismatch", storage)
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Storage(StorageError::WorkspaceMismatch { .. }))
+        ));
     }
 
     #[tokio::test]

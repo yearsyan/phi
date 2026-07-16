@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::Workspace;
+
 pub const DEFAULT_MAX_SKILL_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_SKILLS: usize = 512;
 pub const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;
@@ -113,6 +115,18 @@ impl SkillsConfig {
         self.listing_char_budget = budget.max(1);
         self
     }
+
+    /// Resolves relative skill roots against a session workspace while
+    /// preserving absolute global roots and all discovery policies.
+    pub fn resolve_against(&self, workspace: &Workspace) -> Self {
+        let mut resolved = self.clone();
+        for directory in &mut resolved.directories {
+            if directory.path.is_relative() {
+                directory.path = workspace.resolve(&directory.path);
+            }
+        }
+        resolved
+    }
 }
 
 impl Default for SkillsConfig {
@@ -127,5 +141,27 @@ impl Default for SkillsConfig {
             max_skills: DEFAULT_MAX_SKILLS,
             listing_char_budget: DEFAULT_SKILL_LISTING_BUDGET,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_only_relative_directories_against_workspace() {
+        let config = SkillsConfig::new()
+            .directory(".phi/skills")
+            .directory("/global/skills");
+        let resolved = config.resolve_against(&Workspace::new("/workspace/project"));
+
+        assert_eq!(
+            resolved.directories[0].path,
+            PathBuf::from("/workspace/project/.phi/skills")
+        );
+        assert_eq!(
+            resolved.directories[1].path,
+            PathBuf::from("/global/skills")
+        );
     }
 }

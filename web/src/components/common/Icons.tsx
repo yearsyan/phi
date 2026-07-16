@@ -24,8 +24,8 @@ function Icon({ title, children, ...rest }: IconWrapperProps) {
       strokeWidth={1.75}
       strokeLinecap="round"
       strokeLinejoin="round"
-      role="img"
-      aria-label={title}
+      aria-hidden="true"
+      focusable="false"
       {...rest}
     >
       <title>{title}</title>
@@ -123,6 +123,40 @@ export function GlobeIcon(props: IconProps) {
     <Icon title="Language" {...props}>
       <circle cx="12" cy="12" r="10" />
       <path d="M2 12h20M12 2a15.3 15.3 0 0 1 0 20M12 2a15.3 15.3 0 0 0 0 20" />
+    </Icon>
+  );
+}
+
+export function MenuIcon(props: IconProps) {
+  return (
+    <Icon title="Menu" {...props}>
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </Icon>
+  );
+}
+
+export function CompactIcon(props: IconProps) {
+  return (
+    <Icon title="Compact context" {...props}>
+      <path d="m8 3 4 4 4-4M12 7V1M8 21l4-4 4 4M12 17v6" />
+      <path d="M4 12h16" />
+    </Icon>
+  );
+}
+
+export function ArrowDownIcon(props: IconProps) {
+  return (
+    <Icon title="Scroll to bottom" {...props}>
+      <path d="M12 5v14M19 12l-7 7-7-7" />
+    </Icon>
+  );
+}
+
+export function SparkIcon(props: IconProps) {
+  return (
+    <Icon title="Phi" {...props}>
+      <path d="m12 3 1.45 4.55L18 9l-4.55 1.45L12 15l-1.45-4.55L6 9l4.55-1.45Z" />
+      <path d="m18.5 15 .7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7Z" />
     </Icon>
   );
 }

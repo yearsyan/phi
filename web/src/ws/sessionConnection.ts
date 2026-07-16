@@ -1,8 +1,14 @@
+import type { CapabilityMode } from '../types/wire.ts';
 import type {
   SessionSocketHandlers,
   SessionSocketOpenOptions,
 } from './connection.ts';
 import { SessionSocket } from './connection.ts';
+
+export interface NewSessionSocketOpenOptions extends SessionSocketOpenOptions {
+  agentProfileId?: string;
+  capabilityMode?: CapabilityMode;
+}
 
 /**
  * Open a brand-new prepared session. `profile_id` defaults to "default".
@@ -13,10 +19,18 @@ export function openNewSession(
   authKey: string,
   profileId: string,
   handlers: SessionSocketHandlers,
-  options?: SessionSocketOpenOptions,
+  options?: NewSessionSocketOpenOptions,
 ): Promise<SessionSocket> {
-  const path = `/v1/ws/new?profile_id=${encodeURIComponent(profileId)}`;
-  return SessionSocket.open(path, authKey, handlers, options);
+  const params = new URLSearchParams({ profile_id: profileId });
+  const agentProfileId = options?.agentProfileId?.trim();
+  if (agentProfileId) params.set('agent_profile_id', agentProfileId);
+  if (options?.capabilityMode) {
+    params.set('capability_mode', options.capabilityMode);
+  }
+  const path = `/v1/ws/new?${params.toString()}`;
+  const socketOptions =
+    options?.signal === undefined ? undefined : { signal: options.signal };
+  return SessionSocket.open(path, authKey, handlers, socketOptions);
 }
 
 /**

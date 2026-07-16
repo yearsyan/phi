@@ -115,6 +115,7 @@ struct CatalogInner {
     metadata: Vec<SkillMetadata>,
     diagnostics: Vec<SkillDiagnostic>,
     model_listing: String,
+    listing_char_budget: usize,
 }
 
 /// An immutable, session-safe snapshot of discovered skills.
@@ -425,6 +426,52 @@ impl SkillCatalog {
                 metadata,
                 diagnostics,
                 model_listing,
+                listing_char_budget: config.listing_char_budget,
+            }),
+        })
+    }
+
+    /// Selects an immutable subset of this catalog using exact skill names.
+    ///
+    /// An explicit allow-list is validated so a misspelled profile entry
+    /// cannot silently remove an intended capability. Deny entries take
+    /// precedence, and unknown deny entries are harmless.
+    pub fn select(&self, allow: Option<&[String]>, deny: &[String]) -> Result<Self, SkillError> {
+        if let Some(allow) = allow {
+            for name in allow {
+                if !self.inner.by_name.contains_key(name) {
+                    return Err(SkillError::NotFound { name: name.clone() });
+                }
+            }
+        }
+
+        let denied = deny.iter().map(String::as_str).collect::<HashSet<_>>();
+        let selected = |name: &str| {
+            !denied.contains(name)
+                && allow.is_none_or(|allow| allow.iter().any(|allowed| allowed == name))
+        };
+        let by_name = self
+            .inner
+            .by_name
+            .iter()
+            .filter(|(name, _)| selected(name))
+            .map(|(name, skill)| (name.clone(), Arc::clone(skill)))
+            .collect::<BTreeMap<_, _>>();
+        let metadata = self
+            .inner
+            .metadata
+            .iter()
+            .filter(|skill| selected(&skill.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let model_listing = format_model_listing(&metadata, self.inner.listing_char_budget.max(1));
+        Ok(Self {
+            inner: Arc::new(CatalogInner {
+                by_name,
+                metadata,
+                diagnostics: self.inner.diagnostics.clone(),
+                model_listing,
+                listing_char_budget: self.inner.listing_char_budget,
             }),
         })
     }
@@ -1207,6 +1254,38 @@ mod tests {
             .apply_to_prompt(&SkillInvocation::new("explain"), Content::text("ownership"))
             .unwrap();
         assert!(content.as_text().unwrap().contains("Explain: ownership"));
+    }
+
+    #[tokio::test]
+    async fn profile_selection_is_exact_deny_first_and_rejects_unknown_allows() {
+        let root = TempDir::new().unwrap();
+        write_skill(root.path(), "review", "Review the change.");
+        write_skill(root.path(), "test", "Run the tests.");
+        let catalog = SkillCatalog::load(&SkillsConfig::new().directory(root.path()))
+            .await
+            .unwrap();
+
+        let selected = catalog
+            .select(
+                Some(&["review".to_owned(), "test".to_owned()]),
+                &["test".to_owned(), "unknown-deny".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(
+            selected
+                .skills()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["review"]
+        );
+        assert!(selected.model_listing().contains("review"));
+        assert!(!selected.model_listing().contains("test"));
+
+        assert!(matches!(
+            catalog.select(Some(&["missing".to_owned()]), &[]),
+            Err(SkillError::NotFound { name }) if name == "missing"
+        ));
     }
 
     #[tokio::test]

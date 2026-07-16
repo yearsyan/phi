@@ -12,6 +12,7 @@ pub mod storage;
 pub mod subagent;
 pub mod tool;
 pub mod types;
+pub mod workspace;
 
 pub use agent::{
     Agent, AgentBuilder, AgentMailbox, AgentMailboxDelivery, AgentMailboxSendError,
@@ -54,13 +55,16 @@ pub use storage::{
     DiskSessionStorage, InMemorySessionStorage, SessionSnapshot, SessionStorage, StorageError,
 };
 pub use subagent::{
-    ActiveSubagentRun, CloseSubagentResult, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES,
-    DEFAULT_MAX_SUBAGENTS, DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY,
-    QueuedSubagentMessage, SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest,
-    SubagentConfig, SubagentError, SubagentEvent, SubagentEventKind, SubagentFactory,
-    SubagentFactoryError, SubagentNotification, SubagentNotificationKind,
-    SubagentNotificationSource, SubagentRunOutcome, SubagentRuntime, SubagentSnapshot,
-    SubagentState,
+    ActiveSubagentRun, BuiltSubagent, CloseSubagentResult, ConfiguredSpawnAgentRequest,
+    ConfiguredSubagentBuildRequest, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES, DEFAULT_MAX_SUBAGENTS,
+    DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY, EffectiveSubagentConfig,
+    MAX_SUBAGENT_OUTPUT_FIELD_BYTES, MAX_SUBAGENT_OUTPUT_FIELDS, QueuedSubagentMessage,
+    SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest, SubagentConfig, SubagentError,
+    SubagentEvent, SubagentEventKind, SubagentFactory, SubagentFactoryError, SubagentIsolation,
+    SubagentNotification, SubagentNotificationKind, SubagentNotificationSource,
+    SubagentOutputContract, SubagentResource, SubagentResourceDisposition,
+    SubagentResourceFinalization, SubagentResourceInfo, SubagentRunOutcome, SubagentRuntime,
+    SubagentSnapshot, SubagentState, SubagentType, ValidatedSubagentOutput,
 };
 pub use tool::builtins::{
     BashTool, BuiltinTools, DEFAULT_BASH_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_MAX_EDIT_BYTES,
@@ -72,8 +76,8 @@ pub use tool::subagent::{
     SubagentTools,
 };
 pub use tool::{
-    AgentMode, AgentModeControl, Tool, ToolCancellation, ToolConcurrency, ToolEffect,
-    ToolExecutionContext, ToolOutput, ToolProgress,
+    AgentMode, AgentModeControl, CapabilityMode, Tool, ToolCancellation, ToolConcurrency,
+    ToolEffect, ToolExecutionContext, ToolOutput, ToolPolicy, ToolProgress,
 };
 pub use types::{
     AgentEvent, AgentRun, AgentRunOutcome, AssistantDelta, AssistantMessage, Content, ContentPart,
@@ -82,3 +86,4 @@ pub use types::{
     ProviderRetryEvent, ProviderRetryReason, ProviderState, ReasoningEffort, Role, TokenUsage,
     ToolCall, ToolDefinition, ToolExecutionMode,
 };
+pub use workspace::Workspace;

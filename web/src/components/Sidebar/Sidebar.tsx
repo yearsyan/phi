@@ -1,13 +1,9 @@
-import type { ConnectionPhase } from '../../hooks/useDaemonSession.ts';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
-import {
-  LOCALE_LABELS,
-  LOCALES,
-  type TranslationKey,
-} from '../../i18n/translations.ts';
+import { LOCALE_LABELS, LOCALES } from '../../i18n/translations.ts';
 import type { Theme } from '../../prefs.ts';
-import type { SessionSummary } from '../../types/wire.ts';
+import type { SessionStatus, SessionSummary } from '../../types/wire.ts';
 import {
+  CloseIcon,
   GearIcon,
   GlobeIcon,
   MoonIcon,
@@ -17,9 +13,10 @@ import {
 import styles from './Sidebar.module.css';
 
 interface SidebarProps {
+  open: boolean;
   sessions: SessionSummary[];
+  loading: boolean;
   activeSessionId: string | null;
-  newSessionPhase: ConnectionPhase | null;
   listError: string | null;
   profileId: string;
   theme: Theme;
@@ -28,12 +25,14 @@ interface SidebarProps {
   onOpenSettings: () => void;
   onToggleTheme: () => void;
   onCycleLocale: () => void;
+  onClose: () => void;
 }
 
 export function Sidebar({
+  open,
   sessions,
+  loading,
   activeSessionId,
-  newSessionPhase,
   listError,
   profileId,
   theme,
@@ -42,117 +41,149 @@ export function Sidebar({
   onOpenSettings,
   onToggleTheme,
   onCycleLocale,
+  onClose,
 }: SidebarProps) {
   const { t, locale } = useI18n();
 
   return (
-    <aside className={styles.sidebar}>
-      <div className={styles.topRow}>
-        <div className={styles.brand}>
-          <span className={styles.logo}>φ</span>
-          <span className={styles.brandText}>Phi</span>
+    <>
+      <button
+        type="button"
+        className={`${styles.backdrop} ${open ? styles.backdropVisible : ''}`}
+        aria-label={t('sidebar.close')}
+        onClick={onClose}
+      />
+      <aside
+        className={`${styles.sidebar} ${open ? styles.sidebarOpen : ''}`}
+        aria-label={t('sidebar.sessions')}
+      >
+        <button
+          type="button"
+          className={`${styles.iconButton} ${styles.mobileClose}`}
+          onClick={onClose}
+          aria-label={t('sidebar.close')}
+        >
+          <CloseIcon />
+        </button>
+
+        <button type="button" className={styles.newButton} onClick={onNewChat}>
+          <span className={styles.newIcon}>
+            <PlusIcon />
+          </span>
+          <span>
+            <strong>{t('sidebar.newChat')}</strong>
+            <small>{t('sidebar.newChatHint')}</small>
+          </span>
+        </button>
+
+        <div className={styles.sectionHeader}>
+          <span>{t('sidebar.recent')}</span>
         </div>
-        <div className={styles.tools}>
+
+        <nav className={styles.sessionList}>
+          {listError && (
+            <div className={styles.listError} role="status">
+              {listError}
+            </div>
+          )}
+
+          {sessions.length === 0 && !loading && !listError && (
+            <div className={styles.empty}>
+              <span>{t('sidebar.noSessions')}</span>
+              <small>{t('sidebar.noSessionsHint')}</small>
+            </div>
+          )}
+
+          {sessions.map((session) => {
+            const active = session.session_id === activeSessionId;
+            return (
+              <button
+                type="button"
+                key={session.session_id}
+                className={`${styles.session} ${active ? styles.sessionActive : ''}`}
+                onClick={() => onSelect(session.session_id)}
+              >
+                <div className={styles.sessionTop}>
+                  <span
+                    className={`${styles.statusDot} ${statusClass(session.status, styles)}`}
+                  />
+                  <span className={styles.sessionTitle}>
+                    {sessionTitle(session.session_id)}
+                  </span>
+                  <span className={styles.messageCount}>
+                    {session.message_count ?? '—'}
+                  </span>
+                </div>
+                <div className={styles.sessionMeta}>
+                  <span>{session.config.model}</span>
+                  <span>{session.mode ?? 'default'}</span>
+                </div>
+              </button>
+            );
+          })}
+        </nav>
+
+        <footer className={styles.footer}>
           <button
             type="button"
-            className={styles.iconBtn}
-            onClick={onCycleLocale}
-            title={LOCALES.map((code) => LOCALE_LABELS[code]).join(' / ')}
-            aria-label={t('lang.toggle')}
-          >
-            <GlobeIcon />
-            <span className={styles.localeCode}>{locale}</span>
-          </button>
-          <button
-            type="button"
-            className={styles.iconBtn}
-            onClick={onToggleTheme}
-            title={theme === 'dark' ? t('theme.light') : t('theme.dark')}
-            aria-label={t('theme.toggle')}
-          >
-            {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
-          </button>
-          <button
-            type="button"
-            className={styles.iconBtn}
+            className={styles.profileButton}
             onClick={onOpenSettings}
-            title={t('sidebar.settings')}
-            aria-label={t('sidebar.settings')}
           >
+            <span className={styles.profileMark}>{profileId.slice(0, 1)}</span>
+            <span className={styles.profileText}>
+              <small>{t('sidebar.profile')}</small>
+              <strong>{profileId}</strong>
+            </span>
             <GearIcon />
           </button>
-        </div>
-      </div>
 
-      <button type="button" className={styles.newBtn} onClick={onNewChat}>
-        <PlusIcon /> {t('sidebar.newChat')}
-      </button>
-
-      <div className={styles.listWrap}>
-        {listError && <div className={styles.listError}>{listError}</div>}
-        {newSessionPhase !== null && (
-          <div
-            className={`${styles.item} ${styles.itemActive} ${styles.itemPrepared}`}
-          >
-            <span className={styles.itemTitle}>{t('sidebar.newSession')}</span>
-            <span className={styles.itemMeta}>
-              {t(NEW_SESSION_PHASE_KEYS[newSessionPhase])}
-            </span>
-          </div>
-        )}
-        {sessions.length === 0 && newSessionPhase === null && !listError && (
-          <div className={styles.emptyHint}>{t('sidebar.noSessions')}</div>
-        )}
-        {sessions.map((session) => {
-          const active = session.session_id === activeSessionId;
-          const count = session.message_count ?? 0;
-          return (
+          <div className={styles.footerActions}>
             <button
               type="button"
-              key={session.session_id}
-              className={`${styles.item} ${active ? styles.itemActive : ''}`}
-              onClick={() => onSelect(session.session_id)}
+              className={styles.utilityButton}
+              onClick={onCycleLocale}
+              title={LOCALES.map((code) => LOCALE_LABELS[code]).join(' / ')}
+              aria-label={t('lang.toggle')}
             >
-              <div className={styles.itemHead}>
-                <span
-                  className={`${styles.itemDot} ${styles[`status_${session.status}`] ?? ''}`}
-                />
-                <span className={styles.itemTitle}>
-                  {sessionTitle(session)}
-                </span>
-              </div>
-              <div className={styles.itemMeta}>
-                <span>{session.config.model}</span>
-                {session.message_count !== null && (
-                  <span>
-                    {' · '}
-                    {count}{' '}
-                    {count === 1 ? t('sidebar.msg') : t('sidebar.messages')}
-                  </span>
-                )}
-              </div>
+              <GlobeIcon />
+              <span>{locale.toUpperCase()}</span>
             </button>
-          );
-        })}
-      </div>
-
-      <div className={styles.footer}>
-        <span className={styles.footerLabel}>{t('sidebar.profile')}</span>
-        <span className={styles.footerValue}>{profileId}</span>
-      </div>
-    </aside>
+            <button
+              type="button"
+              className={styles.utilityButton}
+              onClick={onToggleTheme}
+              aria-label={t('theme.toggle')}
+            >
+              {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+              <span>
+                {theme === 'dark' ? t('theme.light') : t('theme.dark')}
+              </span>
+            </button>
+          </div>
+        </footer>
+      </aside>
+    </>
   );
 }
 
-const NEW_SESSION_PHASE_KEYS = {
-  idle: 'chat.connection.idle',
-  connecting: 'chat.connection.connecting',
-  preparing: 'sidebar.preparing',
-  ready: 'chat.status.awaiting_first_prompt',
-  error: 'chat.connection.error',
-} satisfies Record<ConnectionPhase, TranslationKey>;
+function sessionTitle(sessionId: string): string {
+  return sessionId.length > 12
+    ? `Session ${sessionId.slice(-6)}`
+    : `Session ${sessionId}`;
+}
 
-function sessionTitle(session: SessionSummary): string {
-  const id = session.session_id;
-  return id.length > 8 ? `…${id.slice(-6)}` : id;
+function statusClass(
+  status: SessionStatus,
+  classes: Record<string, string>,
+): string {
+  if (status === 'running' || status === 'compacting') {
+    return classes.statusBusy ?? '';
+  }
+  if (status === 'stopping' || status === 'closing') {
+    return classes.statusWarning ?? '';
+  }
+  if (status === 'closed' || status === 'offline') {
+    return classes.statusOffline ?? '';
+  }
+  return classes.statusReady ?? '';
 }

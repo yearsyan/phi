@@ -1,20 +1,22 @@
 use std::{fmt, time::Duration};
 
 use phi::{
-    ActiveSubagentRun, AgentEvent, AgentMode, AssistantDelta, Content, ContentPart,
-    ContextCompactionTrigger, ContextUsage, Message, ProviderRetryReason, ReasoningEffort, Role,
-    SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind,
-    SubagentNotification, SubagentRunOutcome, SubagentSnapshot, SubagentState, TokenUsage,
-    ToolCall, ToolProgress,
+    ActiveSubagentRun, AgentEvent, AgentMode, AssistantDelta, CapabilityMode, Content, ContentPart,
+    ContextCompactionTrigger, ContextUsage, EffectiveSubagentConfig, Message, ProviderRetryReason,
+    ReasoningEffort, Role, SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent,
+    SubagentEventKind, SubagentNotification, SubagentResourceFinalization, SubagentResourceInfo,
+    SubagentRunOutcome, SubagentSnapshot, SubagentState, TokenUsage, ToolCall, ToolProgress,
+    ValidatedSubagentOutput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     runtime::{
-        AgentStatus, AgentSummary, AgentView, AskUserAnswer, AskUserId, AskUserRequest,
-        AssistantDraft, PlanApprovalDecision, PlanApprovalId, PlanApprovalRequest, RunId,
-        RuntimeEvent, RuntimeEventKind, SessionId, SubagentSummary, ToolCallDraft,
+        AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
+        AskUserId, AskUserRequest, AssistantDraft, NamePolicy, PlanApprovalDecision,
+        PlanApprovalId, PlanApprovalRequest, PromptDefinition, PromptMode, RunId, RuntimeEvent,
+        RuntimeEventKind, SessionId, SubagentSummary, ToolCallDraft,
     },
     service::SessionListing,
     store::{
@@ -165,6 +167,131 @@ pub struct ProvidersResponse {
     pub providers: Vec<PublicProviderConfig>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptDefinitionDto {
+    #[serde(default)]
+    pub mode: PromptMode,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamePolicyDto {
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutAgentProfileRequest {
+    #[serde(default)]
+    pub prompt: PromptDefinitionDto,
+    #[serde(default)]
+    pub tools: NamePolicyDto,
+    #[serde(default)]
+    pub skills: NamePolicyDto,
+    #[serde(default)]
+    pub initial_agent_mode: AgentMode,
+    #[serde(default)]
+    pub initial_capability_mode: CapabilityMode,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl From<PutAgentProfileRequest> for AgentProfileDefinition {
+    fn from(request: PutAgentProfileRequest) -> Self {
+        Self {
+            prompt: PromptDefinition {
+                mode: request.prompt.mode,
+                text: request.prompt.text,
+            },
+            tools: NamePolicy {
+                allow: request.tools.allow,
+                deny: request.tools.deny,
+            },
+            skills: NamePolicy {
+                allow: request.skills.allow,
+                deny: request.skills.deny,
+            },
+            initial_agent_mode: request.initial_agent_mode,
+            initial_capability_mode: request.initial_capability_mode,
+            model: request.model,
+            reasoning_effort: request.reasoning_effort,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublicAgentProfile {
+    pub agent_profile_id: String,
+    pub revision: u64,
+    pub prompt: PromptDefinitionDto,
+    pub tools: NamePolicyDto,
+    pub skills: NamePolicyDto,
+    pub initial_agent_mode: AgentMode,
+    pub initial_capability_mode: CapabilityMode,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl From<AgentProfile> for PublicAgentProfile {
+    fn from(profile: AgentProfile) -> Self {
+        let definition = profile.definition;
+        Self {
+            agent_profile_id: profile.agent_profile_id,
+            revision: profile.revision,
+            prompt: PromptDefinitionDto {
+                mode: definition.prompt.mode,
+                text: definition.prompt.text,
+            },
+            tools: NamePolicyDto {
+                allow: definition.tools.allow,
+                deny: definition.tools.deny,
+            },
+            skills: NamePolicyDto {
+                allow: definition.skills.allow,
+                deny: definition.skills.deny,
+            },
+            initial_agent_mode: definition.initial_agent_mode,
+            initial_capability_mode: definition.initial_capability_mode,
+            model: definition.model,
+            reasoning_effort: definition.reasoning_effort,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentProfileResponse {
+    pub configured: bool,
+    pub agent_profile: Option<PublicAgentProfile>,
+}
+
+impl AgentProfileResponse {
+    pub fn from_profile(profile: Option<AgentProfile>) -> Self {
+        Self {
+            configured: profile.is_some(),
+            agent_profile: profile.map(PublicAgentProfile::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentProfilesResponse {
+    pub agent_profiles: Vec<PublicAgentProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentProfileRefDto {
+    pub agent_profile_id: String,
+    pub revision: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
@@ -195,6 +322,10 @@ pub enum ClientCommand {
         request_id: String,
         mode: AgentMode,
     },
+    SetCapabilityMode {
+        request_id: String,
+        capability_mode: CapabilityMode,
+    },
     #[serde(rename = "answer_askuser")]
     AnswerAskUser {
         request_id: String,
@@ -220,6 +351,7 @@ impl ClientCommand {
             | Self::SetModel { request_id, .. }
             | Self::SetReasoningEffort { request_id, .. }
             | Self::SetMode { request_id, .. }
+            | Self::SetCapabilityMode { request_id, .. }
             | Self::AnswerAskUser { request_id, .. }
             | Self::DecidePlanApproval { request_id, .. }
             | Self::Ping { request_id } => request_id,
@@ -234,6 +366,9 @@ pub enum ServerMessage {
     Ready {
         config: SessionConfigDto,
         mode: AgentMode,
+        capability_mode: CapabilityMode,
+        agent_profile: AgentProfileRefDto,
+        workspace: Option<String>,
     },
     SessionCreated {
         session_id: SessionId,
@@ -297,6 +432,7 @@ pub struct SubagentSnapshotDto {
     pub parent_session_id: String,
     pub agent_id: String,
     pub description: String,
+    pub effective_config: EffectiveSubagentConfig,
     pub state: SubagentState,
     pub active_run: Option<ActiveSubagentRun>,
     pub messages: Vec<PublicMessage>,
@@ -304,6 +440,9 @@ pub struct SubagentSnapshotDto {
     pub cumulative_usage: TokenUsage,
     pub context_usage: Option<ContextUsageDto>,
     pub last_outcome: Option<SubagentRunOutcome>,
+    pub validated_output: Option<ValidatedSubagentOutput>,
+    pub resource: Option<SubagentResourceInfo>,
+    pub resource_finalization: Option<SubagentResourceFinalization>,
     pub last_sequence: u64,
 }
 
@@ -313,6 +452,7 @@ impl From<&SubagentSnapshot> for SubagentSnapshotDto {
             parent_session_id: snapshot.parent_id.clone(),
             agent_id: snapshot.agent_id.clone(),
             description: snapshot.description.clone(),
+            effective_config: snapshot.effective_config.clone(),
             state: snapshot.state.clone(),
             active_run: snapshot.active_run.clone(),
             messages: snapshot.messages.iter().map(PublicMessage::from).collect(),
@@ -320,6 +460,9 @@ impl From<&SubagentSnapshot> for SubagentSnapshotDto {
             cumulative_usage: snapshot.cumulative_usage,
             context_usage: snapshot.context_usage.map(ContextUsageDto::from),
             last_outcome: snapshot.last_outcome.clone(),
+            validated_output: snapshot.validated_output.clone(),
+            resource: snapshot.resource.clone(),
+            resource_finalization: snapshot.resource_finalization.clone(),
             last_sequence: snapshot.last_sequence,
         }
     }
@@ -331,6 +474,7 @@ pub enum SubagentEventDto {
     Spawned {
         description: String,
         initial_delivery_id: String,
+        effective_config: EffectiveSubagentConfig,
     },
     StateChanged {
         state: SubagentState,
@@ -348,6 +492,15 @@ pub enum SubagentEventDto {
         run_id: String,
         outcome: SubagentRunOutcome,
     },
+    OutputValidated {
+        output: ValidatedSubagentOutput,
+    },
+    ResourceFinalized {
+        finalization: SubagentResourceFinalization,
+    },
+    ResourceFinalizationFailed {
+        error: String,
+    },
     Closed {
         delivery_id: String,
         reason: String,
@@ -361,9 +514,11 @@ impl From<SubagentEventKind> for SubagentEventDto {
             SubagentEventKind::Spawned {
                 description,
                 initial_delivery_id,
+                effective_config,
             } => Self::Spawned {
                 description,
                 initial_delivery_id,
+                effective_config,
             },
             SubagentEventKind::StateChanged { state } => Self::StateChanged { state },
             SubagentEventKind::MessageQueued { delivery_id } => Self::MessageQueued { delivery_id },
@@ -373,6 +528,13 @@ impl From<SubagentEventKind> for SubagentEventDto {
             },
             SubagentEventKind::RunFinished { run_id, outcome } => {
                 Self::RunFinished { run_id, outcome }
+            }
+            SubagentEventKind::OutputValidated { output } => Self::OutputValidated { output },
+            SubagentEventKind::ResourceFinalized { finalization } => {
+                Self::ResourceFinalized { finalization }
+            }
+            SubagentEventKind::ResourceFinalizationFailed { error } => {
+                Self::ResourceFinalizationFailed { error }
             }
             SubagentEventKind::Closed {
                 delivery_id,
@@ -391,11 +553,14 @@ impl From<SubagentEventKind> for SubagentEventDto {
 pub struct SessionDto {
     pub session_id: SessionId,
     pub profile_id: String,
+    pub agent_profile: AgentProfileRefDto,
+    pub workspace: Option<String>,
     pub initialized: bool,
     pub status: SessionStatusDto,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
     pub mode: AgentMode,
+    pub capability_mode: CapabilityMode,
     pub config: SessionConfigDto,
     pub history: Vec<PublicMessage>,
     pub draft: Option<AssistantDraftDto>,
@@ -411,11 +576,17 @@ impl From<&AgentView> for SessionDto {
         Self {
             session_id: view.session_id,
             profile_id: view.profile_id.clone(),
+            agent_profile: AgentProfileRefDto {
+                agent_profile_id: view.agent_profile_id.clone(),
+                revision: view.agent_profile_revision,
+            },
+            workspace: workspace_path(view.workspace.as_ref()),
             initialized: view.initialized,
             status: view.status.into(),
             active_run_id: view.active_run_id,
             queued_runs: view.queued_runs,
             mode: view.mode,
+            capability_mode: view.capability_mode,
             config: SessionConfigDto {
                 model: view.model.clone(),
                 reasoning_effort: view.reasoning_effort,
@@ -671,10 +842,13 @@ pub struct ErrorResponse {
 pub struct SessionSummaryDto {
     pub session_id: SessionId,
     pub profile_id: String,
+    pub agent_profile: AgentProfileRefDto,
+    pub workspace: Option<String>,
     pub status: SessionStatusDto,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
     pub mode: Option<AgentMode>,
+    pub capability_mode: Option<CapabilityMode>,
     pub config: SessionConfigDto,
     pub message_count: Option<usize>,
     pub subagents: Vec<SubagentSummaryDto>,
@@ -686,10 +860,16 @@ impl From<SessionListing> for SessionSummaryDto {
             Some(state) => Self {
                 session_id: state.session_id,
                 profile_id: state.profile_id,
+                agent_profile: AgentProfileRefDto {
+                    agent_profile_id: state.agent_profile_id,
+                    revision: state.agent_profile_revision,
+                },
+                workspace: workspace_path(state.workspace.as_ref()),
                 status: state.status.into(),
                 active_run_id: state.active_run_id,
                 queued_runs: state.queued_runs,
                 mode: Some(state.mode),
+                capability_mode: Some(state.capability_mode),
                 config: SessionConfigDto {
                     model: state.model,
                     reasoning_effort: state.reasoning_effort,
@@ -705,10 +885,24 @@ impl From<SessionListing> for SessionSummaryDto {
             None => Self {
                 session_id: listing.record.id,
                 profile_id: listing.record.profile_id,
+                agent_profile: listing
+                    .record
+                    .agent_profile
+                    .as_ref()
+                    .map(|profile| AgentProfileRefDto {
+                        agent_profile_id: profile.agent_profile_id.clone(),
+                        revision: profile.revision,
+                    })
+                    .unwrap_or_else(|| AgentProfileRefDto {
+                        agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
+                        revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
+                    }),
+                workspace: workspace_path(listing.record.workspace.as_ref()),
                 status: SessionStatusDto::Offline,
                 active_run_id: None,
                 queued_runs: 0,
                 mode: None,
+                capability_mode: None,
                 config: SessionConfigDto {
                     model: listing.record.model,
                     reasoning_effort: listing.record.reasoning_effort,
@@ -719,6 +913,10 @@ impl From<SessionListing> for SessionSummaryDto {
             },
         }
     }
+}
+
+fn workspace_path(workspace: Option<&phi::Workspace>) -> Option<String> {
+    workspace.map(ToString::to_string)
 }
 
 #[derive(Debug, Serialize)]
@@ -749,6 +947,9 @@ pub enum EventDto {
     },
     ModeChanged {
         mode: AgentMode,
+    },
+    CapabilityModeChanged {
+        capability_mode: CapabilityMode,
     },
     #[serde(rename = "askuser_requested")]
     AskUserRequested {
@@ -783,6 +984,7 @@ pub enum EventDto {
         agent_id: String,
         description: String,
         initial_delivery_id: String,
+        effective_config: EffectiveSubagentConfig,
         observer_path: String,
     },
     SubagentStateChanged {
@@ -805,6 +1007,18 @@ pub enum EventDto {
         agent_id: String,
         run_id: String,
         outcome: SubagentRunOutcome,
+    },
+    SubagentOutputValidated {
+        agent_id: String,
+        output: ValidatedSubagentOutput,
+    },
+    SubagentResourceFinalized {
+        agent_id: String,
+        finalization: SubagentResourceFinalization,
+    },
+    SubagentResourceFinalizationFailed {
+        agent_id: String,
+        error: String,
     },
     SubagentClosed {
         agent_id: String,
@@ -924,6 +1138,9 @@ impl EventDto {
                 },
             },
             RuntimeEventKind::ModeChanged { mode } => Self::ModeChanged { mode },
+            RuntimeEventKind::CapabilityModeChanged { capability_mode } => {
+                Self::CapabilityModeChanged { capability_mode }
+            }
             RuntimeEventKind::AskUserRequested { request } => Self::AskUserRequested { request },
             RuntimeEventKind::AskUserAnswered { ask_id } => Self::AskUserAnswered { ask_id },
             RuntimeEventKind::AskUserCancelled { ask_id } => Self::AskUserCancelled { ask_id },
@@ -963,11 +1180,13 @@ impl From<SubagentEvent> for EventDto {
             SubagentEventKind::Spawned {
                 description,
                 initial_delivery_id,
+                effective_config,
             } => Self::SubagentSpawned {
                 observer_path: format!("/v1/ws/attach/{}/subagents/{agent_id}", event.parent_id),
                 agent_id,
                 description,
                 initial_delivery_id,
+                effective_config,
             },
             SubagentEventKind::StateChanged { state } => {
                 Self::SubagentStateChanged { agent_id, state }
@@ -989,6 +1208,18 @@ impl From<SubagentEvent> for EventDto {
                 run_id,
                 outcome,
             },
+            SubagentEventKind::OutputValidated { output } => {
+                Self::SubagentOutputValidated { agent_id, output }
+            }
+            SubagentEventKind::ResourceFinalized { finalization } => {
+                Self::SubagentResourceFinalized {
+                    agent_id,
+                    finalization,
+                }
+            }
+            SubagentEventKind::ResourceFinalizationFailed { error } => {
+                Self::SubagentResourceFinalizationFailed { agent_id, error }
+            }
             SubagentEventKind::Closed {
                 delivery_id,
                 reason,
@@ -1244,6 +1475,117 @@ mod tests {
     }
 
     #[test]
+    fn agent_profile_request_defaults_and_rejects_unknown_fields() {
+        let defaults: PutAgentProfileRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let defaults = AgentProfileDefinition::from(defaults);
+        assert_eq!(defaults.prompt.mode, PromptMode::Extend);
+        assert_eq!(defaults.prompt.text, "");
+        assert_eq!(defaults.tools, NamePolicy::default());
+        assert_eq!(defaults.skills, NamePolicy::default());
+        assert_eq!(defaults.initial_agent_mode, AgentMode::Default);
+        assert_eq!(defaults.initial_capability_mode, CapabilityMode::FullAccess);
+        assert_eq!(defaults.model, None);
+        assert_eq!(defaults.reasoning_effort, None);
+
+        let configured: PutAgentProfileRequest = serde_json::from_value(serde_json::json!({
+            "prompt": {
+                "mode": "full",
+                "text": "Act as a focused reviewer."
+            },
+            "tools": {
+                "allow": ["read", "edit"],
+                "deny": ["bash"]
+            },
+            "skills": {
+                "allow": ["rust-review"],
+                "deny": []
+            },
+            "initial_agent_mode": "plan",
+            "initial_capability_mode": "workspace_edit",
+            "model": "review-model",
+            "reasoning_effort": "high"
+        }))
+        .unwrap();
+        let configured = AgentProfileDefinition::from(configured);
+        assert_eq!(configured.prompt.mode, PromptMode::Full);
+        assert_eq!(
+            configured.tools.allow,
+            Some(vec!["read".to_owned(), "edit".to_owned()])
+        );
+        assert_eq!(configured.tools.deny, vec!["bash"]);
+        assert_eq!(
+            configured.skills.allow,
+            Some(vec!["rust-review".to_owned()])
+        );
+        assert_eq!(configured.initial_agent_mode, AgentMode::Plan);
+        assert_eq!(
+            configured.initial_capability_mode,
+            CapabilityMode::WorkspaceEdit
+        );
+        assert_eq!(configured.model.as_deref(), Some("review-model"));
+        assert_eq!(configured.reasoning_effort, Some(ReasoningEffort::High));
+
+        assert!(
+            serde_json::from_value::<PutAgentProfileRequest>(serde_json::json!({
+                "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PutAgentProfileRequest>(serde_json::json!({
+                "prompt": {
+                    "mode": "extend",
+                    "text": "valid",
+                    "unknown": true
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_profile_response_serializes_the_public_definition() {
+        let profile = AgentProfile {
+            agent_profile_id: "reviewer".to_owned(),
+            revision: 3,
+            definition: AgentProfileDefinition {
+                prompt: PromptDefinition {
+                    mode: PromptMode::Extend,
+                    text: "Review before editing.".to_owned(),
+                },
+                tools: NamePolicy {
+                    allow: Some(vec!["read".to_owned(), "edit".to_owned()]),
+                    deny: vec!["bash".to_owned()],
+                },
+                skills: NamePolicy {
+                    allow: Some(vec!["rust-review".to_owned()]),
+                    deny: Vec::new(),
+                },
+                initial_agent_mode: AgentMode::Default,
+                initial_capability_mode: CapabilityMode::WorkspaceEdit,
+                model: Some("review-model".to_owned()),
+                reasoning_effort: Some(ReasoningEffort::High),
+            },
+        };
+
+        let value =
+            serde_json::to_value(AgentProfileResponse::from_profile(Some(profile))).unwrap();
+        assert_eq!(value["configured"], true);
+        assert_eq!(value["agent_profile"]["agent_profile_id"], "reviewer");
+        assert_eq!(value["agent_profile"]["revision"], 3);
+        assert_eq!(value["agent_profile"]["prompt"]["mode"], "extend");
+        assert_eq!(
+            value["agent_profile"]["initial_capability_mode"],
+            "workspace_edit"
+        );
+        assert_eq!(value["agent_profile"]["tools"]["allow"][0], "read");
+        assert_eq!(value["agent_profile"]["skills"]["allow"][0], "rust-review");
+        assert_eq!(value["agent_profile"]["model"], "review-model");
+        assert_eq!(value["agent_profile"]["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn prompt_skill_is_optional_and_backward_compatible() {
         let legacy: ClientCommand = serde_json::from_value(serde_json::json!({
             "type": "prompt",
@@ -1265,6 +1607,66 @@ mod tests {
             ClientCommand::Prompt { skill: Some(skill), .. }
                 if skill.name == "review" && skill.arguments.as_deref() == Some("--security")
         ));
+    }
+
+    #[test]
+    fn ready_message_exposes_the_selected_workspace() {
+        let message = ServerMessage::Ready {
+            config: SessionConfigDto {
+                model: "test-model".to_owned(),
+                reasoning_effort: None,
+                revision: 0,
+            },
+            mode: AgentMode::Default,
+            capability_mode: CapabilityMode::FullAccess,
+            agent_profile: AgentProfileRefDto {
+                agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
+                revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
+            },
+            workspace: Some("/workspace/project".to_owned()),
+        };
+        let value = serde_json::to_value(message).unwrap();
+
+        assert_eq!(value["type"], "ready");
+        assert_eq!(value["workspace"], "/workspace/project");
+        assert_eq!(value["capability_mode"], "full_access");
+        assert_eq!(
+            value["agent_profile"]["agent_profile_id"],
+            crate::runtime::DEFAULT_AGENT_PROFILE_ID
+        );
+        assert_eq!(
+            value["agent_profile"]["revision"],
+            crate::runtime::DEFAULT_AGENT_PROFILE_REVISION
+        );
+    }
+
+    #[test]
+    fn capability_command_and_event_use_stable_wire_names() {
+        let command: ClientCommand = serde_json::from_value(serde_json::json!({
+            "type": "set_capability_mode",
+            "request_id": "capability-1",
+            "capability_mode": "read_only"
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            ClientCommand::SetCapabilityMode {
+                request_id,
+                capability_mode: CapabilityMode::ReadOnly,
+            } if request_id == "capability-1"
+        ));
+
+        let event = serde_json::to_value(EventDto::CapabilityModeChanged {
+            capability_mode: CapabilityMode::FullAccess,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "type": "capability_mode_changed",
+                "capability_mode": "full_access"
+            })
+        );
     }
 
     #[test]

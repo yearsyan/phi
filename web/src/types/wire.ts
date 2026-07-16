@@ -71,6 +71,8 @@ export type ReasoningEffort =
 
 export type AgentMode = 'default' | 'plan';
 
+export type CapabilityMode = 'read_only' | 'workspace_edit' | 'full_access';
+
 export type SessionStatus =
   | 'awaiting_first_prompt'
   | 'idle'
@@ -84,6 +86,11 @@ export type SessionStatus =
 export interface SessionConfig {
   model: string;
   reasoning_effort: ReasoningEffort | null;
+  revision: number;
+}
+
+export interface AgentProfileRef {
+  agent_profile_id: string;
   revision: number;
 }
 
@@ -145,6 +152,104 @@ export interface SubagentSummary {
   observer_path: string;
 }
 
+export interface GenerationConfig {
+  model?: string | null;
+  temperature?: number | null;
+  max_tokens?: number | null;
+  reasoning_effort?: ReasoningEffort | null;
+}
+
+export type SubagentType = 'general' | 'explore' | 'plan';
+export type SubagentIsolation = 'shared' | 'worktree';
+export type SubagentOutputContract =
+  | { type: 'text' }
+  | { type: 'json'; required_fields: string[] };
+
+export interface EffectiveSubagentConfig {
+  agent_type: SubagentType;
+  capability_mode: CapabilityMode;
+  generation_config: GenerationConfig;
+  output_contract: SubagentOutputContract;
+  isolation: SubagentIsolation;
+}
+
+export interface ActiveSubagentRun {
+  run_id: string;
+  delivery_id: string;
+}
+
+export type SubagentRunOutcome =
+  | {
+      outcome: 'completed';
+      text: string;
+      turns: number;
+      usage: TokenUsage;
+    }
+  | { outcome: 'stopped' }
+  | { outcome: 'failed'; error: string };
+
+export type ValidatedSubagentOutput =
+  | { type: 'text'; text: string }
+  | { type: 'json'; value: unknown };
+
+export interface SubagentResourceInfo {
+  kind: string;
+  location: string | null;
+}
+
+export interface SubagentResourceFinalization {
+  preserved: boolean;
+  location: string | null;
+  message: string | null;
+}
+
+export interface SubagentSnapshot {
+  parent_session_id: string;
+  agent_id: string;
+  description: string;
+  effective_config: EffectiveSubagentConfig;
+  state: SubagentState;
+  active_run: ActiveSubagentRun | null;
+  messages: PublicMessage[];
+  draft: string | null;
+  cumulative_usage: TokenUsage;
+  context_usage: ContextUsage | null;
+  last_outcome: SubagentRunOutcome | null;
+  validated_output: ValidatedSubagentOutput | null;
+  resource: SubagentResourceInfo | null;
+  resource_finalization: SubagentResourceFinalization | null;
+  last_sequence: number;
+}
+
+export type SubagentEventDto =
+  | {
+      type: 'spawned';
+      description: string;
+      initial_delivery_id: string;
+      effective_config: EffectiveSubagentConfig;
+    }
+  | { type: 'state_changed'; state: SubagentState }
+  | { type: 'message_queued'; delivery_id: string }
+  | { type: 'notification'; notification: SubagentNotification }
+  | { type: 'agent_event'; event: EventDto }
+  | {
+      type: 'run_finished';
+      run_id: string;
+      outcome: SubagentRunOutcome;
+    }
+  | { type: 'output_validated'; output: ValidatedSubagentOutput }
+  | {
+      type: 'resource_finalized';
+      finalization: SubagentResourceFinalization;
+    }
+  | { type: 'resource_finalization_failed'; error: string }
+  | {
+      type: 'closed';
+      delivery_id: string;
+      reason: string;
+      wake_parent: boolean;
+    };
+
 /* -------------------------------------------------------------------------- */
 /* askuser                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -159,7 +264,7 @@ export interface AskUserQuestion {
   question: string;
   header: string;
   options: AskUserOption[];
-  multi_select: boolean;
+  multiSelect: boolean;
 }
 
 export interface AskUserRequest {
@@ -199,11 +304,14 @@ export type PlanApprovalDecision =
 export interface SessionDto {
   session_id: string;
   profile_id: string;
+  agent_profile: AgentProfileRef;
+  workspace?: string | null;
   initialized: boolean;
   status: SessionStatus;
   active_run_id: string | null;
   queued_runs: number;
   mode: AgentMode;
+  capability_mode: CapabilityMode;
   config: SessionConfig;
   history: PublicMessage[];
   draft: AssistantDraft | null;
@@ -273,6 +381,10 @@ export type EventDto =
   | { type: 'run_failed'; run_id: string; message: string }
   | { type: 'config_changed'; config: SessionConfig }
   | { type: 'mode_changed'; mode: AgentMode }
+  | {
+      type: 'capability_mode_changed';
+      capability_mode: CapabilityMode;
+    }
   | { type: 'askuser_requested'; request: AskUserRequest }
   | { type: 'askuser_answered'; ask_id: string }
   | { type: 'askuser_cancelled'; ask_id: string }
@@ -290,6 +402,7 @@ export type EventDto =
       agent_id: string;
       description: string;
       initial_delivery_id: string;
+      effective_config: EffectiveSubagentConfig;
       observer_path: string;
     }
   | { type: 'subagent_state_changed'; agent_id: string; state: SubagentState }
@@ -304,7 +417,22 @@ export type EventDto =
       type: 'subagent_run_finished';
       agent_id: string;
       run_id: string;
-      outcome: unknown;
+      outcome: SubagentRunOutcome;
+    }
+  | {
+      type: 'subagent_output_validated';
+      agent_id: string;
+      output: ValidatedSubagentOutput;
+    }
+  | {
+      type: 'subagent_resource_finalized';
+      agent_id: string;
+      finalization: SubagentResourceFinalization;
+    }
+  | {
+      type: 'subagent_resource_finalization_failed';
+      agent_id: string;
+      error: string;
     }
   | {
       type: 'subagent_closed';
@@ -398,12 +526,19 @@ export interface EventEnvelope {
 
 export type ServerMessage =
   | { type: 'building' }
-  | { type: 'ready'; config: SessionConfig; mode: AgentMode }
+  | {
+      type: 'ready';
+      config: SessionConfig;
+      mode: AgentMode;
+      capability_mode: CapabilityMode;
+      agent_profile: AgentProfileRef;
+      workspace?: string | null;
+    }
   | { type: 'session_created'; session_id: string }
   | { type: 'snapshot'; session: SessionDto }
   | {
       type: 'subagent_snapshot';
-      subagent: unknown;
+      subagent: SubagentSnapshot;
       input_allowed: boolean;
     }
   | {
@@ -411,12 +546,12 @@ export type ServerMessage =
       sequence: number;
       parent_session_id: string;
       agent_id: string;
-      event: unknown;
+      event: SubagentEventDto;
     }
   | {
       type: 'subagent_resync_required';
       skipped: number;
-      subagent: unknown;
+      subagent: SubagentSnapshot;
       input_allowed: boolean;
     }
   | {
@@ -463,6 +598,11 @@ export type ClientCommand =
     }
   | { type: 'set_mode'; request_id: string; mode: AgentMode }
   | {
+      type: 'set_capability_mode';
+      request_id: string;
+      capability_mode: CapabilityMode;
+    }
+  | {
       type: 'answer_askuser';
       request_id: string;
       ask_id: string;
@@ -507,6 +647,50 @@ export interface ProvidersResponse {
   providers: PublicProviderConfig[];
 }
 
+export type PromptMode = 'extend' | 'full';
+
+export interface PromptDefinitionDto {
+  mode?: PromptMode;
+  text?: string;
+}
+
+export interface NamePolicyDto {
+  allow?: string[] | null;
+  deny?: string[];
+}
+
+/** Body for `PUT /v1/agent-profiles/{agent_profile_id}`. */
+export interface PutAgentProfileRequest {
+  prompt?: PromptDefinitionDto;
+  tools?: NamePolicyDto;
+  skills?: NamePolicyDto;
+  initial_agent_mode?: AgentMode;
+  initial_capability_mode?: CapabilityMode;
+  model?: string | null;
+  reasoning_effort?: ReasoningEffort | null;
+}
+
+export interface PublicAgentProfile {
+  agent_profile_id: string;
+  revision: number;
+  prompt: Required<PromptDefinitionDto>;
+  tools: NamePolicyDto;
+  skills: NamePolicyDto;
+  initial_agent_mode: AgentMode;
+  initial_capability_mode: CapabilityMode;
+  model: string | null;
+  reasoning_effort: ReasoningEffort | null;
+}
+
+export interface AgentProfileResponse {
+  configured: boolean;
+  agent_profile: PublicAgentProfile | null;
+}
+
+export interface AgentProfilesResponse {
+  agent_profiles: PublicAgentProfile[];
+}
+
 /** Body for `PUT /v1/providers/{profile_id}`. */
 export interface PutProviderRequest {
   provider: ProviderKind;
@@ -525,10 +709,13 @@ export interface PutProviderRequest {
 export interface SessionSummary {
   session_id: string;
   profile_id: string;
+  agent_profile: AgentProfileRef;
+  workspace?: string | null;
   status: SessionStatus;
   active_run_id: string | null;
   queued_runs: number;
   mode: AgentMode | null;
+  capability_mode: CapabilityMode | null;
   config: SessionConfig;
   message_count: number | null;
   subagents: SubagentSummary[];

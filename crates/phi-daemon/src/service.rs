@@ -3,9 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use phi::{
-    Agent, BuiltinTools, Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage,
-    PlanStore, ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
-    SubagentConfig, SubagentFactory, SubagentFactoryError, SubagentRuntime, SubagentTools,
+    Agent, AgentMode, BuiltSubagent, BuiltinTools, CapabilityMode, ConfiguredSubagentBuildRequest,
+    Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage, PlanStore,
+    ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
+    SubagentConfig, SubagentFactory, SubagentFactoryError, SubagentIsolation,
+    SubagentOutputContract, SubagentRuntime, SubagentTools, SubagentType, Workspace,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
@@ -13,11 +15,14 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use crate::{
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandle, AgentHandleError,
-        AgentRegistry, AgentSummary, BuiltAgent, ConfiguredAgentFactory, QueuedRun, RegistryError,
-        SessionId, ShutdownFailure, UnconfiguredAgentFactory, normalize_provider_config,
+        AgentProfile, AgentProfileDefinition, AgentRegistry, AgentSummary, BuiltAgent,
+        ConfiguredAgentFactory, DEFAULT_AGENT_PROFILE_ID, QueuedRun, RegistryError, SessionId,
+        ShutdownFailure, UnconfiguredAgentFactory, WorktreeManager, compile_agent_profile,
+        normalize_provider_config,
     },
     store::{
-        ControlStore, ControlStoreError, DEFAULT_PROFILE_ID, MemoryControlStore, ProviderConfig,
+        AgentProfileStore, AgentProfileStoreError, ControlStore, ControlStoreError,
+        DEFAULT_PROFILE_ID, MemoryAgentProfileStore, MemoryControlStore, ProviderConfig,
         ProviderProfile, ProviderStore, ProviderStoreError, SessionRecord,
     },
 };
@@ -30,7 +35,9 @@ pub struct ApplicationService {
     plan_store: Arc<dyn PlanStore>,
     factory: Arc<dyn AgentFactory>,
     provider_store: Option<Arc<dyn ProviderStore>>,
+    agent_profile_store: Option<Arc<dyn AgentProfileStore>>,
     subagents_enabled: bool,
+    subagent_worktrees: Option<WorktreeManager>,
     prepared: Arc<Mutex<HashMap<SessionId, AgentHandle>>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
 }
@@ -46,39 +53,120 @@ struct LifecycleState {
 #[derive(Clone)]
 struct DaemonSubagentFactory {
     factory: Arc<dyn AgentFactory>,
+    parent_id: String,
     profile_id: String,
+    agent_profile: crate::runtime::PinnedAgentProfile,
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
+    capability_ceiling: CapabilityMode,
+    workspace: Option<Workspace>,
+    worktrees: Option<WorktreeManager>,
 }
 
 #[async_trait]
 impl SubagentFactory for DaemonSubagentFactory {
     async fn build(&self, request: SubagentBuildRequest) -> Result<Agent, SubagentFactoryError> {
-        if request.allow_nested_subagents {
+        let configured = ConfiguredSubagentBuildRequest {
+            effective_config: phi::EffectiveSubagentConfig {
+                agent_type: SubagentType::General,
+                capability_mode: self.capability_ceiling,
+                generation_config: request.generation_config.clone(),
+                output_contract: SubagentOutputContract::Text,
+                isolation: SubagentIsolation::Shared,
+            },
+            base: request,
+        };
+        self.build_configured(configured)
+            .await
+            .map(|built| built.agent)
+    }
+
+    async fn build_configured(
+        &self,
+        request: ConfiguredSubagentBuildRequest,
+    ) -> Result<BuiltSubagent, SubagentFactoryError> {
+        if request.base.allow_nested_subagents {
             return Err(SubagentFactoryError::new(
                 "nested subagents are disabled by the daemon",
             ));
         }
-
         let model = request
+            .effective_config
             .generation_config
             .model
+            .clone()
             .unwrap_or_else(|| self.model.clone());
         let reasoning_effort = request
+            .effective_config
             .generation_config
             .reasoning_effort
             .or(self.reasoning_effort);
-        let build =
-            AgentBuildRequest::new(SessionId::new(), self.profile_id.clone()).with_model(model);
+        let mut prepared_worktree = None;
+        let workspace = match request.effective_config.isolation {
+            SubagentIsolation::Shared => self.workspace.clone(),
+            SubagentIsolation::Worktree => {
+                let workspace = self.workspace.as_ref().ok_or_else(|| {
+                    SubagentFactoryError::new(
+                        "worktree isolation requires a parent session workspace",
+                    )
+                })?;
+                let manager = self.worktrees.as_ref().ok_or_else(|| {
+                    SubagentFactoryError::new(
+                        "worktree isolation is not configured for this daemon",
+                    )
+                })?;
+                let prepared = manager
+                    .create(workspace, &self.parent_id, &request.base.agent_id)
+                    .await?;
+                let child_workspace = prepared.workspace().clone();
+                prepared_worktree = Some(prepared);
+                Some(child_workspace)
+            }
+        };
+        let profile = AgentProfile {
+            agent_profile_id: self.agent_profile.agent_profile_id.clone(),
+            revision: self.agent_profile.revision,
+            definition: self.agent_profile.definition.clone(),
+        };
+        let child_profile = match workspace.as_ref() {
+            Some(workspace) => compile_agent_profile(&profile, workspace)
+                .map_err(|error| SubagentFactoryError::new(error.to_string()))?,
+            None => self.agent_profile.clone(),
+        };
+        let agent_mode = if request.effective_config.agent_type == SubagentType::Plan {
+            AgentMode::Plan
+        } else {
+            AgentMode::Default
+        };
+        let overlay = subagent_prompt_overlay(&request.effective_config, workspace.as_ref());
+        let mut build = AgentBuildRequest::new(SessionId::new(), self.profile_id.clone())
+            .with_pinned_agent_profile(child_profile)
+            .with_model(model)
+            .with_capability_mode(request.effective_config.capability_mode)
+            .with_agent_mode(agent_mode)
+            .with_prompt_overlay(overlay);
+        if let Some(workspace) = workspace {
+            build = build.with_workspace(workspace);
+        }
         let build = match reasoning_effort {
             Some(reasoning_effort) => build.with_reasoning_effort(reasoning_effort),
             None => build.without_reasoning_effort(),
         };
-        self.factory
-            .build(&build)
-            .await
-            .map(|built| built.agent)
-            .map_err(|error| SubagentFactoryError::new(error.to_string()))
+        match self.factory.build(&build).await {
+            Ok(built) => {
+                let mut child = BuiltSubagent::new(built.agent);
+                if let Some(prepared) = prepared_worktree {
+                    child = child.with_resource(prepared.adopt_resource());
+                }
+                Ok(child)
+            }
+            Err(error) => {
+                if let Some(prepared) = prepared_worktree {
+                    let _ = prepared.finalize_unadopted().await;
+                }
+                Err(SubagentFactoryError::new(error.to_string()))
+            }
+        }
     }
 }
 
@@ -112,9 +200,11 @@ impl ApplicationService {
             plan_store,
             factory,
             provider_store: None,
+            agent_profile_store: None,
             // Embedders opt in by installing the daemon integration. The
             // standalone daemon enables it from DaemonConfig by default.
             subagents_enabled: false,
+            subagent_worktrees: None,
             prepared: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(RwLock::new(LifecycleState::default())),
         }
@@ -162,14 +252,18 @@ impl ApplicationService {
         provider_store: Arc<dyn ProviderStore>,
         skills: SkillsConfig,
     ) -> Self {
-        let factory =
-            ConfiguredAgentFactory::new(Arc::clone(&provider_store)).skills_config(skills);
+        let agent_profile_store: Arc<dyn AgentProfileStore> =
+            Arc::new(MemoryAgentProfileStore::new());
+        let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
+            .agent_profile_store(Arc::clone(&agent_profile_store))
+            .skills_config(skills);
         Self::managed_with_configured_factory(
             registry,
             store,
             session_storage,
             plan_store,
             provider_store,
+            agent_profile_store,
             factory,
         )
     }
@@ -183,7 +277,10 @@ impl ApplicationService {
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
     ) -> Self {
+        let agent_profile_store: Arc<dyn AgentProfileStore> =
+            Arc::new(MemoryAgentProfileStore::new());
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
+            .agent_profile_store(Arc::clone(&agent_profile_store))
             .skills_config(skills)
             .builtin_tools(builtin_tools);
         Self::managed_with_configured_factory(
@@ -192,6 +289,33 @@ impl ApplicationService {
             session_storage,
             plan_store,
             provider_store,
+            agent_profile_store,
+            factory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn managed_with_plan_store_profiles_skills_and_builtin_tools(
+        registry: AgentRegistry,
+        store: Arc<dyn ControlStore>,
+        session_storage: Arc<dyn SessionStorage>,
+        plan_store: Arc<dyn PlanStore>,
+        provider_store: Arc<dyn ProviderStore>,
+        agent_profile_store: Arc<dyn AgentProfileStore>,
+        skills: SkillsConfig,
+        builtin_tools: BuiltinTools,
+    ) -> Self {
+        let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
+            .agent_profile_store(Arc::clone(&agent_profile_store))
+            .skills_config(skills)
+            .builtin_tools(builtin_tools);
+        Self::managed_with_configured_factory(
+            registry,
+            store,
+            session_storage,
+            plan_store,
+            provider_store,
+            agent_profile_store,
             factory,
         )
     }
@@ -202,12 +326,14 @@ impl ApplicationService {
         session_storage: Arc<dyn SessionStorage>,
         plan_store: Arc<dyn PlanStore>,
         provider_store: Arc<dyn ProviderStore>,
+        agent_profile_store: Arc<dyn AgentProfileStore>,
         factory: ConfiguredAgentFactory,
     ) -> Self {
         let factory: Arc<dyn AgentFactory> = Arc::new(factory);
         let mut service =
             Self::new_with_plan_store(registry, store, session_storage, plan_store, factory);
         service.provider_store = Some(provider_store);
+        service.agent_profile_store = Some(agent_profile_store);
         service
     }
 
@@ -229,18 +355,92 @@ impl ApplicationService {
         self.subagents_enabled
     }
 
+    pub fn with_subagent_worktree_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.subagent_worktrees = Some(WorktreeManager::new(root));
+        self
+    }
+
     /// Builds provider, tools and future MCP resources, but deliberately does
     /// not create persistent session metadata yet.
     pub async fn prepare_session(
         &self,
         profile_id: impl Into<String>,
     ) -> Result<PreparedSession, ServiceError> {
+        self.prepare_session_with_options(
+            profile_id.into(),
+            DEFAULT_AGENT_PROFILE_ID.to_owned(),
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn prepare_session_configured(
+        &self,
+        profile_id: impl Into<String>,
+        agent_profile_id: impl Into<String>,
+        capability_mode: Option<CapabilityMode>,
+    ) -> Result<PreparedSession, ServiceError> {
+        self.prepare_session_with_options(
+            profile_id.into(),
+            agent_profile_id.into(),
+            capability_mode,
+            None,
+        )
+        .await
+    }
+
+    /// Prepares a session bound to an explicit library workspace. The
+    /// standalone HTTP API deliberately uses the daemon-configured default;
+    /// embedders may select a different workspace per session.
+    pub async fn prepare_session_in_workspace(
+        &self,
+        profile_id: impl Into<String>,
+        workspace: Workspace,
+    ) -> Result<PreparedSession, ServiceError> {
+        self.prepare_session_with_options(
+            profile_id.into(),
+            DEFAULT_AGENT_PROFILE_ID.to_owned(),
+            None,
+            Some(workspace),
+        )
+        .await
+    }
+
+    async fn prepare_session_with_options(
+        &self,
+        profile_id: String,
+        agent_profile_id: String,
+        capability_mode: Option<CapabilityMode>,
+        workspace: Option<Workspace>,
+    ) -> Result<PreparedSession, ServiceError> {
         let _lifecycle = self.enter().await?;
         let session_id = SessionId::new();
-        let profile_id = profile_id.into();
         let profile_id = normalize_profile_id(&profile_id)?;
-        let request = AgentBuildRequest::new(session_id, profile_id);
+        let request =
+            AgentBuildRequest::new(session_id, profile_id).with_agent_profile_id(agent_profile_id);
+        let request = match workspace {
+            Some(workspace) => request.with_workspace(workspace),
+            None => request,
+        };
+        let request = match capability_mode {
+            Some(capability_mode) => request.with_capability_mode(capability_mode),
+            None => request,
+        };
         let built = self.factory.build(&request).await?;
+        if let Some(requested_workspace) = request.workspace.as_ref()
+            && built.agent.workspace() != Some(requested_workspace)
+        {
+            return Err(AgentFactoryError::InvalidBuildRequest {
+                field: "workspace",
+                message: format!(
+                    "factory built workspace {:?}, expected {:?}",
+                    built.agent.workspace().map(|workspace| workspace.root()),
+                    requested_workspace.root()
+                ),
+            }
+            .into());
+        }
         let handle = self.spawn_handle(session_id, built);
         self.prepared
             .lock()
@@ -299,6 +499,8 @@ impl ApplicationService {
             view.model,
             view.reasoning_effort,
         );
+        record.agent_profile = Some(prepared.handle.agent_profile().clone());
+        record.workspace = view.workspace;
         record.config_revision = view.config_revision;
         self.store.create_session(record.clone()).await?;
 
@@ -347,26 +549,55 @@ impl ApplicationService {
             self.registry.remove(session_id).await;
         }
 
-        let record = self
+        let mut record = self
             .store
             .get_session(session_id)
             .await?
             .ok_or(ServiceError::SessionNotFound { session_id })?;
-        let request = AgentBuildRequest::new(session_id, record.profile_id.clone())
-            .with_model(record.model.clone());
+        let request = build_request_for_record(session_id, &record);
         let request = match record.reasoning_effort {
             Some(reasoning_effort) => request.with_reasoning_effort(reasoning_effort),
             None => request.without_reasoning_effort(),
         };
         let built = self.factory.build(&request).await?;
+        let effective_workspace = built.agent.workspace().cloned();
+        if let Some(stored_workspace) = record.workspace.as_ref()
+            && effective_workspace.as_ref() != Some(stored_workspace)
+        {
+            return Err(AgentFactoryError::InvalidBuildRequest {
+                field: "workspace",
+                message: format!(
+                    "factory built workspace {:?}, expected {:?}",
+                    effective_workspace
+                        .as_ref()
+                        .map(|workspace| workspace.root()),
+                    stored_workspace.root()
+                ),
+            }
+            .into());
+        }
+        let workspace_migrated = record.workspace.is_none() && effective_workspace.is_some();
+        if workspace_migrated {
+            record.workspace = effective_workspace;
+        }
+        let agent_profile_migrated = record.agent_profile.is_none();
+        if agent_profile_migrated {
+            record.agent_profile = Some(built.agent_profile.clone());
+        }
         let handle = self.spawn_handle(session_id, built);
         if let Err(error) = handle
             .initialize(
-                record,
+                record.clone(),
                 Arc::clone(&self.session_storage),
                 Arc::clone(&self.store),
             )
             .await
+        {
+            let _ = handle.shutdown().await;
+            return Err(error.into());
+        }
+        if (workspace_migrated || agent_profile_migrated)
+            && let Err(error) = self.store.update_session(record).await
         {
             let _ = handle.shutdown().await;
             return Err(error.into());
@@ -427,8 +658,7 @@ impl ApplicationService {
             .get_session(session_id)
             .await?
             .ok_or(ServiceError::SessionNotFound { session_id })?;
-        let request =
-            AgentBuildRequest::new(session_id, record.profile_id).with_model(record.model);
+        let request = build_request_for_record(session_id, &record);
         let request = match record.reasoning_effort {
             Some(reasoning_effort) => request.with_reasoning_effort(reasoning_effort),
             None => request.without_reasoning_effort(),
@@ -438,6 +668,40 @@ impl ApplicationService {
 
     pub async fn provider_config(&self) -> Result<Option<ProviderConfig>, ServiceError> {
         self.provider_config_for(DEFAULT_PROFILE_ID).await
+    }
+
+    pub async fn agent_profiles(&self) -> Result<Vec<AgentProfile>, ServiceError> {
+        let store = self
+            .agent_profile_store
+            .as_ref()
+            .ok_or(ServiceError::AgentProfileManagementUnavailable)?;
+        Ok(store.list_agent_profiles().await?)
+    }
+
+    pub async fn agent_profile(
+        &self,
+        agent_profile_id: &str,
+    ) -> Result<Option<AgentProfile>, ServiceError> {
+        let store = self
+            .agent_profile_store
+            .as_ref()
+            .ok_or(ServiceError::AgentProfileManagementUnavailable)?;
+        Ok(store.get_agent_profile(agent_profile_id.trim()).await?)
+    }
+
+    pub async fn configure_agent_profile(
+        &self,
+        agent_profile_id: &str,
+        definition: AgentProfileDefinition,
+    ) -> Result<AgentProfile, ServiceError> {
+        let _lifecycle = self.enter().await?;
+        let store = self
+            .agent_profile_store
+            .as_ref()
+            .ok_or(ServiceError::AgentProfileManagementUnavailable)?;
+        Ok(store
+            .replace_agent_profile(agent_profile_id.trim(), definition)
+            .await?)
     }
 
     pub async fn provider_configs(&self) -> Result<Vec<ProviderProfile>, ServiceError> {
@@ -491,10 +755,11 @@ impl ApplicationService {
         let subagents = self
             .subagents_enabled
             .then(|| self.install_subagents(session_id, &mut built));
-        AgentHandle::spawn_with_plan_store_skills_and_subagents(
+        AgentHandle::spawn_configured_with_plan_store_skills_and_subagents(
             session_id,
             built.agent,
             built.profile_id,
+            built.agent_profile,
             built.model,
             built.reasoning_effort,
             Arc::clone(&self.plan_store),
@@ -505,6 +770,7 @@ impl ApplicationService {
 
     fn install_subagents(&self, session_id: SessionId, built: &mut BuiltAgent) -> SubagentRuntime {
         let config = SubagentConfig {
+            capability_ceiling: built.agent.capability_mode(),
             generation_config: GenerationConfig {
                 model: Some(built.model.clone()),
                 reasoning_effort: built.reasoning_effort,
@@ -514,9 +780,14 @@ impl ApplicationService {
         };
         let child_factory: Arc<dyn SubagentFactory> = Arc::new(DaemonSubagentFactory {
             factory: Arc::clone(&self.factory),
+            parent_id: session_id.to_string(),
             profile_id: built.profile_id.clone(),
+            agent_profile: built.agent_profile.clone(),
             model: built.model.clone(),
             reasoning_effort: built.reasoning_effort,
+            capability_ceiling: built.agent.capability_mode(),
+            workspace: built.agent.workspace().cloned(),
+            worktrees: self.subagent_worktrees.clone(),
         });
         let runtime = SubagentRuntime::new(session_id.to_string(), child_factory, config);
         let SubagentTools {
@@ -526,7 +797,7 @@ impl ApplicationService {
         } = SubagentTools::new(runtime.clone());
         built.agent.add_tool(spawn_agent);
         built.agent.add_tool(send_agent_message);
-        built.agent.add_tool(close_agent);
+        built.agent.add_mandatory_tool(close_agent);
         runtime
     }
 
@@ -598,10 +869,61 @@ fn normalize_profile_id(profile_id: &str) -> Result<String, AgentFactoryError> {
     Ok(profile_id.to_owned())
 }
 
+fn build_request_for_record(session_id: SessionId, record: &SessionRecord) -> AgentBuildRequest {
+    let mut request = AgentBuildRequest::new(session_id, record.profile_id.clone())
+        .with_model(record.model.clone());
+    if let Some(agent_profile) = &record.agent_profile {
+        request = request.with_pinned_agent_profile(agent_profile.clone());
+    } else {
+        request = request.with_legacy_builtin_agent_profile();
+    }
+    match &record.workspace {
+        Some(workspace) => request.with_workspace(workspace.clone()),
+        None => request,
+    }
+}
+
 impl Default for ApplicationService {
     fn default() -> Self {
         Self::unconfigured()
     }
+}
+
+fn subagent_prompt_overlay(
+    config: &phi::EffectiveSubagentConfig,
+    workspace: Option<&Workspace>,
+) -> String {
+    let role = match config.agent_type {
+        SubagentType::General => {
+            "You are a general-purpose child agent. Complete the delegated task independently and report a concise, evidence-backed result to the parent."
+        }
+        SubagentType::Explore => {
+            "You are an exploration child agent. Inspect, search, and reason about the workspace without modifying it. Report concrete findings with file paths and relevant details."
+        }
+        SubagentType::Plan => {
+            "You are a planning child agent. Explore the workspace and return a structured implementation plan. Do not implement the plan or modify project files."
+        }
+    };
+    let output = match &config.output_contract {
+        SubagentOutputContract::Text => {
+            "Return a textual result. Use notify_parent for blockers or the final result."
+                .to_owned()
+        }
+        SubagentOutputContract::Json { required_fields } if required_fields.is_empty() => {
+            "Return valid JSON as the final response.".to_owned()
+        }
+        SubagentOutputContract::Json { required_fields } => format!(
+            "Return valid JSON as the final response. The top-level object must contain these fields: {}.",
+            required_fields.join(", ")
+        ),
+    };
+    let workspace = workspace
+        .map(|workspace| format!("{:?}", workspace.root()))
+        .unwrap_or_else(|| "not configured".to_owned());
+    format!(
+        "# Subagent Role\n{role}\n\n# Effective Child Policy\n- Capability mode: {:?}\n- Isolation: {:?}\n- Child workspace: {workspace}\n- The capability and workspace boundaries are runtime-enforced and cannot be widened by instructions.\n\n# Output Contract\n{output}",
+        config.capability_mode, config.isolation,
+    )
 }
 
 #[derive(Clone)]
@@ -632,6 +954,9 @@ pub enum ServiceError {
     #[error("Provider management is unavailable for this embedded service")]
     ProviderManagementUnavailable,
 
+    #[error("Agent Profile management is unavailable for this embedded service")]
+    AgentProfileManagementUnavailable,
+
     #[error(transparent)]
     Factory(#[from] AgentFactoryError),
 
@@ -640,6 +965,9 @@ pub enum ServiceError {
 
     #[error(transparent)]
     ProviderStore(#[from] ProviderStoreError),
+
+    #[error(transparent)]
+    AgentProfileStore(#[from] AgentProfileStoreError),
 
     #[error(transparent)]
     Agent(#[from] AgentHandleError),

@@ -1,89 +1,184 @@
+.userRow,
+.assistantRow {
+  width: 100%;
+  margin: 24px 0;
+}
+
 .userRow {
   display: flex;
   justify-content: flex-end;
-  margin: 0.5rem 0;
+}
+
+.userContent {
+  display: flex;
+  max-width: min(78%, 720px);
+  flex-direction: column;
+  align-items: flex-end;
 }
 
 .userBubble {
-  max-width: 78%;
-  padding: 0.5rem 0.8rem;
+  padding: 12px 15px;
+  border: 1px solid var(--phi-accent-border);
+  border-radius: 8px 8px 3px 8px;
   background: var(--phi-user-bubble);
-  border: 1px solid var(--phi-border);
-  border-radius: var(--phi-radius-lg);
-  border-bottom-right-radius: 4px;
   color: var(--phi-text-strong);
+  font-size: 14px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 0.9rem;
-  line-height: 1.5;
 }
 
-.optimistic {
-  opacity: 0.6;
-  font-style: italic;
+.userMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 4px 0;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 10px;
+}
+
+.pendingDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--phi-warning);
+  animation: pulse 1.2s ease-in-out infinite;
 }
 
 .assistantRow {
-  margin: 0.6rem 0;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 12px;
 }
 
-.roleLabel {
-  font-family: var(--phi-mono);
-  font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+.assistantAvatar {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-top: 2px;
+  border: 1px solid var(--phi-accent-border);
+  border-radius: 5px;
+  background: var(--phi-accent-soft);
+  color: var(--phi-accent);
+  font-size: 15px;
+}
+
+.assistantContent {
+  min-width: 0;
+  padding-top: 1px;
+}
+
+.assistantLabel {
+  margin-bottom: 8px;
   color: var(--phi-text-muted);
-  margin-bottom: 0.25rem;
+  font-family: var(--phi-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .thinking {
   display: inline-flex;
   align-items: center;
-  height: 1.2rem;
+  gap: 9px;
+  min-height: 28px;
+  color: var(--phi-text-muted);
+  font-size: 13px;
 }
 
-.cursor {
-  width: 0.5rem;
-  height: 1rem;
+.thinkingDots {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.thinkingDots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
   background: var(--phi-accent);
-  display: inline-block;
-  animation: blink 1s steps(2, start) infinite;
+  animation: bounce 1.2s ease-in-out infinite;
 }
 
-@keyframes blink {
-  to {
-    visibility: hidden;
-  }
+.thinkingDots i:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.thinkingDots i:nth-child(3) {
+  animation-delay: 240ms;
 }
 
 .draftTools {
-  margin-top: 0.4rem;
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
+  gap: 6px;
+  margin-top: 12px;
 }
 
 .draftTool {
   display: flex;
+  min-width: 0;
   align-items: center;
-  gap: 0.45rem;
-  padding: 0.25rem 0.45rem;
-  background: var(--phi-surface);
+  gap: 8px;
+  padding: 8px 10px;
   border: 1px solid var(--phi-border);
-  border-radius: 6px;
+  border-radius: 5px;
+  background: var(--phi-surface);
   font-family: var(--phi-mono);
-  font-size: 0.72rem;
-  color: var(--phi-text-muted);
+  font-size: 11px;
+}
+
+.draftToolPulse {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--phi-warning);
+  box-shadow: 0 0 0 4px var(--phi-warning-soft);
 }
 
 .draftToolName {
+  flex: 0 0 auto;
   color: var(--phi-accent);
-  font-weight: 600;
-  flex-shrink: 0;
+  font-weight: 650;
 }
 
 .draftToolArgs {
+  min-width: 0;
   overflow: hidden;
+  color: var(--phi-text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 620px) {
+  .userContent {
+    max-width: 88%;
+  }
+
+  .userRow,
+  .assistantRow {
+    margin: 19px 0;
+  }
 }

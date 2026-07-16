@@ -67,7 +67,7 @@ impl ControlStore for MemoryControlStore {
 
 #[cfg(test)]
 mod tests {
-    use phi::ReasoningEffort;
+    use phi::{ReasoningEffort, Workspace};
 
     use super::*;
 
@@ -78,6 +78,7 @@ mod tests {
             "model-1",
             Some(ReasoningEffort::Medium),
         )
+        .with_workspace(Workspace::new("/workspace/project"))
     }
 
     #[tokio::test]

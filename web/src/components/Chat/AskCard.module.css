@@ -1,103 +1,107 @@
 .card {
-  margin: 0.6rem 0;
-  border: 1px solid var(--phi-border);
-  border-left: 3px solid var(--phi-accent);
-  border-radius: var(--phi-radius);
-  background: var(--phi-surface);
+  margin: 22px 0 24px 42px;
   overflow: hidden;
+  border: 1px solid var(--phi-accent-border);
+  border-radius: 8px;
+  background: var(--phi-surface);
+}
+
+.header,
+.questionHeader,
+.actions {
+  display: flex;
+  align-items: center;
 }
 
 .header {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  background: var(--phi-surface-2);
+  gap: 9px;
+  padding: 12px 14px;
   border-bottom: 1px solid var(--phi-border);
 }
 
 .badge {
-  font-family: var(--phi-mono);
-  font-size: 0.62rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 0.1rem 0.4rem;
-  border-radius: 4px;
-  background: var(--phi-accent-soft);
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: var(--phi-accent-soft-strong);
   color: var(--phi-accent);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
 }
 
 .title {
-  font-size: 0.82rem;
-  color: var(--phi-text);
+  color: var(--phi-text-strong);
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .questions {
-  padding: 0.6rem 0.75rem;
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: 18px;
+  padding: 15px;
 }
 
 .question {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  gap: 8px;
+}
+
+.question + .question {
+  padding-top: 17px;
+  border-top: 1px solid var(--phi-border);
 }
 
 .questionHeader {
-  display: flex;
-  align-items: baseline;
   justify-content: space-between;
-  gap: 0.5rem;
+  gap: 10px;
 }
 
 .questionLabel {
-  font-size: 0.78rem;
-  font-weight: 600;
   color: var(--phi-text-strong);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .multiHint {
+  color: var(--phi-text-dim);
   font-family: var(--phi-mono);
-  font-size: 0.62rem;
-  color: var(--phi-text-muted);
-  text-transform: lowercase;
+  font-size: 9px;
 }
 
 .questionText {
-  font-size: 0.82rem;
   color: var(--phi-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .options {
-  margin-top: 0.2rem;
+  margin-top: 3px;
 }
 
 .optionsGrid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.5rem;
-  align-items: stretch;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(260px, 1.2fr);
+  gap: 10px;
 }
 
 .optionList {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  gap: 7px;
 }
 
 .option {
-  display: block;
-  text-align: left;
-  background: var(--phi-bg-elevated);
+  width: 100%;
+  padding: 10px 11px;
   border: 1px solid var(--phi-border);
   border-radius: 6px;
-  padding: 0.4rem 0.55rem;
+  background: var(--phi-bg-elevated);
+  color: var(--phi-text);
+  text-align: left;
   cursor: pointer;
-  transition:
-    border-color 0.12s ease,
-    background 0.12s ease;
 }
 
 .option:hover {
@@ -108,78 +112,89 @@
 .optionSelected {
   border-color: var(--phi-accent);
   background: var(--phi-accent-soft);
+  box-shadow: inset 2px 0 0 var(--phi-accent);
 }
 
 .optionMain {
   display: flex;
   flex-direction: column;
-  gap: 0.1rem;
+  gap: 4px;
 }
 
 .optionLabel {
-  font-size: 0.8rem;
   color: var(--phi-text-strong);
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .optionDesc {
-  font-size: 0.72rem;
   color: var(--phi-text-muted);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .previewWrap {
+  min-height: 120px;
+  overflow: auto;
+  padding: 11px;
   border: 1px solid var(--phi-border);
   border-radius: 6px;
   background: var(--phi-code-bg);
-  padding: 0.5rem;
-  min-height: 80px;
-  overflow: auto;
 }
 
 .preview {
   margin: 0;
-  font-family: var(--phi-mono);
-  font-size: 0.72rem;
   color: var(--phi-code-text);
+  font-family: var(--phi-mono);
+  font-size: 10px;
+  line-height: 1.5;
   white-space: pre-wrap;
-  word-break: break-word;
 }
 
 .previewPlaceholder {
+  color: var(--phi-text-dim);
   font-family: var(--phi-mono);
-  font-size: 0.7rem;
-  color: var(--phi-text-muted);
+  font-size: 10px;
 }
 
 .customInput {
-  margin-top: 0.3rem;
-  background: var(--phi-bg-elevated);
+  height: 38px;
+  margin-top: 2px;
+  padding: 0 10px;
   border: 1px solid var(--phi-border);
   border-radius: 6px;
-  padding: 0.4rem 0.55rem;
+  outline: 0;
+  background: var(--phi-bg-elevated);
   color: var(--phi-text);
-  font-size: 0.8rem;
-  outline: none;
+  font-size: 11px;
 }
 
 .customInput:focus {
   border-color: var(--phi-accent);
+  box-shadow: 0 0 0 3px var(--phi-accent-soft);
 }
 
 .actions {
-  padding: 0.5rem 0.75rem 0.65rem;
-  border-top: 1px solid var(--phi-border);
-  display: flex;
   justify-content: flex-end;
+  padding: 11px 14px 13px;
+  border-top: 1px solid var(--phi-border);
 }
 
 .submitBtn {
-  background: var(--phi-accent);
+  height: 34px;
+  padding: 0 13px;
   border: 1px solid var(--phi-accent);
-  color: #fff;
   border-radius: 6px;
-  padding: 0.35rem 0.85rem;
-  font-size: 0.8rem;
+  background: var(--phi-accent);
+  color: var(--phi-accent-contrast);
+  font-size: 11px;
+  font-weight: 650;
   cursor: pointer;
+}
+
+.submitBtn:hover:not(:disabled) {
+  border-color: var(--phi-accent-hover);
+  background: var(--phi-accent-hover);
 }
 
 .submitBtn:disabled {
@@ -187,7 +202,12 @@
   cursor: not-allowed;
 }
 
-.submitBtn:hover:not(:disabled) {
-  background: var(--phi-accent-hover);
-  border-color: var(--phi-accent-hover);
+@media (max-width: 720px) {
+  .card {
+    margin-left: 0;
+  }
+
+  .optionsGrid {
+    grid-template-columns: 1fr;
+  }
 }

@@ -11,6 +11,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use phi::CapabilityMode;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -18,11 +19,12 @@ use super::{
     AppState,
     auth::{self, WS_AUTH_PROTOCOL_PREFIX, WS_PROTOCOL},
     dto::{
-        ClientCommand, ServerMessage, SessionConfigDto, SessionDto, SubagentEventDto,
-        SubagentSnapshotDto,
+        AgentProfileRefDto, ClientCommand, ServerMessage, SessionConfigDto, SessionDto,
+        SubagentEventDto, SubagentSnapshotDto,
     },
 };
 use crate::{
+    runtime::DEFAULT_AGENT_PROFILE_ID,
     runtime::{
         AgentHandle, AgentHandleError, AgentStatus, RuntimeEvent, RuntimeEventKind, SessionId,
     },
@@ -46,6 +48,8 @@ pub(super) fn routes() -> Router<AppState> {
 #[serde(deny_unknown_fields)]
 struct NewSessionQuery {
     profile_id: Option<String>,
+    agent_profile_id: Option<String>,
+    capability_mode: Option<CapabilityMode>,
 }
 
 #[derive(Default, Deserialize)]
@@ -69,11 +73,23 @@ async fn new_session(
     let profile_id = query
         .profile_id
         .unwrap_or_else(|| DEFAULT_PROFILE_ID.to_owned());
+    let agent_profile_id = query
+        .agent_profile_id
+        .unwrap_or_else(|| DEFAULT_AGENT_PROFILE_ID.to_owned());
+    let capability_mode = query.capability_mode;
     websocket
         .protocols([WS_PROTOCOL])
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_new(socket, service, profile_id))
+        .on_upgrade(move |socket| {
+            handle_new(
+                socket,
+                service,
+                profile_id,
+                agent_profile_id,
+                capability_mode,
+            )
+        })
 }
 
 async fn attach_session(
@@ -142,7 +158,13 @@ fn authenticate_websocket(headers: &HeaderMap, state: &AppState) -> bool {
     supports_protocol && token.is_some_and(|token| state.auth().consume_ws_token(token))
 }
 
-async fn handle_new(socket: WebSocket, service: Arc<ApplicationService>, profile_id: String) {
+async fn handle_new(
+    socket: WebSocket,
+    service: Arc<ApplicationService>,
+    profile_id: String,
+    agent_profile_id: String,
+    capability_mode: Option<CapabilityMode>,
+) {
     let (mut sender, receiver) = socket.split();
     if send_json(&mut sender, &ServerMessage::Building)
         .await
@@ -151,7 +173,10 @@ async fn handle_new(socket: WebSocket, service: Arc<ApplicationService>, profile
         return;
     }
 
-    let prepared = match service.prepare_session(profile_id).await {
+    let prepared = match service
+        .prepare_session_configured(profile_id, agent_profile_id, capability_mode)
+        .await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = send_json(
@@ -173,6 +198,12 @@ async fn handle_new(socket: WebSocket, service: Arc<ApplicationService>, profile
         &ServerMessage::Ready {
             config: SessionConfigDto::from_summary(&summary),
             mode: summary.mode,
+            capability_mode: summary.capability_mode,
+            agent_profile: AgentProfileRefDto {
+                agent_profile_id: summary.agent_profile_id,
+                revision: summary.agent_profile_revision,
+            },
+            workspace: summary.workspace.as_ref().map(ToString::to_string),
         },
     )
     .await
@@ -449,7 +480,7 @@ async fn socket_loop(
     mut events: broadcast::Receiver<RuntimeEvent>,
     handle: AgentHandle,
     mut pending: Option<PendingActivation>,
-    connection_kind: ConnectionKind,
+    mut connection_kind: ConnectionKind,
     mut skip_through: u64,
 ) -> bool {
     loop {
@@ -475,7 +506,7 @@ async fn socket_loop(
                             &mut sender,
                             &handle,
                             &mut pending,
-                            connection_kind,
+                            &mut connection_kind,
                             command,
                         )
                             .await
@@ -542,7 +573,7 @@ async fn handle_command(
     sender: &mut SplitSink<WebSocket, Message>,
     handle: &AgentHandle,
     pending: &mut Option<PendingActivation>,
-    connection_kind: ConnectionKind,
+    connection_kind: &mut ConnectionKind,
     command: ClientCommand,
 ) -> Result<(), ()> {
     let request_id = command.request_id().to_owned();
@@ -562,6 +593,7 @@ async fn handle_command(
                 {
                     Ok((_, queued)) => {
                         pending.activated = true;
+                        *connection_kind = ConnectionKind::Attach;
                         send_json(
                             sender,
                             &ServerMessage::SessionCreated {
@@ -617,7 +649,7 @@ async fn handle_command(
             Err(error) => reject_handle(sender, request_id, error).await,
         },
         ClientCommand::Compact { instructions, .. } => {
-            if connection_kind != ConnectionKind::Attach {
+            if *connection_kind != ConnectionKind::Attach {
                 return reject(
                     sender,
                     request_id,
@@ -681,6 +713,23 @@ async fn handle_command(
                     &ServerMessage::CommandAccepted {
                         request_id,
                         command: "set_mode",
+                        run_id: None,
+                        queue_position: None,
+                    },
+                )
+                .await
+            }
+            Err(error) => reject_handle(sender, request_id, error).await,
+        },
+        ClientCommand::SetCapabilityMode {
+            capability_mode, ..
+        } => match handle.set_capability_mode(capability_mode).await {
+            Ok(()) => {
+                send_json(
+                    sender,
+                    &ServerMessage::CommandAccepted {
+                        request_id,
+                        command: "set_capability_mode",
                         run_id: None,
                         queue_position: None,
                     },

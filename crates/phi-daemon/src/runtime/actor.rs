@@ -11,10 +11,11 @@ use std::{
 use futures_util::FutureExt;
 use phi::{
     Agent, AgentEvent, AgentMode, AgentModeControl, AgentRunControl, AgentRunOutcome,
-    AssistantDelta, Content, ContextCompactionRunOutcome, ContextUsage, InMemoryPlanStore, Message,
-    PlanStore, ReasoningEffort, Role, SessionStorage, SkillCatalog, SkillDiagnostic,
-    SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotificationKind,
-    SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage,
+    AssistantDelta, CapabilityMode, Content, ContextCompactionRunOutcome, ContextUsage,
+    InMemoryPlanStore, Message, PlanStore, ReasoningEffort, Role, SessionStorage, SkillCatalog,
+    SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind,
+    SubagentNotificationKind, SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage,
+    Workspace,
 };
 use thiserror::Error;
 use tokio::sync::{
@@ -22,10 +23,12 @@ use tokio::sync::{
 };
 
 use super::{
-    AskUserId, PlanApprovalDecision, PlanApprovalId, PlanApprovalRequest, RunId, SessionId,
+    AskUserId, PinnedAgentProfile, PlanApprovalDecision, PlanApprovalId, PlanApprovalRequest,
+    RunId, SessionId,
     ask_user::{
         AskUserAnswer, AskUserRequest, AskUserTool, PendingAskUserRequest, validate_answers,
     },
+    compile_agent_profile, default_agent_profile,
     plan_approval::{
         ExitPlanModeTool, PendingPlanApprovalRequest, PlanApprovalMessage, ReadPlanTool,
         WritePlanTool,
@@ -65,12 +68,16 @@ pub struct ToolCallDraft {
 pub struct AgentView {
     pub session_id: SessionId,
     pub profile_id: String,
+    pub agent_profile_id: String,
+    pub agent_profile_revision: u64,
     pub initialized: bool,
     pub status: AgentStatus,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
     pub mode: AgentMode,
+    pub capability_mode: CapabilityMode,
     pub model: String,
+    pub workspace: Option<Workspace>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub config_revision: u64,
     pub messages: Vec<Message>,
@@ -98,12 +105,16 @@ pub struct SubagentSummary {
 pub struct AgentSummary {
     pub session_id: SessionId,
     pub profile_id: String,
+    pub agent_profile_id: String,
+    pub agent_profile_revision: u64,
     pub initialized: bool,
     pub status: AgentStatus,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
     pub mode: AgentMode,
+    pub capability_mode: CapabilityMode,
     pub model: String,
+    pub workspace: Option<Workspace>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub config_revision: u64,
     pub message_count: usize,
@@ -148,6 +159,9 @@ pub enum RuntimeEventKind {
     },
     ModeChanged {
         mode: AgentMode,
+    },
+    CapabilityModeChanged {
+        capability_mode: CapabilityMode,
     },
     AskUserRequested {
         request: AskUserRequest,
@@ -195,6 +209,7 @@ pub struct AgentHandle {
     compaction_slot: Arc<Semaphore>,
     skills: SkillCatalog,
     subagents: Option<SubagentRuntime>,
+    agent_profile: PinnedAgentProfile,
 }
 
 impl AgentHandle {
@@ -258,7 +273,7 @@ impl AgentHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_plan_store_skills_and_subagents(
         session_id: SessionId,
-        mut agent: Agent,
+        agent: Agent,
         profile_id: impl Into<String>,
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
@@ -266,13 +281,45 @@ impl AgentHandle {
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
     ) -> Self {
+        let workspace = agent
+            .workspace()
+            .cloned()
+            .unwrap_or_else(|| Workspace::new("."));
+        let agent_profile = compile_agent_profile(&default_agent_profile(), &workspace)
+            .expect("the built-in Agent Profile must compile");
+        Self::spawn_configured_with_plan_store_skills_and_subagents(
+            session_id,
+            agent,
+            profile_id,
+            agent_profile,
+            model,
+            reasoning_effort,
+            plan_store,
+            skills,
+            subagents,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_configured_with_plan_store_skills_and_subagents(
+        session_id: SessionId,
+        mut agent: Agent,
+        profile_id: impl Into<String>,
+        agent_profile: PinnedAgentProfile,
+        model: impl Into<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        plan_store: Arc<dyn PlanStore>,
+        skills: SkillCatalog,
+        subagents: Option<SubagentRuntime>,
+    ) -> Self {
+        let stored_agent_profile = agent_profile.clone();
         let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
-        agent.add_tool(ask_user_tool);
-        agent.add_tool(ReadPlanTool::new(session_id, Arc::clone(&plan_store)));
-        agent.add_tool(WritePlanTool::new(session_id, Arc::clone(&plan_store)));
+        agent.add_mandatory_tool(ask_user_tool);
+        agent.add_mandatory_tool(ReadPlanTool::new(session_id, Arc::clone(&plan_store)));
+        agent.add_mandatory_tool(WritePlanTool::new(session_id, Arc::clone(&plan_store)));
         let (exit_plan_mode_tool, plan_approval_messages) =
             ExitPlanModeTool::channel(session_id, Arc::clone(&plan_store));
-        agent.add_tool(exit_plan_mode_tool);
+        agent.add_mandatory_tool(exit_plan_mode_tool);
         let mode_control = agent.mode_control();
         // Subscribe before taking the initial projection so delegation that
         // races construction is either represented by the snapshot, buffered
@@ -281,12 +328,16 @@ impl AgentHandle {
         let initial = AgentView {
             session_id,
             profile_id: profile_id.into(),
+            agent_profile_id: agent_profile.agent_profile_id,
+            agent_profile_revision: agent_profile.revision,
             initialized: false,
             status: AgentStatus::AwaitingFirstPrompt,
             active_run_id: None,
             queued_runs: 0,
             mode: agent.mode(),
+            capability_mode: agent.capability_mode(),
             model: model.into(),
+            workspace: agent.workspace().cloned(),
             reasoning_effort,
             config_revision: 0,
             messages: agent.messages().to_vec(),
@@ -394,6 +445,7 @@ impl AgentHandle {
             compaction_slot,
             skills,
             subagents,
+            agent_profile: stored_agent_profile,
         }
     }
 
@@ -415,6 +467,10 @@ impl AgentHandle {
 
     pub fn subagents(&self) -> Option<&SubagentRuntime> {
         self.subagents.as_ref()
+    }
+
+    pub fn agent_profile(&self) -> &PinnedAgentProfile {
+        &self.agent_profile
     }
 
     pub fn prepare_prompt(
@@ -454,12 +510,16 @@ impl AgentHandle {
         AgentSummary {
             session_id: state.session_id,
             profile_id: state.profile_id.clone(),
+            agent_profile_id: state.agent_profile_id.clone(),
+            agent_profile_revision: state.agent_profile_revision,
             initialized: state.initialized,
             status: state.status,
             active_run_id: state.active_run_id,
             queued_runs: state.queued_runs,
             mode: state.mode,
+            capability_mode: state.capability_mode,
             model: state.model.clone(),
+            workspace: state.workspace.clone(),
             reasoning_effort: state.reasoning_effort,
             config_revision: state.config_revision,
             message_count: state.messages.len(),
@@ -481,7 +541,7 @@ impl AgentHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(AgentCommand::Initialize {
-                record,
+                record: Box::new(record),
                 session_storage,
                 control_store,
                 reply,
@@ -625,6 +685,28 @@ impl AgentHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(AgentCommand::SetMode { mode, reply })
+            .await
+            .map_err(|_| self.stopped_error())?;
+        response
+            .await
+            .map_err(|_| self.response_error())?
+            .map_err(|message| AgentHandleError::Operation {
+                session_id: self.session_id,
+                message,
+            })
+    }
+
+    pub async fn set_capability_mode(
+        &self,
+        capability_mode: CapabilityMode,
+    ) -> Result<(), AgentHandleError> {
+        self.ensure_configurable()?;
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AgentCommand::SetCapabilityMode {
+                capability_mode,
+                reply,
+            })
             .await
             .map_err(|_| self.stopped_error())?;
         response
@@ -796,7 +878,7 @@ struct MetadataBinding {
 
 enum AgentCommand {
     Initialize {
-        record: SessionRecord,
+        record: Box<SessionRecord>,
         session_storage: Arc<dyn SessionStorage>,
         control_store: Arc<dyn ControlStore>,
         reply: oneshot::Sender<Result<(), String>>,
@@ -822,6 +904,10 @@ enum AgentCommand {
     },
     SetMode {
         mode: AgentMode,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SetCapabilityMode {
+        capability_mode: CapabilityMode,
         reply: oneshot::Sender<Result<(), String>>,
     },
     AnswerAskUser {
@@ -915,6 +1001,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 control_store,
                 reply,
             } => {
+                let record = *record;
                 if hub.is_initialized() {
                     let _ = reply.send(Err("session is already initialized".to_owned()));
                     continue;
@@ -1071,6 +1158,9 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 AgentCommand::SetMode { reply, .. } => {
                                     let _ = reply.send(Err("cannot change mode directly while the agent is running".to_owned()));
                                 }
+                                AgentCommand::SetCapabilityMode { reply, .. } => {
+                                    let _ = reply.send(Err("cannot change capability mode while the agent is running".to_owned()));
+                                }
                                 AgentCommand::CompactContext { admission, .. } => {
                                     let _ = admission.send(Err(AgentHandleError::Busy {
                                         session_id: hub.session_id,
@@ -1143,6 +1233,14 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 let final_mode = agent.mode();
                 if hub.current_mode() != final_mode {
                     hub.mode_changed(final_mode);
+                }
+                if let Some(subagents) = &subagents {
+                    let ceiling = if final_mode == AgentMode::Plan {
+                        CapabilityMode::ReadOnly
+                    } else {
+                        agent.capability_mode()
+                    };
+                    subagents.set_capability_ceiling(ceiling);
                 }
                 cancel_pending_asks(
                     &mut pending_asks,
@@ -1278,9 +1376,21 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 let _ = reply.send(result);
             }
             AgentCommand::SetMode { mode, reply } => {
-                let result = apply_mode(&mut agent, &hub, mode).await;
+                let result = apply_mode(&mut agent, &hub, subagents.as_ref(), mode).await;
                 if let Err(error) = &result {
                     hub.operation_failed("set_mode", error.clone());
+                }
+                let _ = reply.send(result);
+            }
+            AgentCommand::SetCapabilityMode {
+                capability_mode,
+                reply,
+            } => {
+                let result =
+                    apply_capability_mode(&mut agent, &hub, subagents.as_ref(), capability_mode)
+                        .await;
+                if let Err(error) = &result {
+                    hub.operation_failed("set_capability_mode", error.clone());
                 }
                 let _ = reply.send(result);
             }
@@ -1811,6 +1921,9 @@ fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
         AgentCommand::SetMode { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
         }
+        AgentCommand::SetCapabilityMode { reply, .. } => {
+            let _ = reply.send(Err("agent is closing".to_owned()));
+        }
         AgentCommand::AnswerAskUser { ask_id, reply, .. } => {
             let _ = reply.send(Err(AgentHandleError::AskUserNotPending {
                 session_id: hub.session_id,
@@ -1877,14 +1990,69 @@ async fn apply_reasoning(
     Ok(())
 }
 
-async fn apply_mode(agent: &mut Agent, hub: &EventHub, mode: AgentMode) -> Result<(), String> {
+async fn apply_mode(
+    agent: &mut Agent,
+    hub: &EventHub,
+    subagents: Option<&SubagentRuntime>,
+    mode: AgentMode,
+) -> Result<(), String> {
+    if let Some(subagents) = subagents
+        && mode == AgentMode::Plan
+    {
+        subagents
+            .close_exceeding_capability(CapabilityMode::ReadOnly, "parent entered plan mode")
+            .await;
+    }
     let result = agent
         .set_mode(mode)
         .await
         .map_err(|error| error.to_string());
     let effective_mode = agent.mode();
+    if let Some(subagents) = subagents {
+        let ceiling = if effective_mode == AgentMode::Plan {
+            CapabilityMode::ReadOnly
+        } else {
+            agent.capability_mode()
+        };
+        subagents.set_capability_ceiling(ceiling);
+    }
     if hub.current_mode() != effective_mode {
         hub.mode_changed(effective_mode);
+    }
+    result
+}
+
+async fn apply_capability_mode(
+    agent: &mut Agent,
+    hub: &EventHub,
+    subagents: Option<&SubagentRuntime>,
+    capability_mode: CapabilityMode,
+) -> Result<(), String> {
+    if let Some(subagents) = subagents {
+        let ceiling = if agent.mode() == AgentMode::Plan {
+            CapabilityMode::ReadOnly
+        } else {
+            capability_mode
+        };
+        subagents
+            .close_exceeding_capability(ceiling, "parent capability mode was narrowed")
+            .await;
+    }
+    let result = agent
+        .set_capability_mode(capability_mode)
+        .await
+        .map_err(|error| error.to_string());
+    let effective = agent.capability_mode();
+    if let Some(subagents) = subagents {
+        let ceiling = if agent.mode() == AgentMode::Plan {
+            CapabilityMode::ReadOnly
+        } else {
+            effective
+        };
+        subagents.set_capability_ceiling(ceiling);
+    }
+    if hub.current_capability_mode() != effective {
+        hub.capability_mode_changed(effective);
     }
     result
 }
@@ -1905,6 +2073,10 @@ impl EventHub {
 
     fn current_mode(&self) -> AgentMode {
         self.state.borrow().mode
+    }
+
+    fn current_capability_mode(&self) -> CapabilityMode {
+        self.state.borrow().capability_mode
     }
 
     fn is_initialized(&self) -> bool {
@@ -1962,6 +2134,7 @@ impl EventHub {
             state.reasoning_effort = record.reasoning_effort;
             state.config_revision = record.config_revision;
             state.mode = agent.mode();
+            state.capability_mode = agent.capability_mode();
             state.messages = agent.messages().to_vec();
             state.last_usage = agent.last_usage();
             state.context_usage = agent.context_usage();
@@ -2127,6 +2300,13 @@ impl EventHub {
         self.publish(RuntimeEventKind::ModeChanged { mode }, |state| {
             state.mode = mode;
         });
+    }
+
+    fn capability_mode_changed(&self, capability_mode: CapabilityMode) {
+        self.publish(
+            RuntimeEventKind::CapabilityModeChanged { capability_mode },
+            |state| state.capability_mode = capability_mode,
+        );
     }
 
     fn operation_failed(&self, operation: impl Into<String>, message: String) {
@@ -2520,12 +2700,16 @@ mod tests {
         let (state, _) = watch::channel(AgentView {
             session_id,
             profile_id: "test".to_owned(),
+            agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
+            agent_profile_revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
             initialized: true,
             status: AgentStatus::Idle,
             active_run_id: None,
             queued_runs: 0,
             mode: AgentMode::Default,
+            capability_mode: CapabilityMode::FullAccess,
             model: "test-model".to_owned(),
+            workspace: None,
             reasoning_effort: None,
             config_revision: 0,
             messages: Vec::new(),
@@ -2578,6 +2762,13 @@ mod tests {
             kind: SubagentEventKind::Spawned {
                 description: "research".to_owned(),
                 initial_delivery_id: "delivery-1".to_owned(),
+                effective_config: phi::EffectiveSubagentConfig {
+                    agent_type: phi::SubagentType::Explore,
+                    capability_mode: CapabilityMode::ReadOnly,
+                    generation_config: phi::GenerationConfig::default(),
+                    output_contract: phi::SubagentOutputContract::Text,
+                    isolation: phi::SubagentIsolation::Shared,
+                },
             },
         });
 

@@ -71,7 +71,7 @@ impl DaemonConfig {
     }
 
     pub fn with_workspace_dir(mut self, workspace_dir: impl Into<PathBuf>) -> Self {
-        self.workspace_dir = workspace_dir.into();
+        self.workspace_dir = normalize_workspace_dir(workspace_dir.into());
         self
     }
 
@@ -119,7 +119,7 @@ impl DaemonConfig {
                     value,
                 });
             }
-            config.workspace_dir = PathBuf::from(value);
+            config.workspace_dir = normalize_workspace_dir(PathBuf::from(value));
         }
         if let Some(value) = optional_environment_os(GLOBAL_SKILLS_DIRS_ENV) {
             config.global_skill_dirs = parse_path_list(value);
@@ -159,28 +159,21 @@ impl DaemonConfig {
     }
 
     pub fn skills_config(&self) -> SkillsConfig {
+        self.skills_config_template()
+            .resolve_against(&phi::Workspace::new(self.workspace_dir.clone()))
+    }
+
+    pub(crate) fn skills_config_template(&self) -> SkillsConfig {
         let mut config = SkillsConfig::new()
             .enabled(self.skills_enabled)
             .duplicate_policy(DuplicateSkillPolicy::LastWins);
         for path in &self.global_skill_dirs {
-            config = config.skill_directory(
-                SkillDirectory::new(self.resolve_from_workspace(path)).source("global"),
-            );
+            config = config.skill_directory(SkillDirectory::new(path.clone()).source("global"));
         }
         for path in &self.workspace_skill_dirs {
-            config = config.skill_directory(
-                SkillDirectory::new(self.resolve_from_workspace(path)).source("workspace"),
-            );
+            config = config.skill_directory(SkillDirectory::new(path.clone()).source("workspace"));
         }
         config
-    }
-
-    fn resolve_from_workspace(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            self.workspace_dir.join(path)
-        }
     }
 
     pub(crate) fn auth_key(&self) -> &str {
@@ -246,6 +239,10 @@ fn default_global_skill_dirs() -> Vec<PathBuf> {
         .map(|home| home.join(DEFAULT_GLOBAL_SKILLS_DIR))
         .into_iter()
         .collect()
+}
+
+fn normalize_workspace_dir(path: PathBuf) -> PathBuf {
+    phi::Workspace::new(path).root().to_owned()
 }
 
 fn home_directory() -> Option<PathBuf> {

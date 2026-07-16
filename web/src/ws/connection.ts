@@ -175,7 +175,13 @@ export class SessionSocket {
     } catch {
       return;
     }
-    this.handlers.onMessage(parsed as ServerMessage);
+    if (!isServerMessage(parsed)) {
+      this.handlers.onError(
+        new Error('Daemon sent an invalid WebSocket frame'),
+      );
+      return;
+    }
+    this.handlers.onMessage(parsed);
   };
 
   private readonly handleClose = (event: CloseEvent): void => {
@@ -192,6 +198,15 @@ export class SessionSocket {
     );
     void event;
   };
+}
+
+function isServerMessage(value: unknown): value is ServerMessage {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'type' in value &&
+    typeof value.type === 'string'
+  );
 }
 
 function getCloseCode(socket: WebSocket | null): number | 'unknown' {

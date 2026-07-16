@@ -19,7 +19,8 @@ use tokio::{
 };
 
 use crate::{
-    tool::AgentMode,
+    Workspace,
+    tool::{AgentMode, CapabilityMode},
     types::{Message, TokenUsage},
 };
 
@@ -31,6 +32,12 @@ const MAX_SESSION_ID_BYTES: usize = 180;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub id: String,
+    /// Immutable working directory associated with this session.
+    ///
+    /// `None` preserves compatibility with sessions created before workspace
+    /// association was introduced.
+    #[serde(default)]
+    pub workspace: Option<Workspace>,
     pub messages: Vec<Message>,
     pub last_usage: Option<TokenUsage>,
     pub cumulative_usage: TokenUsage,
@@ -40,6 +47,12 @@ pub struct SessionSnapshot {
     /// modes were introduced.
     #[serde(default)]
     pub mode: AgentMode,
+    /// Maximum tool capability restored when this session is resumed.
+    ///
+    /// Full access preserves compatibility with snapshots written before
+    /// capability modes were introduced.
+    #[serde(default)]
+    pub capability_mode: CapabilityMode,
 }
 
 impl SessionSnapshot {
@@ -48,11 +61,18 @@ impl SessionSnapshot {
         validate_session_id(&id)?;
         Ok(Self {
             id,
+            workspace: None,
             messages,
             last_usage: None,
             cumulative_usage: TokenUsage::default(),
             mode: AgentMode::default(),
+            capability_mode: CapabilityMode::default(),
         })
+    }
+
+    pub fn with_workspace(mut self, workspace: Workspace) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 }
 
@@ -84,6 +104,15 @@ pub enum StorageError {
 
     #[error("stored session ID {actual:?} does not match requested ID {expected:?}")]
     SessionIdMismatch { expected: String, actual: String },
+
+    #[error(
+        "session {session_id:?} is bound to workspace {stored:?}, not requested workspace {requested:?}"
+    )]
+    WorkspaceMismatch {
+        session_id: String,
+        stored: PathBuf,
+        requested: Option<PathBuf>,
+    },
 
     #[error("invalid transcript for session {session_id:?}: {message}")]
     InvalidTranscript { session_id: String, message: String },
@@ -186,10 +215,15 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError> {
         validate_session_id(&session.id)?;
-        self.sessions
-            .write()
-            .await
-            .insert(session.id.clone(), session.clone());
+        let mut sessions = self.sessions.write().await;
+        if let Some(current) = sessions.get(&session.id) {
+            validate_workspace_binding(
+                &session.id,
+                current.workspace.as_ref(),
+                session.workspace.as_ref(),
+            )?;
+        }
+        sessions.insert(session.id.clone(), session.clone());
         Ok(())
     }
 
@@ -280,22 +314,28 @@ struct StoredSessionRecord {
 enum StoredSessionEventRef<'a> {
     Append {
         messages: &'a [Message],
+        workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         mode: AgentMode,
+        capability_mode: CapabilityMode,
     },
     Replace {
         messages: &'a [Message],
+        workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         mode: AgentMode,
+        capability_mode: CapabilityMode,
     },
     ReplaceTail {
         from: usize,
         messages: &'a [Message],
+        workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         mode: AgentMode,
+        capability_mode: CapabilityMode,
     },
 }
 
@@ -304,25 +344,37 @@ enum StoredSessionEventRef<'a> {
 enum StoredSessionEvent {
     Append {
         messages: Vec<Message>,
+        #[serde(default)]
+        workspace: Option<Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         #[serde(default)]
         mode: AgentMode,
+        #[serde(default)]
+        capability_mode: CapabilityMode,
     },
     Replace {
         messages: Vec<Message>,
+        #[serde(default)]
+        workspace: Option<Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         #[serde(default)]
         mode: AgentMode,
+        #[serde(default)]
+        capability_mode: CapabilityMode,
     },
     ReplaceTail {
         from: usize,
         messages: Vec<Message>,
+        #[serde(default)]
+        workspace: Option<Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         #[serde(default)]
         mode: AgentMode,
+        #[serde(default)]
+        capability_mode: CapabilityMode,
     },
 }
 
@@ -333,12 +385,14 @@ struct ParsedLog {
     ends_with_newline: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LogCursor {
     message_count: usize,
+    workspace: Option<Workspace>,
     last_usage: Option<TokenUsage>,
     cumulative_usage: TokenUsage,
     mode: AgentMode,
+    capability_mode: CapabilityMode,
     valid_len: usize,
     file_len: usize,
     ends_with_newline: bool,
@@ -346,23 +400,35 @@ struct LogCursor {
 
 impl LogCursor {
     fn from_parsed(parsed: &ParsedLog) -> Self {
-        let (message_count, last_usage, cumulative_usage, mode) = parsed
-            .snapshot
-            .as_ref()
-            .map(|snapshot| {
-                (
-                    snapshot.messages.len(),
-                    snapshot.last_usage,
-                    snapshot.cumulative_usage,
-                    snapshot.mode,
-                )
-            })
-            .unwrap_or((0, None, TokenUsage::default(), AgentMode::default()));
+        let (message_count, workspace, last_usage, cumulative_usage, mode, capability_mode) =
+            parsed
+                .snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    (
+                        snapshot.messages.len(),
+                        snapshot.workspace.clone(),
+                        snapshot.last_usage,
+                        snapshot.cumulative_usage,
+                        snapshot.mode,
+                        snapshot.capability_mode,
+                    )
+                })
+                .unwrap_or((
+                    0,
+                    None,
+                    None,
+                    TokenUsage::default(),
+                    AgentMode::default(),
+                    CapabilityMode::default(),
+                ));
         Self {
             message_count,
+            workspace,
             last_usage,
             cumulative_usage,
             mode,
+            capability_mode,
             valid_len: parsed.valid_len,
             file_len: parsed.file_len,
             ends_with_newline: parsed.ends_with_newline,
@@ -393,20 +459,31 @@ impl SessionStorage for DiskSessionStorage {
             .await
             .map_err(|source| io_error(self.root.clone(), source))?;
         let parsed = read_log(&path, &session.id).await?;
+        if let Some(previous) = parsed.snapshot.as_ref() {
+            validate_workspace_binding(
+                &session.id,
+                previous.workspace.as_ref(),
+                session.workspace.as_ref(),
+            )?;
+        }
         let event = match parsed.snapshot.as_ref() {
             Some(previous) if session.messages.starts_with(&previous.messages) => {
                 StoredSessionEventRef::Append {
                     messages: &session.messages[previous.messages.len()..],
+                    workspace: session.workspace.as_ref(),
                     last_usage: session.last_usage,
                     cumulative_usage: session.cumulative_usage,
                     mode: session.mode,
+                    capability_mode: session.capability_mode,
                 }
             }
             _ => StoredSessionEventRef::Replace {
                 messages: &session.messages,
+                workspace: session.workspace.as_ref(),
                 last_usage: session.last_usage,
                 cumulative_usage: session.cumulative_usage,
                 mode: session.mode,
+                capability_mode: session.capability_mode,
             },
         };
         let prior_message_count = parsed
@@ -454,7 +531,7 @@ impl SessionStorage for DiskSessionStorage {
             Err(source) if source.kind() == ErrorKind::NotFound => 0,
             Err(source) => return Err(io_error(path.clone(), source)),
         };
-        let cached = self.cursors.lock().await.get(&session.id).copied();
+        let cached = self.cursors.lock().await.get(&session.id).cloned();
         let cursor = match cached {
             Some(cursor)
                 if cursor.file_len == actual_file_len
@@ -477,11 +554,18 @@ impl SessionStorage for DiskSessionStorage {
                 cursor
             }
         };
+        validate_workspace_binding(
+            &session.id,
+            cursor.workspace.as_ref(),
+            session.workspace.as_ref(),
+        )?;
 
         if previous_message_count == session.messages.len()
+            && cursor.workspace == session.workspace
             && cursor.last_usage == session.last_usage
             && cursor.cumulative_usage == session.cumulative_usage
             && cursor.mode == session.mode
+            && cursor.capability_mode == session.capability_mode
             && cursor.valid_len == cursor.file_len
         {
             return Ok(());
@@ -495,9 +579,11 @@ impl SessionStorage for DiskSessionStorage {
         };
         let event = StoredSessionEventRef::Append {
             messages: &session.messages[previous_message_count..],
+            workspace: session.workspace.as_ref(),
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
             mode: session.mode,
+            capability_mode: session.capability_mode,
         };
         let cursor = append_record(
             &path,
@@ -539,7 +625,7 @@ impl SessionStorage for DiskSessionStorage {
             Err(source) if source.kind() == ErrorKind::NotFound => 0,
             Err(source) => return Err(io_error(path.clone(), source)),
         };
-        let cached = self.cursors.lock().await.get(&session.id).copied();
+        let cached = self.cursors.lock().await.get(&session.id).cloned();
         let cursor = match cached {
             Some(cursor) if cursor.file_len == actual_file_len => cursor,
             _ => {
@@ -547,6 +633,11 @@ impl SessionStorage for DiskSessionStorage {
                 LogCursor::from_parsed(&parsed)
             }
         };
+        validate_workspace_binding(
+            &session.id,
+            cursor.workspace.as_ref(),
+            session.workspace.as_ref(),
+        )?;
         if unchanged_message_count > cursor.message_count {
             return Err(StorageError::InvalidTranscript {
                 session_id: session.id.clone(),
@@ -566,9 +657,11 @@ impl SessionStorage for DiskSessionStorage {
         let event = StoredSessionEventRef::ReplaceTail {
             from: unchanged_message_count,
             messages: &session.messages[unchanged_message_count..],
+            workspace: session.workspace.as_ref(),
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
             mode: session.mode,
+            capability_mode: session.capability_mode,
         };
         let cursor = append_record(
             &path,
@@ -608,32 +701,55 @@ async fn append_record(
     prior_message_count: usize,
     inject_post_write_sync_failure: bool,
 ) -> Result<LogCursor, StorageError> {
-    let (message_count, last_usage, cumulative_usage, mode) = match &event {
-        StoredSessionEventRef::Append {
-            messages,
-            last_usage,
-            cumulative_usage,
-            mode,
-        } => (
-            prior_message_count + messages.len(),
-            *last_usage,
-            *cumulative_usage,
-            *mode,
-        ),
-        StoredSessionEventRef::Replace {
-            messages,
-            last_usage,
-            cumulative_usage,
-            mode,
-        } => (messages.len(), *last_usage, *cumulative_usage, *mode),
-        StoredSessionEventRef::ReplaceTail {
-            from,
-            messages,
-            last_usage,
-            cumulative_usage,
-            mode,
-        } => (from + messages.len(), *last_usage, *cumulative_usage, *mode),
-    };
+    let (message_count, workspace, last_usage, cumulative_usage, mode, capability_mode) =
+        match &event {
+            StoredSessionEventRef::Append {
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                mode,
+                capability_mode,
+            } => (
+                prior_message_count + messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *mode,
+                *capability_mode,
+            ),
+            StoredSessionEventRef::Replace {
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                mode,
+                capability_mode,
+            } => (
+                messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *mode,
+                *capability_mode,
+            ),
+            StoredSessionEventRef::ReplaceTail {
+                from,
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                mode,
+                capability_mode,
+            } => (
+                from + messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *mode,
+                *capability_mode,
+            ),
+        };
     let mut bytes = serde_json::to_vec(&StoredSessionRecordRef {
         format_version: DISK_FORMAT_VERSION,
         session_id,
@@ -690,9 +806,11 @@ async fn append_record(
     let file_len = parsed.valid_len + separator_len + bytes.len();
     Ok(LogCursor {
         message_count,
+        workspace,
         last_usage,
         cumulative_usage,
         mode,
+        capability_mode,
         valid_len: file_len,
         file_len,
         ends_with_newline: true,
@@ -802,50 +920,69 @@ fn apply_record(
     match event {
         StoredSessionEvent::Append {
             messages,
+            workspace,
             last_usage,
             cumulative_usage,
             mode,
+            capability_mode,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
+                workspace: None,
                 messages: Vec::new(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 mode: AgentMode::default(),
+                capability_mode: CapabilityMode::default(),
             });
+            if workspace.is_some() {
+                session.workspace = workspace;
+            }
             session.messages.extend(messages);
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
             session.mode = mode;
+            session.capability_mode = capability_mode;
         }
         StoredSessionEvent::Replace {
             messages,
+            workspace,
             last_usage,
             cumulative_usage,
             mode,
+            capability_mode,
         } => {
             *snapshot = Some(SessionSnapshot {
                 id: session_id.to_owned(),
+                workspace,
                 messages,
                 last_usage,
                 cumulative_usage,
                 mode,
+                capability_mode,
             });
         }
         StoredSessionEvent::ReplaceTail {
             from,
             messages,
+            workspace,
             last_usage,
             cumulative_usage,
             mode,
+            capability_mode,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
+                workspace: None,
                 messages: Vec::new(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 mode: AgentMode::default(),
+                capability_mode: CapabilityMode::default(),
             });
+            if workspace.is_some() {
+                session.workspace = workspace;
+            }
             if from > session.messages.len() {
                 return Err(StorageError::InvalidTranscript {
                     session_id: session_id.to_owned(),
@@ -860,6 +997,7 @@ fn apply_record(
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
             session.mode = mode;
+            session.capability_mode = capability_mode;
         }
     }
     Ok(())
@@ -879,6 +1017,24 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), StorageError> 
     Ok(())
 }
 
+pub(crate) fn validate_workspace_binding(
+    session_id: &str,
+    stored: Option<&Workspace>,
+    requested: Option<&Workspace>,
+) -> Result<(), StorageError> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    if requested == Some(stored) {
+        return Ok(());
+    }
+    Err(StorageError::WorkspaceMismatch {
+        session_id: session_id.to_owned(),
+        stored: stored.root().to_owned(),
+        requested: requested.map(|workspace| workspace.root().to_owned()),
+    })
+}
+
 fn io_error(path: PathBuf, source: std::io::Error) -> StorageError {
     StorageError::Io { path, source }
 }
@@ -893,6 +1049,7 @@ mod tests {
     fn snapshot() -> SessionSnapshot {
         SessionSnapshot {
             id: "session/with spaces".to_owned(),
+            workspace: Some(Workspace::new("/workspace/project")),
             messages: vec![Message::user_parts([
                 ContentPart::text("hello"),
                 ContentPart::image(ImageUrl::from_bytes("image/png", &[1, 2, 3])),
@@ -900,6 +1057,7 @@ mod tests {
             last_usage: Some(TokenUsage::new(10, 2, 1)),
             cumulative_usage: TokenUsage::new(20, 5, 2),
             mode: AgentMode::Plan,
+            capability_mode: CapabilityMode::WorkspaceEdit,
         }
     }
 
@@ -928,6 +1086,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot.mode, AgentMode::Default);
+        assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
+        assert_eq!(snapshot.workspace, None);
+    }
+
+    #[tokio::test]
+    async fn session_workspace_can_be_added_but_not_rebound() {
+        let storage = InMemorySessionStorage::new();
+        let mut session = SessionSnapshot::new("workspace-bound", Vec::new()).unwrap();
+        storage.save(&session).await.unwrap();
+
+        session.workspace = Some(Workspace::new("/workspace/one"));
+        storage.save(&session).await.unwrap();
+        session.workspace = Some(Workspace::new("/workspace/two"));
+
+        assert!(matches!(
+            storage.save(&session).await,
+            Err(StorageError::WorkspaceMismatch {
+                ref session_id,
+                ..
+            }) if session_id == "workspace-bound"
+        ));
     }
 
     #[tokio::test]
@@ -953,6 +1132,8 @@ mod tests {
 
         let snapshot = storage.load("legacy-disk").await.unwrap().unwrap();
         assert_eq!(snapshot.mode, AgentMode::Default);
+        assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
+        assert_eq!(snapshot.workspace, None);
     }
 
     #[tokio::test]
@@ -1027,6 +1208,7 @@ mod tests {
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(repaired));
 
         let mut replaced = SessionSnapshot::new(&session.id, vec![Message::user("reset")]).unwrap();
+        replaced.workspace = session.workspace.clone();
         replaced.cumulative_usage = TokenUsage::new(1, 1, 0);
         storage.save(&replaced).await.unwrap();
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(replaced));

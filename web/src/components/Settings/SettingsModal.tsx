@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getProvider, listProviders, putProvider } from '../../api/http.ts';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
 import type { TranslationKey } from '../../i18n/translations.ts';
 import type {
+  CapabilityMode,
   ProviderKind,
   PublicProviderConfig,
   PutProviderRequest,
@@ -29,9 +30,13 @@ const EFFORTS: ReasoningEffort[] = [
 interface SettingsModalProps {
   authKey: string;
   profileId: string;
+  agentProfileId: string;
+  capabilityMode: CapabilityMode | null;
   onClose: () => void;
   onSaveAuthKey: (key: string) => void;
   onSaveProfileId: (id: string) => void;
+  onSaveAgentProfileId: (id: string) => void;
+  onSaveCapabilityMode: (mode: CapabilityMode | null) => void;
   onConfigured: () => void;
 }
 
@@ -49,6 +54,8 @@ interface ProfileFormState {
   requestTimeoutSecs: string;
   streamIdleTimeoutSecs: string;
 }
+
+type BuildResult = PutProviderRequest | { errorKey: TranslationKey };
 
 const emptyForm = (profileId: string): ProfileFormState => ({
   profileId,
@@ -68,12 +75,11 @@ const emptyForm = (profileId: string): ProfileFormState => ({
 function fromConfig(
   profileId: string,
   config: PublicProviderConfig,
-  keepApiKey: string,
 ): ProfileFormState {
   return {
     profileId,
     provider: config.provider,
-    apiKey: keepApiKey,
+    apiKey: '',
     baseUrl: config.base_url,
     model: config.model,
     maxOutputTokens: config.max_output_tokens?.toString() ?? '',
@@ -86,19 +92,25 @@ function fromConfig(
   };
 }
 
-/** Validation result: either a valid body or a translation key for the error. */
-type BuildResult = PutProviderRequest | { errorKey: TranslationKey };
-
 export function SettingsModal({
   authKey,
   profileId,
+  agentProfileId,
+  capabilityMode,
   onClose,
   onSaveAuthKey,
   onSaveProfileId,
+  onSaveAgentProfileId,
+  onSaveCapabilityMode,
   onConfigured,
 }: SettingsModalProps) {
   const { t } = useI18n();
   const [localAuthKey, setLocalAuthKey] = useState(authKey);
+  const [localAgentProfileId, setLocalAgentProfileId] =
+    useState(agentProfileId);
+  const [localCapabilityMode, setLocalCapabilityMode] = useState<
+    CapabilityMode | ''
+  >(capabilityMode ?? '');
   const [form, setForm] = useState<ProfileFormState>(() =>
     emptyForm(profileId),
   );
@@ -106,103 +118,144 @@ export function SettingsModal({
     profileId,
   ]);
   const [configured, setConfigured] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const loadRevision = useRef(0);
 
-  const loadProfile = async (key: string, id: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const list = await listProfilesSafe(key);
-      setAvailableProfiles(list);
-      if (!list.includes(id) && list.length > 0) {
-        const fallback = list[0];
-        if (fallback === undefined) return;
-        setForm((prev) => ({ ...prev, profileId: fallback }));
-        const response = await getProvider(key, fallback);
-        applyProviderResponse(response, fallback);
-        return;
+  const applyResponse = useCallback(
+    (
+      response: {
+        configured: boolean;
+        provider: PublicProviderConfig | null;
+      },
+      id: string,
+    ) => {
+      setConfigured(response.configured);
+      setForm(
+        response.configured && response.provider
+          ? fromConfig(id, response.provider)
+          : emptyForm(id),
+      );
+      setDirty(false);
+    },
+    [],
+  );
+
+  const loadProfile = useCallback(
+    async (key: string, requestedId: string) => {
+      const revision = ++loadRevision.current;
+      setLoading(true);
+      setError(null);
+      setSaved(false);
+      try {
+        const listed = await listProviders(key);
+        if (revision !== loadRevision.current) return;
+        const ids = listed.providers.map((profile) => profile.profile_id);
+        setAvailableProfiles(ids.length > 0 ? ids : ['default']);
+
+        const response = await getProvider(key, requestedId);
+        if (revision !== loadRevision.current) return;
+        applyResponse(response, requestedId);
+      } catch (loadError) {
+        if (revision !== loadRevision.current) return;
+        setConfigured(false);
+        setForm((current) => ({
+          ...emptyForm(requestedId),
+          apiKey: current.apiKey,
+        }));
+        setDirty(false);
+        setError(
+          loadError instanceof Error ? loadError.message : String(loadError),
+        );
+      } finally {
+        if (revision === loadRevision.current) setLoading(false);
       }
-      const response = await getProvider(key, id);
-      applyProviderResponse(response, id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    [applyResponse],
+  );
 
-  const applyProviderResponse = (
-    response: { configured: boolean; provider: PublicProviderConfig | null },
-    id: string,
-  ) => {
-    setConfigured(response.configured);
-    const provider = response.provider;
-    if (response.configured && provider) {
-      setForm((prev) => fromConfig(id, provider, prev.apiKey));
-    } else {
-      setForm((prev) => ({ ...emptyForm(id), apiKey: prev.apiKey }));
-    }
-  };
-
-  // Reload the profile list + selected config whenever the auth key or profile
-  // id changes. `loadProfile` is a component-local closure and is intentionally
-  // excluded to avoid refetching on every render.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: loadProfile is covered by [authKey, profileId]
   useEffect(() => {
-    if (!authKey) {
-      setForm(emptyForm(profileId));
-      return;
-    }
-    void loadProfile(authKey, profileId);
-  }, [authKey, profileId]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
 
-  const handleField = <K extends keyof ProfileFormState>(
+  useEffect(() => {
+    if (authKey.trim()) void loadProfile(authKey, profileId);
+  }, [authKey, profileId, loadProfile]);
+
+  const updateField = <K extends keyof ProfileFormState>(
     key: K,
     value: ProfileFormState[K],
   ) => {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((current) => ({ ...current, [key]: value }));
+    setDirty(true);
+    if (key === 'profileId') setConfigured(false);
     setSaved(false);
   };
 
-  const handleSelectProfile = async (id: string) => {
-    handleField('profileId', id);
-    if (authKey) {
-      await loadProfile(authKey, id);
+  const handleLoad = async () => {
+    const key = localAuthKey.trim();
+    if (!key) {
+      setError(t('settings.errors.authKeyRequired'));
+      return;
     }
+    const id = form.profileId.trim() || 'default';
+    await loadProfile(key, id);
   };
 
   const buildBody = (): BuildResult => {
     const apiKey = form.apiKey.trim();
-    if (!apiKey && !configured) {
-      return { errorKey: 'settings.errors.apiKeyRequired' };
-    }
+    if (!apiKey) return { errorKey: 'settings.errors.apiKeyRequiredOnWrite' };
     const baseUrl = form.baseUrl.trim();
     if (!baseUrl) return { errorKey: 'settings.errors.baseUrlRequired' };
     const model = form.model.trim();
     if (!model) return { errorKey: 'settings.errors.modelRequired' };
-    const maxContext = Number.parseInt(form.maxContextTokens, 10);
-    if (!Number.isFinite(maxContext) || maxContext <= 0) {
+    const maxContext = positiveInteger(form.maxContextTokens);
+    if (maxContext === null) {
       return { errorKey: 'settings.errors.maxContext' };
     }
-    const maxOutput = form.maxOutputTokens.trim();
-    const temperature = form.temperature.trim();
+
+    const maxRetries = nonNegativeInteger(form.maxRetries);
+    const requestTimeout = positiveInteger(form.requestTimeoutSecs);
+    const streamTimeout = positiveInteger(form.streamIdleTimeoutSecs);
+    if (
+      maxRetries === null ||
+      requestTimeout === null ||
+      streamTimeout === null
+    ) {
+      return { errorKey: 'settings.errors.advancedNumbers' };
+    }
+
     const body: PutProviderRequest = {
       provider: form.provider,
       api_key: apiKey,
       base_url: baseUrl,
       model,
       max_context_tokens: maxContext,
-      max_retries: Number.parseInt(form.maxRetries || '10', 10) || 10,
-      request_timeout_secs:
-        Number.parseInt(form.requestTimeoutSecs || '30', 10) || 30,
-      stream_idle_timeout_secs:
-        Number.parseInt(form.streamIdleTimeoutSecs || '120', 10) || 120,
+      max_retries: maxRetries,
+      request_timeout_secs: requestTimeout,
+      stream_idle_timeout_secs: streamTimeout,
     };
-    if (maxOutput) body.max_output_tokens = Number.parseInt(maxOutput, 10);
-    if (temperature) body.temperature = Number.parseFloat(temperature);
+    if (form.maxOutputTokens.trim()) {
+      const maxOutput = positiveInteger(form.maxOutputTokens);
+      if (maxOutput === null) {
+        return { errorKey: 'settings.errors.maxOutput' };
+      }
+      body.max_output_tokens = maxOutput;
+    }
+    if (form.temperature.trim()) {
+      const temperature = Number.parseFloat(form.temperature);
+      if (!Number.isFinite(temperature)) {
+        return { errorKey: 'settings.errors.temperature' };
+      }
+      body.temperature = temperature;
+    }
     if (form.reasoningEffort) body.reasoning_effort = form.reasoningEffort;
     return body;
   };
@@ -210,32 +263,57 @@ export function SettingsModal({
   const handleSave = async () => {
     setError(null);
     setSaved(false);
-
-    const built = buildBody();
-    if ('errorKey' in built) {
-      setError(t(built.errorKey));
-      return;
-    }
-    const savedAuthKey = localAuthKey.trim();
-    if (!savedAuthKey) {
+    const key = localAuthKey.trim();
+    if (!key) {
       setError(t('settings.errors.authKeyRequired'));
       return;
     }
-    const savedProfileId = form.profileId.trim() || 'default';
+    const id = form.profileId.trim() || 'default';
+
+    if (configured && !dirty) {
+      setSaving(true);
+      try {
+        const response = await getProvider(key, id);
+        if (!response.configured || response.provider === null) {
+          setConfigured(false);
+          setError(t('settings.errors.profileNotConfigured'));
+          return;
+        }
+        onSaveAuthKey(key);
+        onSaveProfileId(id);
+        onSaveAgentProfileId(localAgentProfileId);
+        onSaveCapabilityMode(localCapabilityMode || null);
+        onConfigured();
+      } catch (saveError) {
+        setError(
+          saveError instanceof Error ? saveError.message : String(saveError),
+        );
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
+    const body = buildBody();
+    if ('errorKey' in body) {
+      setError(t(body.errorKey));
+      return;
+    }
+
     setSaving(true);
     try {
-      const response = await putProvider(savedAuthKey, savedProfileId, built);
-      onSaveAuthKey(savedAuthKey);
-      onSaveProfileId(savedProfileId);
-      onConfigured();
-      setConfigured(response.configured);
-      const provider = response.provider;
-      if (response.configured && provider) {
-        setForm((prev) => fromConfig(savedProfileId, provider, prev.apiKey));
-      }
+      const response = await putProvider(key, id, body);
+      applyResponse(response, id);
+      onSaveAuthKey(key);
+      onSaveProfileId(id);
+      onSaveAgentProfileId(localAgentProfileId);
+      onSaveCapabilityMode(localCapabilityMode || null);
       setSaved(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      onConfigured();
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error ? saveError.message : String(saveError),
+      );
     } finally {
       setSaving(false);
     }
@@ -249,17 +327,20 @@ export function SettingsModal({
         aria-label={t('settings.closeLabel')}
         onClick={onClose}
       />
-      <div
+      <section
         className={styles.modal}
         role="dialog"
         aria-modal="true"
-        aria-label={t('settings.title')}
+        aria-labelledby="settings-title"
       >
         <header className={styles.header}>
-          <h2 className={styles.title}>{t('settings.title')}</h2>
+          <div>
+            <p>{t('settings.eyebrow')}</p>
+            <h2 id="settings-title">{t('settings.title')}</h2>
+          </div>
           <button
             type="button"
-            className={styles.closeBtn}
+            className={styles.closeButton}
             onClick={onClose}
             aria-label={t('settings.closeLabel')}
           >
@@ -268,70 +349,73 @@ export function SettingsModal({
         </header>
 
         <div className={styles.body}>
-          <section className={styles.section}>
-            <h3 className={styles.sectionTitle}>
-              {t('settings.daemonConnection')}
-            </h3>
-            <label className={styles.field}>
-              <span className={styles.label}>{t('settings.authKey')}</span>
-              <input
-                type="password"
-                className={styles.input}
-                value={localAuthKey}
-                placeholder={t('settings.authKeyPlaceholder')}
-                onChange={(event) => setLocalAuthKey(event.target.value)}
-              />
-              <span className={styles.hint}>{t('settings.authKeyHint')}</span>
-            </label>
+          <section className={styles.connectionCard}>
+            <div className={styles.sectionHeading}>
+              <div>
+                <h3>{t('settings.daemonConnection')}</h3>
+                <p>{t('settings.connectionCopy')}</p>
+              </div>
+              <span
+                className={`${styles.status} ${
+                  configured ? styles.statusReady : styles.statusIdle
+                }`}
+              >
+                {configured
+                  ? t('settings.configured')
+                  : t('settings.notConfigured')}
+              </span>
+            </div>
+            <div className={styles.inlineFields}>
+              <label className={styles.field}>
+                <span>{t('settings.authKey')}</span>
+                <input
+                  type="password"
+                  value={localAuthKey}
+                  placeholder={t('settings.authKeyPlaceholder')}
+                  onChange={(event) => setLocalAuthKey(event.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className={styles.secondaryButton}
+                onClick={() => void handleLoad()}
+                disabled={loading || !localAuthKey.trim()}
+              >
+                {loading ? t('settings.loading') : t('settings.load')}
+              </button>
+            </div>
           </section>
 
           <section className={styles.section}>
-            <h3 className={styles.sectionTitle}>
-              {t('settings.providerProfile')}
-            </h3>
-
-            <div className={styles.row}>
-              <label className={styles.field}>
-                <span className={styles.label}>{t('settings.profileId')}</span>
-                <select
-                  className={styles.input}
-                  value={form.profileId}
-                  onChange={(event) =>
-                    void handleSelectProfile(event.target.value)
-                  }
-                >
-                  {availableProfiles.map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                  {!availableProfiles.includes(form.profileId) && (
-                    <option value={form.profileId}>{form.profileId}</option>
-                  )}
-                </select>
-              </label>
-              <div className={styles.field}>
-                <span className={styles.label}>{t('settings.status')}</span>
-                <span
-                  className={`${styles.statusPill} ${configured ? styles.statusOk : styles.statusOff}`}
-                >
-                  {configured
-                    ? t('settings.configured')
-                    : t('settings.notConfigured')}
-                </span>
+            <div className={styles.sectionHeading}>
+              <div>
+                <h3>{t('settings.providerProfile')}</h3>
+                <p>{t('settings.providerCopy')}</p>
               </div>
             </div>
 
-            <div className={styles.row}>
+            <div className={styles.twoColumns}>
               <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.providerAdapter')}
-                </span>
+                <span>{t('settings.profileId')}</span>
+                <input
+                  list="phi-profile-options"
+                  value={form.profileId}
+                  onChange={(event) =>
+                    updateField('profileId', event.target.value)
+                  }
+                />
+                <datalist id="phi-profile-options">
+                  {availableProfiles.map((id) => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+              </label>
+              <label className={styles.field}>
+                <span>{t('settings.providerAdapter')}</span>
                 <select
-                  className={styles.input}
                   value={form.provider}
                   onChange={(event) =>
-                    handleField('provider', event.target.value as ProviderKind)
+                    updateField('provider', event.target.value as ProviderKind)
                   }
                 >
                   {PROVIDERS.map((provider) => (
@@ -341,170 +425,177 @@ export function SettingsModal({
                   ))}
                 </select>
               </label>
+            </div>
+
+            <div className={styles.twoColumns}>
               <label className={styles.field}>
-                <span className={styles.label}>{t('settings.model')}</span>
+                <span>{t('settings.model')}</span>
                 <input
-                  className={styles.input}
                   value={form.model}
                   placeholder="model-name"
-                  onChange={(event) => handleField('model', event.target.value)}
+                  onChange={(event) => updateField('model', event.target.value)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span>{t('settings.apiKey')}</span>
+                <input
+                  type="password"
+                  value={form.apiKey}
+                  placeholder={
+                    configured
+                      ? t('settings.apiKeyRequiredToUpdate')
+                      : t('settings.apiKeyPlaceholder')
+                  }
+                  onChange={(event) =>
+                    updateField('apiKey', event.target.value)
+                  }
                 />
               </label>
             </div>
 
             <label className={styles.field}>
-              <span className={styles.label}>{t('settings.apiKey')}</span>
+              <span>{t('settings.baseUrl')}</span>
               <input
-                type="password"
-                className={styles.input}
-                value={form.apiKey}
-                placeholder={
-                  configured
-                    ? t('settings.apiKeyPlaceholderConfigured')
-                    : t('settings.apiKeyPlaceholder')
-                }
-                onChange={(event) => handleField('apiKey', event.target.value)}
-              />
-            </label>
-
-            <label className={styles.field}>
-              <span className={styles.label}>{t('settings.baseUrl')}</span>
-              <input
-                className={styles.input}
                 value={form.baseUrl}
                 placeholder="https://api.example.com/v1"
-                onChange={(event) => handleField('baseUrl', event.target.value)}
+                onChange={(event) => updateField('baseUrl', event.target.value)}
               />
             </label>
+          </section>
 
-            <div className={styles.row}>
-              <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.maxContextTokens')}
-                </span>
-                <input
-                  className={styles.input}
-                  type="number"
-                  value={form.maxContextTokens}
-                  onChange={(event) =>
-                    handleField('maxContextTokens', event.target.value)
-                  }
-                />
-              </label>
-              <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.maxOutputTokens')}
-                </span>
-                <input
-                  className={styles.input}
-                  type="number"
-                  value={form.maxOutputTokens}
-                  onChange={(event) =>
-                    handleField('maxOutputTokens', event.target.value)
-                  }
-                />
-              </label>
+          <section className={styles.section}>
+            <div className={styles.sectionHeading}>
+              <div>
+                <h3>{t('settings.sessionDefaults')}</h3>
+                <p>{t('settings.sessionDefaultsCopy')}</p>
+              </div>
             </div>
-
-            <div className={styles.row}>
+            <div className={styles.twoColumns}>
               <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.temperature')}
-                </span>
+                <span>{t('settings.agentProfileId')}</span>
                 <input
-                  className={styles.input}
-                  type="number"
-                  step="0.1"
-                  value={form.temperature}
+                  value={localAgentProfileId}
+                  placeholder={t('settings.agentProfileIdPlaceholder')}
                   onChange={(event) =>
-                    handleField('temperature', event.target.value)
+                    setLocalAgentProfileId(event.target.value)
                   }
                 />
               </label>
               <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.reasoningEffort')}
-                </span>
+                <span>{t('settings.capabilityMode')}</span>
                 <select
-                  className={styles.input}
-                  value={form.reasoningEffort}
+                  value={localCapabilityMode}
                   onChange={(event) =>
-                    handleField(
-                      'reasoningEffort',
-                      event.target.value as ReasoningEffort | '',
+                    setLocalCapabilityMode(
+                      event.target.value as CapabilityMode | '',
                     )
                   }
                 >
-                  <option value="">{t('settings.effortNone')}</option>
-                  {EFFORTS.map((effort) => (
-                    <option key={effort} value={effort}>
-                      {effort}
-                    </option>
-                  ))}
+                  <option value="">
+                    {t('settings.capabilityProfileDefault')}
+                  </option>
+                  <option value="read_only">
+                    {t('chat.capability.readOnly')}
+                  </option>
+                  <option value="workspace_edit">
+                    {t('chat.capability.workspaceEdit')}
+                  </option>
+                  <option value="full_access">
+                    {t('chat.capability.fullAccess')}
+                  </option>
                 </select>
-              </label>
-            </div>
-
-            <div className={styles.row}>
-              <label className={styles.field}>
-                <span className={styles.label}>{t('settings.maxRetries')}</span>
-                <input
-                  className={styles.input}
-                  type="number"
-                  value={form.maxRetries}
-                  onChange={(event) =>
-                    handleField('maxRetries', event.target.value)
-                  }
-                />
-              </label>
-              <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.requestTimeoutSecs')}
-                </span>
-                <input
-                  className={styles.input}
-                  type="number"
-                  value={form.requestTimeoutSecs}
-                  onChange={(event) =>
-                    handleField('requestTimeoutSecs', event.target.value)
-                  }
-                />
-              </label>
-              <label className={styles.field}>
-                <span className={styles.label}>
-                  {t('settings.streamIdleTimeoutSecs')}
-                </span>
-                <input
-                  className={styles.input}
-                  type="number"
-                  value={form.streamIdleTimeoutSecs}
-                  onChange={(event) =>
-                    handleField('streamIdleTimeoutSecs', event.target.value)
-                  }
-                />
               </label>
             </div>
           </section>
 
-          {error && <div className={styles.error}>{error}</div>}
+          <details className={styles.advanced}>
+            <summary>{t('settings.advanced')}</summary>
+            <div className={styles.advancedBody}>
+              <div className={styles.threeColumns}>
+                <NumberField
+                  label={t('settings.maxContextTokens')}
+                  value={form.maxContextTokens}
+                  onChange={(value) => updateField('maxContextTokens', value)}
+                />
+                <NumberField
+                  label={t('settings.maxOutputTokens')}
+                  value={form.maxOutputTokens}
+                  onChange={(value) => updateField('maxOutputTokens', value)}
+                />
+                <NumberField
+                  label={t('settings.temperature')}
+                  value={form.temperature}
+                  step="0.1"
+                  onChange={(value) => updateField('temperature', value)}
+                />
+              </div>
+              <div className={styles.threeColumns}>
+                <label className={styles.field}>
+                  <span>{t('settings.reasoningEffort')}</span>
+                  <select
+                    value={form.reasoningEffort}
+                    onChange={(event) =>
+                      updateField(
+                        'reasoningEffort',
+                        event.target.value as ReasoningEffort | '',
+                      )
+                    }
+                  >
+                    <option value="">{t('settings.effortNone')}</option>
+                    {EFFORTS.map((effort) => (
+                      <option key={effort} value={effort}>
+                        {effort}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <NumberField
+                  label={t('settings.maxRetries')}
+                  value={form.maxRetries}
+                  onChange={(value) => updateField('maxRetries', value)}
+                />
+                <NumberField
+                  label={t('settings.requestTimeoutSecs')}
+                  value={form.requestTimeoutSecs}
+                  onChange={(value) => updateField('requestTimeoutSecs', value)}
+                />
+              </div>
+              <NumberField
+                label={t('settings.streamIdleTimeoutSecs')}
+                value={form.streamIdleTimeoutSecs}
+                onChange={(value) =>
+                  updateField('streamIdleTimeoutSecs', value)
+                }
+              />
+            </div>
+          </details>
+
+          {configured && dirty && !form.apiKey.trim() && (
+            <div className={styles.warning}>
+              {t('settings.apiKeyUpdateWarning')}
+            </div>
+          )}
+          {error && (
+            <div className={styles.error} role="alert">
+              {error}
+            </div>
+          )}
           {saved && <div className={styles.success}>{t('settings.saved')}</div>}
         </div>
 
         <footer className={styles.footer}>
-          <span className={styles.footerHint}>
-            {loading ? t('settings.loading') : t('settings.footerHint')}
-          </span>
-          <div className={styles.footerActions}>
+          <p>{t('settings.footerHint')}</p>
+          <div>
             <button
               type="button"
-              className={styles.cancelBtn}
+              className={styles.secondaryButton}
               onClick={onClose}
             >
               {t('settings.close')}
             </button>
             <button
               type="button"
-              className={styles.saveBtn}
+              className={styles.primaryButton}
               onClick={() => void handleSave()}
               disabled={saving || !localAuthKey.trim()}
             >
@@ -512,17 +603,41 @@ export function SettingsModal({
             </button>
           </div>
         </footer>
-      </div>
+      </section>
     </div>
   );
 }
 
-async function listProfilesSafe(authKey: string): Promise<string[]> {
-  try {
-    const response = await listProviders(authKey);
-    const ids = response.providers.map((provider) => provider.profile_id);
-    return ids.length > 0 ? ids : ['default'];
-  } catch {
-    return ['default'];
-  }
+function NumberField({
+  label,
+  value,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  step?: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className={styles.field}>
+      <span>{label}</span>
+      <input
+        type="number"
+        step={step}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </label>
+  );
+}
+
+function positiveInteger(value: string): number | null {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function nonNegativeInteger(value: string): number | null {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }

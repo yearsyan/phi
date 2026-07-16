@@ -1,6 +1,9 @@
 import type {
+  AgentProfileResponse,
+  AgentProfilesResponse,
   ProviderResponse,
   ProvidersResponse,
+  PutAgentProfileRequest,
   PutProviderRequest,
   SessionSummary,
   SessionsResponse,
@@ -76,6 +79,37 @@ export function putProvider(
 ): Promise<ProviderResponse> {
   return http<ProviderResponse>(
     `/v1/providers/${encodeURIComponent(profileId)}`,
+    authKey,
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
+}
+
+export function listAgentProfiles(
+  authKey: string,
+): Promise<AgentProfilesResponse> {
+  return http<AgentProfilesResponse>('/v1/agent-profiles', authKey, {
+    method: 'GET',
+  });
+}
+
+export function getAgentProfile(
+  authKey: string,
+  agentProfileId: string,
+): Promise<AgentProfileResponse> {
+  return http<AgentProfileResponse>(
+    `/v1/agent-profiles/${encodeURIComponent(agentProfileId)}`,
+    authKey,
+    { method: 'GET' },
+  );
+}
+
+export function putAgentProfile(
+  authKey: string,
+  agentProfileId: string,
+  body: PutAgentProfileRequest,
+): Promise<AgentProfileResponse> {
+  return http<AgentProfileResponse>(
+    `/v1/agent-profiles/${encodeURIComponent(agentProfileId)}`,
     authKey,
     { method: 'PUT', body: JSON.stringify(body) },
   );

@@ -74,14 +74,15 @@
   color: var(--phi-text-strong);
 }
 
-.pre {
-  margin: 0;
+.fallbackPre {
+  margin: 0.6rem 0;
+  overflow-x: auto;
 }
 
 .codeBlock {
   margin: 0.6rem 0;
   border: 1px solid var(--phi-border);
-  border-radius: 8px;
+  border-radius: 6px;
   overflow: hidden;
   background: var(--phi-code-bg);
 }

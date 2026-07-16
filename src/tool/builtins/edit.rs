@@ -11,10 +11,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use super::common::{io_error, mutation_guard, normalize_cwd, resolve_path};
+use super::common::{io_error, mutation_guard, normalize_cwd, resolve_path_for_context};
 use crate::{
     error::ToolError,
-    tool::{Tool, ToolEffect, ToolOutput},
+    tool::{Tool, ToolEffect, ToolExecutionContext, ToolOutput},
     types::ToolDefinition,
 };
 
@@ -257,8 +257,26 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(arguments, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(arguments, Some(&context)).await
+    }
+}
+
+impl EditTool {
+    async fn execute_inner(
+        &self,
+        arguments: Value,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, ToolError> {
         let arguments = EditArguments::parse(arguments)?;
-        let path = resolve_path(&self.cwd, &arguments.path)?;
+        let path = resolve_path_for_context(&self.cwd, &arguments.path, context).await?;
         let _guard = mutation_guard(&path).await;
         let raw_content = match read_edit_file(&path, self.max_file_size).await {
             Ok(content) => content,

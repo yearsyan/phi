@@ -8,11 +8,14 @@
 mod runtime;
 
 pub use runtime::{
-    ActiveSubagentRun, CloseSubagentResult, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES,
-    DEFAULT_MAX_SUBAGENTS, DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY,
-    QueuedSubagentMessage, SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest,
-    SubagentConfig, SubagentError, SubagentEvent, SubagentEventKind, SubagentFactory,
-    SubagentFactoryError, SubagentNotification, SubagentNotificationKind,
-    SubagentNotificationSource, SubagentRunOutcome, SubagentRuntime, SubagentSnapshot,
-    SubagentState,
+    ActiveSubagentRun, BuiltSubagent, CloseSubagentResult, ConfiguredSpawnAgentRequest,
+    ConfiguredSubagentBuildRequest, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES, DEFAULT_MAX_SUBAGENTS,
+    DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY, EffectiveSubagentConfig,
+    MAX_SUBAGENT_OUTPUT_FIELD_BYTES, MAX_SUBAGENT_OUTPUT_FIELDS, QueuedSubagentMessage,
+    SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest, SubagentConfig, SubagentError,
+    SubagentEvent, SubagentEventKind, SubagentFactory, SubagentFactoryError, SubagentIsolation,
+    SubagentNotification, SubagentNotificationKind, SubagentNotificationSource,
+    SubagentOutputContract, SubagentResource, SubagentResourceDisposition,
+    SubagentResourceFinalization, SubagentResourceInfo, SubagentRunOutcome, SubagentRuntime,
+    SubagentSnapshot, SubagentState, SubagentType, ValidatedSubagentOutput,
 };

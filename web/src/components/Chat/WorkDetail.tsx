@@ -1,6 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
-import type { TranslationKey } from '../../i18n/translations.ts';
 import type {
   RunActivity,
   Step,
@@ -10,208 +9,203 @@ import { ChevronIcon, TerminalIcon } from '../common/Icons.tsx';
 import styles from './WorkDetail.module.css';
 
 interface WorkDetailProps {
-  steps: Step[];
-  collapsed: boolean;
-  /** Live run status — used to render the header summary while running. */
-  runStatus: RunActivity['status'] | null;
-  turnNumber: number | null;
-  errorMessage: string | null;
+  run: RunActivity;
 }
 
-/**
- * Renders the per-turn "work detail" block: tool calls, retries, compaction
- * and subagent notices. Expanded while the turn is running; collapsed to a
- * single summary line once the turn ends. The user can always re-expand.
- */
-export function WorkDetail({
-  steps,
-  collapsed,
-  runStatus,
-  turnNumber,
-  errorMessage,
-}: WorkDetailProps) {
+export function WorkDetail({ run }: WorkDetailProps) {
   const { t } = useI18n();
-  // The daemon drives `collapsed` (turn finished → collapse). The user can
-  // override it locally afterwards.
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  // Reset the user override whenever the daemon changes the collapse state.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: collapsed is the trigger; body only resets state
-  useEffect(() => {
-    setUserOpen(null);
-  }, [collapsed]);
+  const live = run.status === 'running' || run.status === 'queued';
+  const [open, setOpen] = useState(live);
+  const steps = useMemo(
+    () =>
+      run.turns.flatMap((turn) =>
+        turn.steps.map((step) => ({ turn: turn.turn, step })),
+      ),
+    [run.turns],
+  );
 
-  const open = userOpen ?? !collapsed;
-  const summary = buildSummary(steps, runStatus, t);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new run should reset the local disclosure state
+  useEffect(() => {
+    setOpen(live);
+  }, [live, run.runId]);
+
+  const toolCount = steps.filter(({ step }) => step.kind === 'tool').length;
+  const summary = live
+    ? toolCount > 0
+      ? t('chat.activity.runningTools', { count: toolCount })
+      : t('chat.activity.thinking')
+    : run.status === 'failed'
+      ? t('chat.activity.failed')
+      : run.status === 'stopped'
+        ? t('chat.activity.stopped')
+        : t('chat.activity.completed', { count: toolCount });
 
   return (
-    <div className={styles.wrap}>
+    <section
+      className={`${styles.activity} ${live ? styles.activityLive : ''}`}
+    >
       <button
         type="button"
         className={styles.header}
-        onClick={() => setUserOpen(!open)}
+        onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
       >
+        <span
+          className={`${styles.runDot} ${styles[`run_${run.status}`] ?? ''}`}
+        />
+        <TerminalIcon />
+        <span className={styles.summary}>{summary}</span>
+        <span className={styles.runId}>{run.runId.slice(-6)}</span>
         <ChevronIcon
           className={`${styles.chevron} ${open ? styles.chevronOpen : ''}`}
         />
-        <TerminalIcon className={styles.icon} />
-        <span className={styles.summary}>{summary}</span>
-        {turnNumber !== null && (
-          <span className={styles.badge}>
-            {t('chat.workDetail.turn')} {turnNumber}
-          </span>
-        )}
-        {errorMessage && (
-          <span className={styles.errorFlag}>
-            {t('chat.workDetail.failedFlag')}
-          </span>
-        )}
       </button>
-      {open && steps.length > 0 && (
-        <div className={styles.body}>
-          {steps.map((step, index) => (
-            <StepRow key={stepKey(step, index)} step={step} />
-          ))}
+
+      {open && (
+        <div className={styles.timeline}>
+          {steps.length === 0 ? (
+            <div className={styles.waiting}>
+              <span className={styles.waitingLine} />
+              {t('chat.activity.waiting')}
+            </div>
+          ) : (
+            steps.map(({ turn, step }, index) => (
+              <StepRow
+                key={stepKey(step, turn, index)}
+                step={step}
+                turn={turn}
+              />
+            ))
+          )}
+          {run.errorMessage && (
+            <div className={`${styles.event} ${styles.eventError}`}>
+              <span className={styles.eventRail} />
+              <div>
+                <div className={styles.eventLabel}>
+                  {t('chat.activity.error')}
+                </div>
+                <div className={styles.eventText}>{run.errorMessage}</div>
+              </div>
+            </div>
+          )}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
-type TFunc = (
-  key: TranslationKey,
-  params?: Record<string, string | number>,
-) => string;
-
-function stepKey(step: Step, index: number): string {
-  if (step.kind === 'tool') return `tool-${step.key}`;
-  if (step.kind === 'subagent')
-    return `subagent-${index}-${step.agentId}-${step.message}`;
-  if (step.kind === 'retry') return `retry-${index}-${step.retryNumber}`;
-  if (step.kind === 'compaction') return `compaction-${index}-${step.phase}`;
-  return `notice-${index}-${step.message}`;
-}
-
-function toolWord(count: number, t: TFunc): string {
-  return count === 1 ? t('chat.workDetail.tool') : t('chat.workDetail.tools');
-}
-
-function buildSummary(
-  steps: Step[],
-  runStatus: RunActivity['status'] | null,
-  t: TFunc,
-): string {
-  const toolCount = steps.filter((step) => step.kind === 'tool').length;
-  const running = steps.some(
-    (step) => step.kind === 'tool' && step.status === 'running',
-  );
-  if (runStatus === 'running' || runStatus === 'queued') {
-    if (running) {
-      return toolCount > 0
-        ? `${t('chat.workDetail.working')} · ${toolCount} ${toolWord(toolCount, t)}…`
-        : `${t('chat.workDetail.working')}…`;
-    }
-    return toolCount > 0
-      ? `${t('chat.workDetail.running')} ${toolCount} ${toolWord(toolCount, t)}…`
-      : t('chat.workDetail.thinking');
-  }
-  if (runStatus === 'stopped') {
-    return toolCount > 0
-      ? `${t('chat.workDetail.stopped')} · ${toolCount} ${toolWord(toolCount, t)} ${t('chat.workDetail.beforeStop')}`
-      : t('chat.workDetail.stopped');
-  }
-  if (runStatus === 'failed') {
-    return toolCount > 0
-      ? `${t('chat.workDetail.failed')} · ${t('chat.workDetail.after')} ${toolCount} ${toolWord(toolCount, t)}`
-      : t('chat.workDetail.failed');
-  }
-  if (toolCount === 0) return t('chat.workDetail.completed');
-  return `${t('chat.workDetail.ran')} ${toolCount} ${toolWord(toolCount, t)}`;
-}
-
-function StepRow({ step }: { step: Step }) {
+function StepRow({ step, turn }: { step: Step; turn: number }) {
   const { t } = useI18n();
-  switch (step.kind) {
-    case 'tool':
-      return <ToolRow step={step} />;
-    case 'retry':
-      return (
-        <div className={`${styles.step} ${styles.notice}`}>
-          <span className={styles.stepLabel}>
-            {t('chat.workDetail.failed')}
-          </span>
-          <span className={styles.stepText}>
-            #{step.retryNumber}/{step.maxRetries} — {step.reason}
-          </span>
-        </div>
-      );
-    case 'compaction':
-      return (
-        <div className={`${styles.step} ${styles.notice}`}>
-          <span className={styles.stepLabel}>{t('chat.toolResult')}</span>
-          <span className={styles.stepText}>{step.message ?? step.phase}</span>
-        </div>
-      );
-    case 'subagent':
-      return (
-        <div className={`${styles.step} ${styles.notice}`}>
-          <span className={styles.stepLabel}>{t('chat.tool')}</span>
-          <span className={styles.stepText}>
-            {step.message}
-            {step.detail ? (
-              <span className={styles.stepDetail}> · {step.detail}</span>
-            ) : null}
-          </span>
-        </div>
-      );
-    case 'notice':
-      return (
-        <div className={`${styles.step} ${styles.notice}`}>
-          <span className={styles.stepLabel}>{step.level}</span>
-          <span className={styles.stepText}>{step.message}</span>
-        </div>
-      );
-    default:
-      return null;
-  }
-}
+  if (step.kind === 'tool') return <ToolRow step={step} turn={turn} />;
 
-function ToolRow({ step }: { step: ToolStep }) {
-  const [expanded, setExpanded] = useState(false);
-  const hasOutput = step.content !== null && step.content.length > 0;
-  const truncatedArgs = truncate(JSON.stringify(step.call.arguments));
+  const label =
+    step.kind === 'retry'
+      ? t('chat.activity.retry')
+      : step.kind === 'compaction'
+        ? t('chat.activity.compaction')
+        : step.kind === 'subagent'
+          ? t('chat.activity.subagent')
+          : step.level;
+  const text =
+    step.kind === 'retry'
+      ? `#${step.retryNumber}/${step.maxRetries} · ${step.reason}`
+      : step.kind === 'compaction'
+        ? (step.message ?? step.phase)
+        : step.kind === 'subagent'
+          ? `${step.message}${step.detail ? ` · ${step.detail}` : ''}`
+          : step.message;
+
   return (
-    <div className={`${styles.step} ${styles.tool}`}>
-      <button
-        type="button"
-        className={styles.toolHead}
-        onClick={() => hasOutput && setExpanded(!expanded)}
-      >
-        <span
-          className={`${styles.statusDot} ${
-            step.status === 'running'
-              ? styles.statusRunning
-              : step.isError
-                ? styles.statusError
-                : styles.statusOk
-          }`}
-        />
-        <span className={styles.toolName}>{step.call.name}</span>
-        <span className={styles.toolArgs}>{truncatedArgs}</span>
-        {step.progress.length > 0 && step.status === 'running' && (
-          <span className={styles.progressLast}>
-            {step.progress[step.progress.length - 1]}
-          </span>
-        )}
-      </button>
-      {expanded && hasOutput && (
-        <pre className={styles.output}>{step.content}</pre>
-      )}
+    <div
+      className={`${styles.event} ${
+        step.kind === 'compaction' && step.phase === 'failed'
+          ? styles.eventError
+          : ''
+      }`}
+    >
+      <span className={styles.eventRail} />
+      <div className={styles.eventBody}>
+        <div className={styles.eventTop}>
+          <span className={styles.eventLabel}>{label}</span>
+          <span className={styles.turnLabel}>T{turn}</span>
+        </div>
+        <div className={styles.eventText}>{text}</div>
+      </div>
     </div>
   );
 }
 
-function truncate(value: string, max = 120): string {
-  const compact = value.replace(/\s+/g, ' ').trim();
-  return compact.length > max ? `${compact.slice(0, max)}…` : compact;
+function ToolRow({ step, turn }: { step: ToolStep; turn: number }) {
+  const { t } = useI18n();
+  const output = step.content?.trim() ?? '';
+  const args = formatArguments(step.call.arguments);
+  const progress = step.progress[step.progress.length - 1];
+
+  return (
+    <div className={styles.event}>
+      <span className={styles.eventRail} />
+      <div className={styles.eventBody}>
+        <div className={styles.eventTop}>
+          <span
+            className={`${styles.toolState} ${
+              step.status === 'running'
+                ? styles.toolRunning
+                : step.isError
+                  ? styles.toolError
+                  : styles.toolDone
+            }`}
+          />
+          <span className={styles.toolName}>{step.call.name}</span>
+          <span className={styles.turnLabel}>T{turn}</span>
+        </div>
+        <div className={styles.toolSummary}>
+          {progress ??
+            (step.status === 'running'
+              ? t('chat.activity.toolRunning')
+              : step.isError
+                ? t('chat.activity.toolFailed')
+                : t('chat.activity.toolDone'))}
+        </div>
+        {(args || output) && (
+          <details className={styles.details}>
+            <summary>{t('chat.activity.details')}</summary>
+            {args && (
+              <div className={styles.detailBlock}>
+                <span>{t('chat.activity.arguments')}</span>
+                <pre>{args}</pre>
+              </div>
+            )}
+            {output && (
+              <div className={styles.detailBlock}>
+                <span>{t('chat.activity.output')}</span>
+                <pre>{output}</pre>
+              </div>
+            )}
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function stepKey(step: Step, turn: number, index: number): string {
+  if (step.kind === 'tool') return `${turn}-${step.key}`;
+  if (step.kind === 'retry')
+    return `${turn}-retry-${step.retryNumber}-${index}`;
+  if (step.kind === 'subagent') {
+    return `${turn}-subagent-${step.agentId}-${index}`;
+  }
+  if (step.kind === 'compaction') {
+    return `${turn}-compact-${step.phase}-${index}`;
+  }
+  return `${turn}-notice-${index}`;
+}
+
+function formatArguments(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }

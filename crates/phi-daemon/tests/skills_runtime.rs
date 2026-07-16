@@ -4,13 +4,13 @@ use async_trait::async_trait;
 use futures_util::stream;
 use phi::{
     Agent, Content, InMemoryPlanStore, InMemorySessionStorage, LlmProvider, ProviderEventStream,
-    ProviderRequest, SkillCatalog, SkillInvocation, SkillsConfig,
+    ProviderRequest, SkillCatalog, SkillInvocation, SkillsConfig, Workspace,
 };
 use phi_daemon::{
     api::AppState,
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandle, AgentRegistry, BuiltAgent,
-        SessionId,
+        SessionId, compile_agent_profile, default_agent_profile,
     },
     serve,
     service::ApplicationService,
@@ -32,12 +32,21 @@ struct TestFactory {
 #[async_trait]
 impl AgentFactory for TestFactory {
     async fn build(&self, request: &AgentBuildRequest) -> Result<BuiltAgent, AgentFactoryError> {
+        let mut builder = Agent::builder(NeverProvider).skills(self.skills.clone());
+        if let Some(workspace) = &request.workspace {
+            builder = builder.workspace(workspace.clone());
+        }
         Ok(BuiltAgent {
-            agent: Agent::builder(NeverProvider)
-                .skills(self.skills.clone())
-                .build(),
+            agent: builder.build(),
             skills: self.skills.clone(),
             profile_id: request.profile_id.clone(),
+            agent_profile: request.pinned_agent_profile.clone().unwrap_or_else(|| {
+                compile_agent_profile(
+                    &default_agent_profile(),
+                    request.workspace.as_ref().unwrap_or(&Workspace::new(".")),
+                )
+                .unwrap()
+            }),
             model: request
                 .model
                 .clone()
