@@ -3,8 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use phi::{
-    Agent, Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage, PlanStore,
-    ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
+    Agent, BuiltinTools, Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage,
+    PlanStore, ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
     SubagentConfig, SubagentFactory, SubagentFactoryError, SubagentRuntime, SubagentTools,
 };
 use thiserror::Error;
@@ -162,9 +162,49 @@ impl ApplicationService {
         provider_store: Arc<dyn ProviderStore>,
         skills: SkillsConfig,
     ) -> Self {
-        let factory: Arc<dyn AgentFactory> = Arc::new(
-            ConfiguredAgentFactory::new(Arc::clone(&provider_store)).skills_config(skills),
-        );
+        let factory =
+            ConfiguredAgentFactory::new(Arc::clone(&provider_store)).skills_config(skills);
+        Self::managed_with_configured_factory(
+            registry,
+            store,
+            session_storage,
+            plan_store,
+            provider_store,
+            factory,
+        )
+    }
+
+    pub fn managed_with_plan_store_skills_and_builtin_tools(
+        registry: AgentRegistry,
+        store: Arc<dyn ControlStore>,
+        session_storage: Arc<dyn SessionStorage>,
+        plan_store: Arc<dyn PlanStore>,
+        provider_store: Arc<dyn ProviderStore>,
+        skills: SkillsConfig,
+        builtin_tools: BuiltinTools,
+    ) -> Self {
+        let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
+            .skills_config(skills)
+            .builtin_tools(builtin_tools);
+        Self::managed_with_configured_factory(
+            registry,
+            store,
+            session_storage,
+            plan_store,
+            provider_store,
+            factory,
+        )
+    }
+
+    fn managed_with_configured_factory(
+        registry: AgentRegistry,
+        store: Arc<dyn ControlStore>,
+        session_storage: Arc<dyn SessionStorage>,
+        plan_store: Arc<dyn PlanStore>,
+        provider_store: Arc<dyn ProviderStore>,
+        factory: ConfiguredAgentFactory,
+    ) -> Self {
+        let factory: Arc<dyn AgentFactory> = Arc::new(factory);
         let mut service =
             Self::new_with_plan_store(registry, store, session_storage, plan_store, factory);
         service.provider_store = Some(provider_store);

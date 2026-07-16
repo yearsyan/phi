@@ -1,0 +1,195 @@
+.wrap {
+  margin: 0.35rem 0 0.5rem;
+  border: 1px solid var(--phi-border);
+  border-radius: var(--phi-radius);
+  background: var(--phi-surface);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  background: transparent;
+  border: none;
+  color: var(--phi-text-muted);
+  font-size: 0.78rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.header:hover {
+  background: var(--phi-surface-hover);
+  color: var(--phi-text);
+}
+
+.chevron {
+  transition: transform 0.12s ease;
+  flex-shrink: 0;
+  font-size: 0.85rem;
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+.icon {
+  font-size: 0.85rem;
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
+.summary {
+  flex: 1;
+  font-family: var(--phi-mono);
+}
+
+.badge {
+  font-size: 0.68rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 4px;
+  background: var(--phi-surface-2);
+  color: var(--phi-text-muted);
+}
+
+.errorFlag {
+  font-size: 0.68rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 4px;
+  background: var(--phi-danger-soft);
+  color: var(--phi-danger);
+}
+
+.body {
+  border-top: 1px solid var(--phi-border);
+  padding: 0.3rem 0.5rem 0.4rem;
+  font-family: var(--phi-mono);
+  font-size: 0.74rem;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.2rem 0.15rem;
+  border-radius: 4px;
+}
+
+.step:hover {
+  background: var(--phi-surface-hover);
+}
+
+.stepLabel {
+  flex-shrink: 0;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  color: var(--phi-text-muted);
+  padding-top: 0.1rem;
+  min-width: 3.5rem;
+}
+
+.stepText {
+  color: var(--phi-text);
+  word-break: break-word;
+}
+
+.stepDetail {
+  color: var(--phi-text-muted);
+}
+
+/* Tool rows */
+
+.tool {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.2rem;
+}
+
+.toolHead {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  background: transparent;
+  border: none;
+  color: var(--phi-text);
+  text-align: left;
+  padding: 0.2rem 0.15rem;
+  cursor: pointer;
+  font-family: var(--phi-mono);
+  font-size: 0.74rem;
+}
+
+.statusDot {
+  flex-shrink: 0;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--phi-text-muted);
+}
+
+.statusRunning {
+  background: var(--phi-warning);
+  box-shadow: 0 0 0 0 rgba(210, 153, 34, 0.5);
+  animation: pulse 1.4s infinite;
+}
+
+.statusError {
+  background: var(--phi-danger);
+}
+
+.statusOk {
+  background: var(--phi-success);
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(210, 153, 34, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 4px rgba(210, 153, 34, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(210, 153, 34, 0);
+  }
+}
+
+.toolName {
+  color: var(--phi-accent);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.toolArgs {
+  color: var(--phi-text-muted);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progressLast {
+  color: var(--phi-text-muted);
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+.output {
+  margin: 0 0 0 1.4rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--phi-code-bg);
+  border: 1px solid var(--phi-border);
+  border-radius: 4px;
+  font-family: var(--phi-mono);
+  font-size: 0.72rem;
+  color: var(--phi-code-text);
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

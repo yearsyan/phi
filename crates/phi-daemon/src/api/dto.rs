@@ -73,7 +73,9 @@ impl From<PutProviderRequest> for ProviderConfig {
             api_key: request.api_key,
             base_url: request.base_url,
             model: request.model,
-            system_prompt: request.system_prompt,
+            // Retained in the wire request for compatibility, but the daemon
+            // owns one fixed coding-agent system prompt.
+            system_prompt: None,
             max_output_tokens: request.max_output_tokens,
             max_context_tokens: request.max_context_tokens,
             temperature: request.temperature,
@@ -139,7 +141,7 @@ impl PublicProviderConfig {
             api_key_configured: !config.api_key.is_empty(),
             base_url: config.base_url.clone(),
             model: config.model.clone(),
-            system_prompt: config.system_prompt.clone(),
+            system_prompt: None,
             max_output_tokens: config.max_output_tokens,
             max_context_tokens: config.max_context_tokens,
             temperature: config.temperature,
@@ -1219,6 +1221,26 @@ mod tests {
             "max_context_tokens": null
         }));
         assert!(null.is_err());
+    }
+
+    #[test]
+    fn provider_system_prompt_is_accepted_for_compatibility_but_ignored() {
+        let request: PutProviderRequest = serde_json::from_value(serde_json::json!({
+            "provider": "openai_chat",
+            "api_key": "secret",
+            "base_url": "https://example.test/v1",
+            "model": "test-model",
+            "system_prompt": "custom prompt",
+            "max_context_tokens": 128000
+        }))
+        .unwrap();
+        let config = ProviderConfig::from(request);
+        assert_eq!(config.system_prompt, None);
+
+        let mut legacy = config;
+        legacy.system_prompt = Some("legacy prompt".to_owned());
+        let public = PublicProviderConfig::new(crate::store::DEFAULT_PROFILE_ID, &legacy);
+        assert_eq!(public.system_prompt, None);
     }
 
     #[test]

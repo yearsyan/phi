@@ -1,0 +1,140 @@
+/*
+ * Global design tokens and base styles for the Phi web client.
+ *
+ * Color tokens are scoped under [data-theme="dark"] / [data-theme="light"] on
+ * the root element; every CSS module references the same `--phi-*` custom
+ * properties, so a theme switch is a single attribute change. Component styling
+ * stays in CSS Modules (no Tailwind).
+ */
+
+:root {
+  /* Shared (non-color) tokens. */
+  --phi-mono:
+    "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  --phi-sans:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+
+  --phi-radius: 8px;
+  --phi-radius-lg: 12px;
+
+  /* Color tokens are set per-theme below; default to dark so the page is
+     legible before the pre-paint script runs. */
+  color-scheme: dark;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --phi-bg: #0d1117;
+  --phi-bg-elevated: #11161f;
+  --phi-surface: #161b22;
+  --phi-surface-2: #1c2230;
+  --phi-surface-hover: #222a39;
+  --phi-border: #2a313c;
+  --phi-border-strong: #3a4150;
+
+  --phi-text: #d7dde6;
+  --phi-text-strong: #f1f4f8;
+  --phi-text-muted: #8b94a3;
+
+  --phi-accent: #4f8cff;
+  --phi-accent-hover: #6a9eff;
+  --phi-accent-soft: rgba(79, 140, 255, 0.16);
+
+  --phi-user-bubble: #1c2740;
+
+  --phi-success: #2ea043;
+  --phi-warning: #d29922;
+  --phi-danger: #f85149;
+  --phi-danger-soft: rgba(248, 81, 73, 0.14);
+
+  --phi-code-bg: #0a0e14;
+  --phi-code-text: #c9d1d9;
+
+  --phi-shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.55);
+  --phi-overlay: rgba(0, 0, 0, 0.55);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --phi-bg: #f6f8fa;
+  --phi-bg-elevated: #ffffff;
+  --phi-surface: #ffffff;
+  --phi-surface-2: #eef1f5;
+  --phi-surface-hover: #e4e8ee;
+  --phi-border: #d3d9e0;
+  --phi-border-strong: #b9c1cc;
+
+  --phi-text: #2f363d;
+  --phi-text-strong: #11161c;
+  --phi-text-muted: #5c6571;
+
+  --phi-accent: #2f6fd8;
+  --phi-accent-hover: #2558b8;
+  --phi-accent-soft: rgba(47, 111, 216, 0.1);
+
+  --phi-user-bubble: #e3ecfb;
+
+  --phi-success: #1c7e34;
+  --phi-warning: #9a6700;
+  --phi-danger: #cf222e;
+  --phi-danger-soft: rgba(207, 34, 46, 0.08);
+
+  --phi-code-bg: #f3f5f8;
+  --phi-code-text: #1f242b;
+
+  --phi-shadow-modal: 0 20px 50px rgba(15, 23, 42, 0.18);
+  --phi-overlay: rgba(15, 23, 42, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--phi-bg);
+  color: var(--phi-text);
+  font-family: var(--phi-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease;
+}
+
+button {
+  font-family: inherit;
+}
+
+textarea,
+input,
+select {
+  font-family: inherit;
+  color: inherit;
+}
+
+/* Thin scrollbars to match the dense coding-agent aesthetic. */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--phi-border);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--phi-border-strong);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

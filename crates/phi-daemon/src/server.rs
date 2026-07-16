@@ -1,6 +1,6 @@
 use std::{future::Future, io, net::SocketAddr, sync::Arc};
 
-use phi::{DiskPlanStore, DiskSessionStorage};
+use phi::{BuiltinTools, DiskPlanStore, DiskSessionStorage};
 use thiserror::Error;
 use tokio::{net::TcpListener, signal, sync::oneshot};
 use tracing::{error, info, warn};
@@ -75,13 +75,14 @@ fn application_service(config: &DaemonConfig) -> ApplicationService {
     let plan_store = Arc::new(DiskPlanStore::new(data_dir.join(PLAN_DIRECTORY)));
     let provider_store = Arc::new(DiskProviderStore::new(data_dir.join(PROVIDER_CONFIG_FILE)));
 
-    ApplicationService::managed_with_plan_store_and_skills(
+    ApplicationService::managed_with_plan_store_skills_and_builtin_tools(
         AgentRegistry::new(),
         control_store,
         session_storage,
         plan_store,
         provider_store,
         config.skills_config(),
+        BuiltinTools::all(config.workspace_dir()),
     )
     .with_subagents_enabled(config.subagents_enabled())
 }

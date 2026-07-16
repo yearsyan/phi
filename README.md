@@ -807,10 +807,29 @@ PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
   cargo run -p phi-daemon
 ```
 
+### Web client
+
+`web/` 提供 React/Vite 客户端。开发服务器会把 `/v1` HTTP 与 WebSocket 请求代理到
+默认的 `http://127.0.0.1:8787` daemon：
+
+```bash
+cd web
+pnpm install
+pnpm dev
+```
+
+首次使用需在设置中保存 daemon 长期 key 和 Provider profile。已有本地配置时，页面会
+自动连接一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
+客户端会区分连接、准备、就绪与失败状态，连接或 Agent 准备超过 15 秒会进入可重试的
+错误状态，WebSocket 断开后也会立即禁止继续发送。
+
 完整 Provider/启动配置、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon 自带的 factory
-按 `profile_id` 读取由 HTTP 管理并持久化的 Provider 配置；若需要 MCP 或 workspace
-read/edit/write/bash 等工具，可提供自定义 `AgentFactory`。
+按 `profile_id` 读取由 HTTP 管理并持久化的 Provider 配置，并使用固定的 Phi
+coding-agent system prompt。standalone daemon 默认以 `PHI_DAEMON_WORKSPACE_DIR`
+为根目录安装 `read`、`edit`、`write`、`bash` 及后台 bash task 工具；Web 不允许
+修改 system prompt。daemon key 因而同时具备工作区读写和命令执行权限，应只提供给
+可信客户端。
 
 ## 模块结构
 

@@ -1,0 +1,193 @@
+.card {
+  margin: 0.6rem 0;
+  border: 1px solid var(--phi-border);
+  border-left: 3px solid var(--phi-accent);
+  border-radius: var(--phi-radius);
+  background: var(--phi-surface);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--phi-surface-2);
+  border-bottom: 1px solid var(--phi-border);
+}
+
+.badge {
+  font-family: var(--phi-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  background: var(--phi-accent-soft);
+  color: var(--phi-accent);
+}
+
+.title {
+  font-size: 0.82rem;
+  color: var(--phi-text);
+}
+
+.questions {
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.question {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.questionHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.questionLabel {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--phi-text-strong);
+}
+
+.multiHint {
+  font-family: var(--phi-mono);
+  font-size: 0.62rem;
+  color: var(--phi-text-muted);
+  text-transform: lowercase;
+}
+
+.questionText {
+  font-size: 0.82rem;
+  color: var(--phi-text-muted);
+}
+
+.options {
+  margin-top: 0.2rem;
+}
+
+.optionsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.optionList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.option {
+  display: block;
+  text-align: left;
+  background: var(--phi-bg-elevated);
+  border: 1px solid var(--phi-border);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease;
+}
+
+.option:hover {
+  border-color: var(--phi-border-strong);
+  background: var(--phi-surface-hover);
+}
+
+.optionSelected {
+  border-color: var(--phi-accent);
+  background: var(--phi-accent-soft);
+}
+
+.optionMain {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.optionLabel {
+  font-size: 0.8rem;
+  color: var(--phi-text-strong);
+}
+
+.optionDesc {
+  font-size: 0.72rem;
+  color: var(--phi-text-muted);
+}
+
+.previewWrap {
+  border: 1px solid var(--phi-border);
+  border-radius: 6px;
+  background: var(--phi-code-bg);
+  padding: 0.5rem;
+  min-height: 80px;
+  overflow: auto;
+}
+
+.preview {
+  margin: 0;
+  font-family: var(--phi-mono);
+  font-size: 0.72rem;
+  color: var(--phi-code-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.previewPlaceholder {
+  font-family: var(--phi-mono);
+  font-size: 0.7rem;
+  color: var(--phi-text-muted);
+}
+
+.customInput {
+  margin-top: 0.3rem;
+  background: var(--phi-bg-elevated);
+  border: 1px solid var(--phi-border);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  color: var(--phi-text);
+  font-size: 0.8rem;
+  outline: none;
+}
+
+.customInput:focus {
+  border-color: var(--phi-accent);
+}
+
+.actions {
+  padding: 0.5rem 0.75rem 0.65rem;
+  border-top: 1px solid var(--phi-border);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.submitBtn {
+  background: var(--phi-accent);
+  border: 1px solid var(--phi-accent);
+  color: #fff;
+  border-radius: 6px;
+  padding: 0.35rem 0.85rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.submitBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.submitBtn:hover:not(:disabled) {
+  background: var(--phi-accent-hover);
+  border-color: var(--phi-accent-hover);
+}

@@ -1,0 +1,134 @@
+.root {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--phi-text);
+}
+
+.root :global(p),
+.compact :global(p) {
+  margin: 0.4rem 0;
+}
+
+.root :global(p:first-child),
+.compact :global(p:first-child) {
+  margin-top: 0;
+}
+
+.root :global(p:last-child),
+.compact :global(p:last-child) {
+  margin-bottom: 0;
+}
+
+.root :global(h1),
+.root :global(h2),
+.root :global(h3),
+.root :global(h4) {
+  margin: 1rem 0 0.5rem;
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--phi-text-strong);
+}
+
+.root :global(h1) {
+  font-size: 1.2rem;
+}
+.root :global(h2) {
+  font-size: 1.08rem;
+}
+.root :global(h3) {
+  font-size: 1rem;
+}
+
+.root :global(ul),
+.root :global(ol) {
+  margin: 0.4rem 0;
+  padding-left: 1.25rem;
+}
+
+.root :global(li) {
+  margin: 0.15rem 0;
+}
+
+.root :global(blockquote) {
+  margin: 0.5rem 0;
+  padding: 0.2rem 0.8rem;
+  border-left: 2px solid var(--phi-border);
+  color: var(--phi-text-muted);
+}
+
+.link {
+  color: var(--phi-accent);
+  text-decoration: none;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.inlineCode {
+  font-family: var(--phi-mono);
+  font-size: 0.85em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--phi-surface-2);
+  color: var(--phi-text-strong);
+}
+
+.pre {
+  margin: 0;
+}
+
+.codeBlock {
+  margin: 0.6rem 0;
+  border: 1px solid var(--phi-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--phi-code-bg);
+}
+
+.codeHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.6rem;
+  background: var(--phi-surface-2);
+  border-bottom: 1px solid var(--phi-border);
+  font-size: 0.72rem;
+}
+
+.codeLang {
+  font-family: var(--phi-mono);
+  color: var(--phi-text-muted);
+  text-transform: lowercase;
+}
+
+.copyBtn {
+  background: transparent;
+  border: 1px solid var(--phi-border);
+  color: var(--phi-text-muted);
+  font-family: var(--phi-mono);
+  font-size: 0.7rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.copyBtn:hover {
+  color: var(--phi-text);
+  border-color: var(--phi-text-muted);
+}
+
+.codePre {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  overflow-x: auto;
+  font-family: var(--phi-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--phi-code-text);
+}
+
+.compact {
+  font-size: 0.85rem;
+  color: var(--phi-text-muted);
+}

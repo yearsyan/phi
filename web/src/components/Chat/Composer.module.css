@@ -1,0 +1,95 @@
+.composer {
+  border-top: 1px solid var(--phi-border);
+  background: var(--phi-bg-elevated);
+  padding: 0.7rem 1rem 0.9rem;
+}
+
+.row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  background: var(--phi-surface);
+  border: 1px solid var(--phi-border);
+  border-radius: var(--phi-radius-lg);
+  padding: 0.45rem 0.45rem 0.45rem 0.75rem;
+  transition: border-color 0.12s ease;
+}
+
+.row:focus-within {
+  border-color: var(--phi-accent);
+}
+
+.textarea {
+  flex: 1;
+  resize: none;
+  border: none;
+  background: transparent;
+  color: var(--phi-text);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  outline: none;
+  max-height: 240px;
+  padding: 0.2rem 0;
+}
+
+.textarea::placeholder {
+  color: var(--phi-text-muted);
+}
+
+.textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sendBtn,
+.stopBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  height: 2rem;
+  padding: 0 0.7rem;
+  border-radius: var(--phi-radius);
+  border: 1px solid var(--phi-border);
+  background: var(--phi-surface-2);
+  color: var(--phi-text);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.sendBtn {
+  padding: 0 0.6rem;
+  background: var(--phi-accent);
+  border-color: var(--phi-accent);
+  color: #fff;
+}
+
+.sendBtn:hover:not(:disabled) {
+  background: var(--phi-accent-hover);
+  border-color: var(--phi-accent-hover);
+}
+
+.sendBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sendLabel {
+  font-size: 0.78rem;
+}
+
+@media (max-width: 520px) {
+  .sendLabel {
+    display: none;
+  }
+}
+
+.stopBtn:hover {
+  background: var(--phi-danger-soft);
+  color: var(--phi-danger);
+  border-color: var(--phi-danger);
+}

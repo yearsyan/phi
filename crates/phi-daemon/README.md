@@ -50,6 +50,12 @@ cargo run -p phi-daemon
 默认监听 `127.0.0.1:8787`，默认数据目录是相对于启动工作目录的 `.phi/daemon`。
 启动后通过 `PUT /v1/providers/{profile_id}` 写入一个或多个 Provider profile；配置成功前 session 列表仍可使用，但选择未配置 profile 的 `/v1/ws/new` 会返回 `agent_build_failed`。
 
+standalone daemon 将每个父 Agent 和 child Agent 配置为完整 coding agent，并以
+`PHI_DAEMON_WORKSPACE_DIR` 为工作目录安装 `read`、`edit`、`write`、`bash`、
+`bash_task_output`、`bash_task_stop`。daemon 使用固定的 Phi coding-agent system
+prompt，Provider profile 和 Web 设置都不能替换它。该提示词要求 Agent 先检查仓库约定、
+优先使用专用文件工具、保留无关改动并在完成前运行相关验证。
+
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -59,7 +65,7 @@ cargo run -p phi-daemon
 | `PHI_DAEMON_AUTH_KEY_FILE` | 无，必须设置 | 只包含长期 bearer key 的文件；key 长度为 32–4096 字节，建议文件权限 `0600` |
 | `PHI_DAEMON_SKILLS_ENABLED` | `true` | 是否为 daemon session 启用 skills；library 默认仍为关闭 |
 | `PHI_DAEMON_SUBAGENTS_ENABLED` | `true` | 是否注入父 Agent 的 subagent 工具并开放只读 child observer；library 仍需显式注册工具 |
-| `PHI_DAEMON_WORKSPACE_DIR` | daemon 启动工作目录 | 所有 session 共用的工作目录根路径 |
+| `PHI_DAEMON_WORKSPACE_DIR` | daemon 启动工作目录 | 所有 session 共用的 coding tools 工作目录根路径 |
 | `PHI_DAEMON_GLOBAL_SKILLS_DIRS` | `~/.phy/skills` | 全局 skill 根目录列表，可配置多个 |
 | `PHI_DAEMON_WORKSPACE_SKILLS_DIRS` | `.phy/skills`、`.claude/skills` | 相对工作目录的 skill 根目录列表，可配置多个 |
 | `RUST_LOG` | `phi_daemon=info` | tracing filter |
@@ -69,6 +75,9 @@ cargo run -p phi-daemon
 长期 key 不接受 URL 参数或明文环境变量，只从 `PHI_DAEMON_AUTH_KEY_FILE` 指向的文件加载。HTTP API 要求 `Authorization: Bearer <key>`。WebSocket 不直接携带长期 key：客户端先调用 `POST /v1/auth/token` 换取 60 秒有效、单次使用的临时 token，再通过 `Sec-WebSocket-Protocol` 提交。key 和 token 都不会写入应用日志、URL 或 Debug 输出。
 
 daemon 目前仍不提供 TLS、origin 校验或租户隔离。默认 loopback 监听是有意的；若绑定非本机地址，仍应使用可信前置代理补充 TLS、origin 校验、授权和访问控制。代理不应记录 `Sec-WebSocket-Protocol` 的完整请求值，因为其中包含短期凭证。
+
+长期 daemon key 同时授予工作区文件读写和命令执行能力。不要把 key 交给不可信客户端，
+也不要把配置了 `write`/`bash` 能力的 daemon 暴露到缺少严格访问控制的网络。
 
 ## 持久化与恢复
 
@@ -198,7 +207,6 @@ curl -X PUT http://127.0.0.1:8787/v1/providers/openai-main \
     "api_key": "...",
     "base_url": "https://provider.example/v1",
     "model": "model-name",
-    "system_prompt": "You are a helpful assistant.",
     "max_output_tokens": 4096,
     "max_context_tokens": 128000,
     "temperature": 0.2,
@@ -211,7 +219,10 @@ curl -X PUT http://127.0.0.1:8787/v1/providers/openai-main \
 
 `provider` 支持 `openai_chat`、`openai_responses`、`anthropic`。`provider`、`api_key`、`base_url`、`model` 和 `max_context_tokens` 必填；`max_context_tokens` 必须是正整数，用于上下文占用统计，并作为后续压缩和精简策略的预算上限。默认 `max_retries=10`、`request_timeout_secs=30`、`stream_idle_timeout_secs=120`，其余可选字段可省略或为 `null`。连接响应头超时和 SSE 完整事件间空闲超时都必须大于零。`request_timeout_secs` 命中后请求会直接失败，不会自动重发，以免已经被 Provider 接收的 POST 重复计费。该接口只做本地格式和 Provider URL 校验，不会发送探测请求。daemon factory 为所有 session 构建的 Provider 复用同一个 HTTP client 和连接池。
 
-daemon factory 会为每个新 Agent 显式创建一份 `DefaultContextCompactor`。嵌入 daemon library 的调用方可通过 `ConfiguredAgentFactory::context_compactor` 或 `context_compactor_factory` 替换默认策略。
+旧客户端提交的 `system_prompt` 字段仍会被兼容解析，但 daemon 会忽略该值，公开响应中的
+`system_prompt` 始终为 `null`。系统提示词由 daemon 固定，Web 客户端不提供编辑入口。
+
+daemon factory 会为每个新 Agent 显式创建一份 `DefaultContextCompactor`。嵌入 daemon library 的调用方可通过 `ConfiguredAgentFactory::context_compactor` 或 `context_compactor_factory` 替换默认策略；通过 `ConfiguredAgentFactory::builtin_tools` 可为自定义 service 选择不同的本地工具集合。
 
 旧 `provider.json` 中缺少 `max_context_tokens` 或将其设为 `null` 的 profile 必须先补成正整数，否则新版本会拒绝加载该配置文件。
 

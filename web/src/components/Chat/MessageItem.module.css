@@ -1,0 +1,89 @@
+.userRow {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0.5rem 0;
+}
+
+.userBubble {
+  max-width: 78%;
+  padding: 0.5rem 0.8rem;
+  background: var(--phi-user-bubble);
+  border: 1px solid var(--phi-border);
+  border-radius: var(--phi-radius-lg);
+  border-bottom-right-radius: 4px;
+  color: var(--phi-text-strong);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.optimistic {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.assistantRow {
+  margin: 0.6rem 0;
+}
+
+.roleLabel {
+  font-family: var(--phi-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--phi-text-muted);
+  margin-bottom: 0.25rem;
+}
+
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  height: 1.2rem;
+}
+
+.cursor {
+  width: 0.5rem;
+  height: 1rem;
+  background: var(--phi-accent);
+  display: inline-block;
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.draftTools {
+  margin-top: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.draftTool {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.25rem 0.45rem;
+  background: var(--phi-surface);
+  border: 1px solid var(--phi-border);
+  border-radius: 6px;
+  font-family: var(--phi-mono);
+  font-size: 0.72rem;
+  color: var(--phi-text-muted);
+}
+
+.draftToolName {
+  color: var(--phi-accent);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.draftToolArgs {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
