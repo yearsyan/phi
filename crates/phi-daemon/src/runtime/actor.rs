@@ -11,9 +11,10 @@ use std::{
 use futures_util::FutureExt;
 use phi::{
     Agent, AgentEvent, AgentMode, AgentModeControl, AgentRunControl, AgentRunOutcome,
-    AssistantDelta, Content, ContextUsage, InMemoryPlanStore, Message, PlanStore, ReasoningEffort,
-    Role, SessionStorage, SkillCatalog, SkillDiagnostic, SkillInvocation, SkillMetadata,
-    TokenUsage,
+    AssistantDelta, Content, ContextCompactionRunOutcome, ContextUsage, InMemoryPlanStore, Message,
+    PlanStore, ReasoningEffort, Role, SessionStorage, SkillCatalog, SkillDiagnostic,
+    SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotificationKind,
+    SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage,
 };
 use thiserror::Error;
 use tokio::sync::{
@@ -39,6 +40,7 @@ const EVENT_CAPACITY: usize = 1_024;
 pub enum AgentStatus {
     AwaitingFirstPrompt,
     Idle,
+    Compacting,
     Running,
     Stopping,
     Closing,
@@ -78,7 +80,16 @@ pub struct AgentView {
     pub cumulative_usage: TokenUsage,
     pub pending_asks: Vec<AskUserRequest>,
     pub pending_plan_approvals: Vec<PlanApprovalRequest>,
+    pub subagents: Vec<SubagentSummary>,
     pub last_event_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubagentSummary {
+    pub agent_id: String,
+    pub description: String,
+    pub state: SubagentState,
+    pub last_sequence: u64,
 }
 
 /// Lightweight control-plane projection. It intentionally excludes transcript
@@ -96,6 +107,7 @@ pub struct AgentSummary {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub config_revision: u64,
     pub message_count: usize,
+    pub subagents: Vec<SubagentSummary>,
     pub last_event_sequence: u64,
 }
 
@@ -163,6 +175,10 @@ pub enum RuntimeEventKind {
     ActorCrashed {
         message: String,
     },
+    SubagentsResynced {
+        subagents: Vec<SubagentSummary>,
+    },
+    Subagent(SubagentEvent),
     Agent(AgentEvent),
 }
 
@@ -174,8 +190,11 @@ pub struct AgentHandle {
     state: watch::Receiver<AgentView>,
     hub: Arc<EventHub>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
+    active_compaction: Arc<Mutex<Option<AgentRunControl>>>,
     prompt_slots: Arc<Semaphore>,
+    compaction_slot: Arc<Semaphore>,
     skills: SkillCatalog,
+    subagents: Option<SubagentRuntime>,
 }
 
 impl AgentHandle {
@@ -217,12 +236,35 @@ impl AgentHandle {
 
     pub fn spawn_with_plan_store_and_skills(
         session_id: SessionId,
+        agent: Agent,
+        profile_id: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        plan_store: Arc<dyn PlanStore>,
+        skills: SkillCatalog,
+    ) -> Self {
+        Self::spawn_with_plan_store_skills_and_subagents(
+            session_id,
+            agent,
+            profile_id,
+            model,
+            reasoning_effort,
+            plan_store,
+            skills,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_plan_store_skills_and_subagents(
+        session_id: SessionId,
         mut agent: Agent,
         profile_id: impl Into<String>,
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
         plan_store: Arc<dyn PlanStore>,
         skills: SkillCatalog,
+        subagents: Option<SubagentRuntime>,
     ) -> Self {
         let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
         agent.add_tool(ask_user_tool);
@@ -232,6 +274,10 @@ impl AgentHandle {
             ExitPlanModeTool::channel(session_id, Arc::clone(&plan_store));
         agent.add_tool(exit_plan_mode_tool);
         let mode_control = agent.mode_control();
+        // Subscribe before taking the initial projection so delegation that
+        // races construction is either represented by the snapshot, buffered
+        // as an event, or both (the projection update is idempotent).
+        let subagent_events = subagents.as_ref().map(SubagentRuntime::subscribe);
         let initial = AgentView {
             session_id,
             profile_id: profile_id.into(),
@@ -250,6 +296,13 @@ impl AgentHandle {
             cumulative_usage: agent.cumulative_usage(),
             pending_asks: Vec::new(),
             pending_plan_approvals: Vec::new(),
+            subagents: subagents
+                .as_ref()
+                .map(SubagentRuntime::snapshots)
+                .unwrap_or_default()
+                .iter()
+                .map(subagent_summary)
+                .collect(),
             last_event_sequence: 0,
         };
         let (commands, command_receiver) = mpsc::channel(COMMAND_CAPACITY);
@@ -264,16 +317,24 @@ impl AgentHandle {
             state: state_sender,
         });
         let active_run = Arc::new(Mutex::new(None));
+        let active_compaction = Arc::new(Mutex::new(None));
         let prompt_slots = Arc::new(Semaphore::new(COMMAND_CAPACITY));
+        let compaction_slot = Arc::new(Semaphore::new(1));
 
         let listener_hub = Arc::clone(&hub);
         agent.subscribe(move |event| listener_hub.publish_agent(event));
 
         let actor_hub = Arc::clone(&hub);
         let actor_active_run = Arc::clone(&active_run);
+        let actor_active_compaction = Arc::clone(&active_compaction);
         let supervisor_hub = Arc::clone(&hub);
         let supervisor_active_run = Arc::clone(&active_run);
+        let supervisor_active_compaction = Arc::clone(&active_compaction);
         let supervisor_prompt_slots = Arc::clone(&prompt_slots);
+        let supervisor_compaction_slot = Arc::clone(&compaction_slot);
+        let supervisor_subagents = subagents.clone();
+        let actor_prompt_slots = Arc::clone(&prompt_slots);
+        let actor_subagents = subagents.clone();
         tokio::spawn(async move {
             let outcome = AssertUnwindSafe(run_actor(
                 agent,
@@ -285,6 +346,10 @@ impl AgentHandle {
                     mode_control,
                     hub: actor_hub,
                     active_run: actor_active_run,
+                    active_compaction: actor_active_compaction,
+                    prompt_slots: actor_prompt_slots,
+                    subagents: actor_subagents,
+                    subagent_events,
                 },
             ))
             .catch_unwind()
@@ -292,6 +357,10 @@ impl AgentHandle {
             if let Err(payload) = outcome {
                 let message = panic_message(payload);
                 supervisor_prompt_slots.close();
+                supervisor_compaction_slot.close();
+                if let Some(subagents) = supervisor_subagents {
+                    subagents.shutdown("parent agent actor crashed").await;
+                }
                 supervisor_hub.actor_crashed(message.clone());
                 let active = supervisor_active_run
                     .lock()
@@ -300,6 +369,13 @@ impl AgentHandle {
                 if let Some(active) = active {
                     active.control.stop();
                     supervisor_hub.run_failed(active.id, message.clone(), AgentStatus::Closing);
+                }
+                if let Some(control) = supervisor_active_compaction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    control.stop();
                 }
                 supervisor_hub.fail_all_queued(&message);
                 supervisor_hub.closed();
@@ -313,8 +389,11 @@ impl AgentHandle {
             state,
             hub,
             active_run,
+            active_compaction,
             prompt_slots,
+            compaction_slot,
             skills,
+            subagents,
         }
     }
 
@@ -332,6 +411,10 @@ impl AgentHandle {
 
     pub fn skill_catalog(&self) -> &SkillCatalog {
         &self.skills
+    }
+
+    pub fn subagents(&self) -> Option<&SubagentRuntime> {
+        self.subagents.as_ref()
     }
 
     pub fn prepare_prompt(
@@ -380,6 +463,7 @@ impl AgentHandle {
             reasoning_effort: state.reasoning_effort,
             config_revision: state.config_revision,
             message_count: state.messages.len(),
+            subagents: state.subagents.clone(),
             last_event_sequence: state.last_event_sequence,
         }
     }
@@ -448,6 +532,49 @@ impl AgentHandle {
             .map_err(|_| self.response_error())?
             .map_err(|()| self.stopped_error())?;
         Ok(QueuedRun { run_id, position })
+    }
+
+    /// Admits one explicit context compaction and returns as soon as the actor
+    /// has transitioned to `Compacting`. Completion or failure is reported by
+    /// the corresponding ordered Agent event.
+    pub async fn compact_context(
+        &self,
+        instructions: Option<String>,
+    ) -> Result<(), AgentHandleError> {
+        let status = self.status();
+        if status != AgentStatus::Idle {
+            return Err(AgentHandleError::Busy {
+                session_id: self.session_id,
+                status,
+            });
+        }
+        let compaction_permit = Arc::clone(&self.compaction_slot)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                TryAcquireError::NoPermits => AgentHandleError::Busy {
+                    session_id: self.session_id,
+                    status: AgentStatus::Compacting,
+                },
+                TryAcquireError::Closed => self.stopped_error(),
+            })?;
+        let status = self.status();
+        if status != AgentStatus::Idle {
+            return Err(AgentHandleError::Busy {
+                session_id: self.session_id,
+                status,
+            });
+        }
+
+        let (admission, response) = oneshot::channel();
+        self.commands
+            .send(AgentCommand::CompactContext {
+                instructions,
+                compaction_permit,
+                admission,
+            })
+            .await
+            .map_err(|_| self.stopped_error())?;
+        response.await.map_err(|_| self.response_error())?
     }
 
     pub async fn set_model(&self, model: String) -> Result<(), AgentHandleError> {
@@ -571,6 +698,9 @@ impl AgentHandle {
 
     pub async fn shutdown(&self) -> Result<(), AgentHandleError> {
         if self.status() == AgentStatus::Closed {
+            if let Some(subagents) = &self.subagents {
+                subagents.shutdown("parent agent is shut down").await;
+            }
             return Ok(());
         }
         {
@@ -580,9 +710,22 @@ impl AgentHandle {
             let mut active = self.active_run.lock().expect("active run lock poisoned");
             self.hub.status(AgentStatus::Closing);
             self.prompt_slots.close();
+            self.compaction_slot.close();
             if let Some(active) = active.as_mut() {
                 active.request_stop();
             }
+        }
+        if let Some(control) = self
+            .active_compaction
+            .lock()
+            .expect("active compaction lock poisoned")
+            .as_ref()
+        {
+            control.stop();
+        }
+
+        if let Some(subagents) = &self.subagents {
+            subagents.shutdown("parent agent is shutting down").await;
         }
 
         let (reply, response) = oneshot::channel();
@@ -594,7 +737,11 @@ impl AgentHandle {
     }
 
     fn ensure_configurable(&self) -> Result<(), AgentHandleError> {
-        let status = self.status();
+        let status = if self.compaction_slot.available_permits() == 0 {
+            AgentStatus::Compacting
+        } else {
+            self.status()
+        };
         if matches!(status, AgentStatus::AwaitingFirstPrompt | AgentStatus::Idle) {
             Ok(())
         } else {
@@ -660,6 +807,11 @@ enum AgentCommand {
         queue_permit: OwnedSemaphorePermit,
         admission: Option<oneshot::Sender<Result<usize, ()>>>,
     },
+    CompactContext {
+        instructions: Option<String>,
+        compaction_permit: OwnedSemaphorePermit,
+        admission: oneshot::Sender<Result<(), AgentHandleError>>,
+    },
     SetModel {
         model: String,
         reply: oneshot::Sender<Result<(), String>>,
@@ -695,6 +847,10 @@ struct ActorRuntime {
     mode_control: AgentModeControl,
     hub: Arc<EventHub>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
+    active_compaction: Arc<Mutex<Option<AgentRunControl>>>,
+    prompt_slots: Arc<Semaphore>,
+    subagents: Option<SubagentRuntime>,
+    subagent_events: Option<broadcast::Receiver<SubagentEvent>>,
 }
 
 async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
@@ -706,6 +862,10 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
         mode_control,
         hub,
         active_run,
+        active_compaction,
+        prompt_slots,
+        subagents,
+        mut subagent_events,
     } = runtime;
     let mut backlog = VecDeque::new();
     let mut binding: Option<MetadataBinding> = None;
@@ -715,7 +875,30 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
     loop {
         let command = match backlog.pop_front() {
             Some(command) => Some(command),
-            None => commands.recv().await,
+            None => loop {
+                tokio::select! {
+                    command = commands.recv() => break command,
+                    event = receive_subagent_event(&mut subagent_events) => {
+                        match event {
+                            Ok(event) => handle_subagent_event(
+                                event,
+                                &hub,
+                                &prompt_slots,
+                                &mut backlog,
+                            ),
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                resync_subagents(&hub, subagents.as_ref(), skipped);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                subagent_events = None;
+                            }
+                        }
+                        if let Some(command) = backlog.pop_front() {
+                            break Some(command);
+                        }
+                    }
+                }
+            },
         };
         let Some(mut command) = command else {
             closing = true;
@@ -798,7 +981,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         // so a timed-out request is retired before a queued
                         // decision for the same ID can be considered.
                         biased;
-                        result = &mut run => break result,
                         request = ask_user_requests.recv() => {
                             let Some(request) = request else {
                                 closing = true;
@@ -841,6 +1023,27 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 }
                             }
                         }
+                        // Delegation is published synchronously by the core
+                        // runtime. If it and the parent run become ready in
+                        // the same poll, expose the child before publishing
+                        // the parent's terminal event.
+                        event = receive_subagent_event(&mut subagent_events) => {
+                            match event {
+                                Ok(event) => handle_subagent_event(
+                                    event,
+                                    &hub,
+                                    &prompt_slots,
+                                    &mut backlog,
+                                ),
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    resync_subagents(&hub, subagents.as_ref(), skipped);
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    subagent_events = None;
+                                }
+                            }
+                        }
+                        result = &mut run => break result,
                         command = commands.recv() => {
                             let Some(mut command) = command else {
                                 closing = true;
@@ -867,6 +1070,12 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 }
                                 AgentCommand::SetMode { reply, .. } => {
                                     let _ = reply.send(Err("cannot change mode directly while the agent is running".to_owned()));
+                                }
+                                AgentCommand::CompactContext { admission, .. } => {
+                                    let _ = admission.send(Err(AgentHandleError::Busy {
+                                        session_id: hub.session_id,
+                                        status: hub.current_status(),
+                                    }));
                                 }
                                 AgentCommand::AnswerAskUser {
                                     ask_id,
@@ -980,6 +1189,76 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     break;
                 }
             }
+            AgentCommand::CompactContext {
+                instructions,
+                compaction_permit,
+                admission,
+            } => {
+                if agent.context_compactor_name().is_none() || agent.messages().is_empty() {
+                    let _ = admission.send(Err(AgentHandleError::InvalidCommand {
+                        message: "the session has no context available to compact".to_owned(),
+                    }));
+                    drop(compaction_permit);
+                    continue;
+                }
+
+                let control = AgentRunControl::new();
+                {
+                    // Use the same lifecycle lock as run start/completion and
+                    // shutdown so Closing can never be overwritten by a racing
+                    // compaction admission.
+                    let _lifecycle = active_run.lock().expect("active run lock poisoned");
+                    let status = hub.current_status();
+                    if status != AgentStatus::Idle {
+                        let _ = admission.send(Err(AgentHandleError::Busy {
+                            session_id: hub.session_id,
+                            status,
+                        }));
+                        drop(compaction_permit);
+                        continue;
+                    }
+                    *active_compaction
+                        .lock()
+                        .expect("active compaction lock poisoned") = Some(control.clone());
+                    hub.status(AgentStatus::Compacting);
+                }
+                if admission.send(Ok(())).is_err() {
+                    let _lifecycle = active_run.lock().expect("active run lock poisoned");
+                    active_compaction
+                        .lock()
+                        .expect("active compaction lock poisoned")
+                        .take();
+                    if hub.current_status() != AgentStatus::Closing {
+                        hub.status(AgentStatus::Idle);
+                    }
+                    drop(compaction_permit);
+                    continue;
+                }
+
+                let result = agent
+                    .compact_context_controlled(instructions, control)
+                    .await;
+                {
+                    let _lifecycle = active_run.lock().expect("active run lock poisoned");
+                    active_compaction
+                        .lock()
+                        .expect("active compaction lock poisoned")
+                        .take();
+                    if !closing && hub.current_status() != AgentStatus::Closing {
+                        hub.status(AgentStatus::Idle);
+                    }
+                }
+                match result {
+                    Ok(
+                        ContextCompactionRunOutcome::Completed(_)
+                        | ContextCompactionRunOutcome::Stopped,
+                    ) => {}
+                    Err(error) => {
+                        hub.operation_failed("compact_context", error.to_string());
+                    }
+                }
+                drop(compaction_permit);
+            }
             AgentCommand::SetModel { model, reply } => {
                 let result = apply_model(&mut agent, &hub, &mut binding, model).await;
                 if let Err(error) = &result {
@@ -1044,11 +1323,113 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
         &mut plan_approval_messages,
         "plan approval request was cancelled because the agent is closing",
     );
+    if let Some(subagents) = subagents {
+        subagents.shutdown("parent agent actor stopped").await;
+    }
     drop(agent);
     hub.closed();
     if let Some(reply) = shutdown_reply {
         let _ = reply.send(());
     }
+}
+
+async fn receive_subagent_event(
+    receiver: &mut Option<broadcast::Receiver<SubagentEvent>>,
+) -> Result<SubagentEvent, broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn handle_subagent_event(
+    event: SubagentEvent,
+    hub: &EventHub,
+    prompt_slots: &Arc<Semaphore>,
+    backlog: &mut VecDeque<AgentCommand>,
+) {
+    let wake_content = subagent_wake_content(&event);
+    if matches!(&event.kind, SubagentEventKind::AgentEvent(_)) {
+        hub.observe_subagent_stream(&event);
+    } else {
+        hub.subagent(event);
+    }
+    let Some(content) = wake_content else {
+        return;
+    };
+    if matches!(
+        hub.current_status(),
+        AgentStatus::Closing | AgentStatus::Closed
+    ) {
+        return;
+    }
+    let queue_permit = match Arc::clone(prompt_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            hub.operation_failed(
+                "subagent_notification",
+                format!(
+                    "subagent notification could not wake parent because the prompt queue is full (capacity {COMMAND_CAPACITY})"
+                ),
+            );
+            return;
+        }
+        Err(TryAcquireError::Closed) => return,
+    };
+    let run_id = RunId::new();
+    hub.run_queued(run_id);
+    backlog.push_back(AgentCommand::Prompt {
+        run_id,
+        content,
+        queue_permit,
+        admission: None,
+    });
+}
+
+fn resync_subagents(hub: &EventHub, runtime: Option<&SubagentRuntime>, skipped: u64) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let subagents = runtime
+        .snapshots()
+        .iter()
+        .map(subagent_summary)
+        .collect::<Vec<_>>();
+    hub.subagents_resynced(subagents, skipped);
+}
+
+fn subagent_wake_content(event: &SubagentEvent) -> Option<Content> {
+    if !event.wakes_parent() {
+        return None;
+    }
+    let payload = match &event.kind {
+        SubagentEventKind::Notification(notification) => serde_json::json!({
+            "type": "subagent_notification",
+            "agent_id": event.agent_id,
+            "sequence": event.sequence,
+            "delivery_id": notification.delivery_id,
+            "kind": notification.kind,
+            "source": notification.source,
+            "message": notification.message,
+        }),
+        SubagentEventKind::Closed {
+            delivery_id,
+            reason,
+            ..
+        } => serde_json::json!({
+            "type": "subagent_notification",
+            "agent_id": event.agent_id,
+            "sequence": event.sequence,
+            "delivery_id": delivery_id,
+            "kind": SubagentNotificationKind::Closed,
+            "source": "runtime",
+            "message": reason,
+        }),
+        _ => return None,
+    };
+    Some(Content::text(format!(
+        "<subagent_notification>{payload}</subagent_notification>"
+    )))
 }
 
 fn admit_prompt(command: &mut AgentCommand, hub: &EventHub) -> bool {
@@ -1414,6 +1795,12 @@ fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
         }
         AgentCommand::Initialize { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
+        }
+        AgentCommand::CompactContext { admission, .. } => {
+            let _ = admission.send(Err(AgentHandleError::Busy {
+                session_id: hub.session_id,
+                status: AgentStatus::Closing,
+            }));
         }
         AgentCommand::SetModel { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
@@ -1789,6 +2176,32 @@ impl EventHub {
         });
     }
 
+    fn subagent(&self, event: SubagentEvent) {
+        let projected = event.clone();
+        self.publish(RuntimeEventKind::Subagent(event), |state| {
+            apply_subagent_event(state, &projected);
+        });
+    }
+
+    fn observe_subagent_stream(&self, event: &SubagentEvent) {
+        let _publish = self.publish_lock.lock().expect("event hub lock poisoned");
+        self.state
+            .send_modify(|state| apply_subagent_event(state, event));
+    }
+
+    fn subagents_resynced(&self, subagents: Vec<SubagentSummary>, skipped: u64) {
+        self.publish(
+            RuntimeEventKind::SubagentsResynced {
+                subagents: subagents.clone(),
+            },
+            |state| state.subagents = subagents,
+        );
+        self.operation_failed(
+            "subagent_events",
+            format!("subagent event receiver lagged by {skipped} events; projection resynced"),
+        );
+    }
+
     fn closed(&self) {
         self.publish(
             RuntimeEventKind::StateChanged {
@@ -1804,6 +2217,53 @@ impl EventHub {
             },
         );
     }
+}
+
+fn subagent_summary(snapshot: &SubagentSnapshot) -> SubagentSummary {
+    SubagentSummary {
+        agent_id: snapshot.agent_id.clone(),
+        description: snapshot.description.clone(),
+        state: snapshot.state.clone(),
+        last_sequence: snapshot.last_sequence,
+    }
+}
+
+fn apply_subagent_event(state: &mut AgentView, event: &SubagentEvent) {
+    let existing = state
+        .subagents
+        .iter_mut()
+        .find(|summary| summary.agent_id == event.agent_id);
+    let summary = match existing {
+        Some(summary) => summary,
+        None => {
+            let description = match &event.kind {
+                SubagentEventKind::Spawned { description, .. } => description.clone(),
+                _ => String::new(),
+            };
+            state.subagents.push(SubagentSummary {
+                agent_id: event.agent_id.clone(),
+                description,
+                state: SubagentState::Starting,
+                last_sequence: 0,
+            });
+            state
+                .subagents
+                .last_mut()
+                .expect("a subagent summary was just inserted")
+        }
+    };
+    if let SubagentEventKind::Spawned { description, .. } = &event.kind {
+        summary.description.clone_from(description);
+    }
+    match &event.kind {
+        SubagentEventKind::StateChanged { state } => summary.state = state.clone(),
+        SubagentEventKind::Closed { .. } => summary.state = SubagentState::Closed,
+        _ => {}
+    }
+    summary.last_sequence = event.sequence;
+    state
+        .subagents
+        .sort_unstable_by(|left, right| left.agent_id.cmp(&right.agent_id));
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
@@ -1826,6 +2286,34 @@ fn wire_agent_event(event: &AgentEvent) -> AgentEvent {
         },
         AgentEvent::AgentStopped { .. } => AgentEvent::AgentStopped {
             messages: Vec::new(),
+        },
+        AgentEvent::ContextCompactionCompleted {
+            trigger,
+            compactor,
+            before_message_count,
+            after_message_count,
+            changed_from,
+            replacement,
+            summary,
+            usage,
+            estimated_context_tokens,
+        } => AgentEvent::ContextCompactionCompleted {
+            trigger: trigger.clone(),
+            compactor: compactor.clone(),
+            before_message_count: *before_message_count,
+            after_message_count: *after_message_count,
+            changed_from: *changed_from,
+            replacement: replacement
+                .iter()
+                .cloned()
+                .map(|mut message| {
+                    message.provider_state = None;
+                    message
+                })
+                .collect(),
+            summary: summary.clone(),
+            usage: *usage,
+            estimated_context_tokens: *estimated_context_tokens,
         },
         event => event.clone(),
     }
@@ -1882,11 +2370,31 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
             state.context_usage = *context_usage;
             state.cumulative_usage += *usage;
         }
+        AgentEvent::ContextCompactionCompleted {
+            after_message_count,
+            changed_from,
+            replacement,
+            usage,
+            ..
+        } => {
+            if *changed_from <= state.messages.len() {
+                state.messages.truncate(*changed_from);
+                state.messages.extend_from_slice(replacement);
+                debug_assert_eq!(state.messages.len(), *after_message_count);
+            }
+            state.last_usage = None;
+            state.context_usage = None;
+            if let Some(usage) = usage {
+                state.cumulative_usage += *usage;
+            }
+        }
         AgentEvent::TurnStart { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::ToolExecutionProgress { .. }
         | AgentEvent::ToolExecutionEnd { .. }
         | AgentEvent::ProviderRetry { .. }
+        | AgentEvent::ContextCompactionStarted { .. }
+        | AgentEvent::ContextCompactionFailed { .. }
         | AgentEvent::Error { .. } => {}
     }
 }
@@ -1999,4 +2507,168 @@ pub enum AgentHandleError {
         session_id: SessionId,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phi::{SubagentNotification, SubagentNotificationSource};
+
+    fn test_hub() -> EventHub {
+        let session_id = SessionId::new();
+        let (events, _) = broadcast::channel(16);
+        let (state, _) = watch::channel(AgentView {
+            session_id,
+            profile_id: "test".to_owned(),
+            initialized: true,
+            status: AgentStatus::Idle,
+            active_run_id: None,
+            queued_runs: 0,
+            mode: AgentMode::Default,
+            model: "test-model".to_owned(),
+            reasoning_effort: None,
+            config_revision: 0,
+            messages: Vec::new(),
+            draft: None,
+            last_usage: None,
+            context_usage: None,
+            cumulative_usage: TokenUsage::default(),
+            pending_asks: Vec::new(),
+            pending_plan_approvals: Vec::new(),
+            subagents: Vec::new(),
+            last_event_sequence: 0,
+        });
+        EventHub {
+            session_id,
+            publish_lock: Mutex::new(()),
+            queued_run_ids: Mutex::new(VecDeque::new()),
+            sequence: AtomicU64::new(0),
+            events,
+            state,
+        }
+    }
+
+    fn notification_event(
+        sequence: u64,
+        kind: SubagentNotificationKind,
+        wake_parent: bool,
+    ) -> SubagentEvent {
+        SubagentEvent {
+            sequence,
+            parent_id: "parent".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            kind: SubagentEventKind::Notification(SubagentNotification {
+                delivery_id: format!("delivery-{sequence}"),
+                kind,
+                source: SubagentNotificationSource::Child,
+                message: "status".to_owned(),
+                wake_parent,
+            }),
+        }
+    }
+
+    #[test]
+    fn spawned_subagent_is_published_through_parent_hub() {
+        let hub = test_hub();
+        let mut events = hub.events.subscribe();
+        hub.subagent(SubagentEvent {
+            sequence: 1,
+            parent_id: "parent".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            kind: SubagentEventKind::Spawned {
+                description: "research".to_owned(),
+                initial_delivery_id: "delivery-1".to_owned(),
+            },
+        });
+
+        let published = events.try_recv().expect("spawn event should be broadcast");
+        assert!(matches!(
+            published.kind,
+            RuntimeEventKind::Subagent(SubagentEvent {
+                kind: SubagentEventKind::Spawned { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            hub.state.borrow().subagents,
+            vec![SubagentSummary {
+                agent_id: "agent-1".to_owned(),
+                description: "research".to_owned(),
+                state: SubagentState::Starting,
+                last_sequence: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn progress_is_observable_without_waking_and_result_is_queued() {
+        let hub = test_hub();
+        let mut events = hub.events.subscribe();
+        let prompt_slots = Arc::new(Semaphore::new(2));
+        let mut backlog = VecDeque::new();
+
+        handle_subagent_event(
+            notification_event(1, SubagentNotificationKind::Progress, false),
+            &hub,
+            &prompt_slots,
+            &mut backlog,
+        );
+        assert!(backlog.is_empty());
+        assert_eq!(hub.state.borrow().queued_runs, 0);
+        assert!(matches!(
+            events
+                .try_recv()
+                .expect("progress should be observable")
+                .kind,
+            RuntimeEventKind::Subagent(SubagentEvent {
+                kind: SubagentEventKind::Notification(SubagentNotification {
+                    kind: SubagentNotificationKind::Progress,
+                    ..
+                }),
+                ..
+            })
+        ));
+
+        handle_subagent_event(
+            notification_event(2, SubagentNotificationKind::Result, true),
+            &hub,
+            &prompt_slots,
+            &mut backlog,
+        );
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(hub.state.borrow().queued_runs, 1);
+        let AgentCommand::Prompt { content, .. } = backlog.pop_front().unwrap() else {
+            panic!("result notification must queue an internal prompt");
+        };
+        let content = content.as_text().expect("wake prompt should be text");
+        assert!(content.contains("subagent_notification"));
+        assert!(content.contains("agent-1"));
+        assert!(content.contains("result"));
+    }
+
+    #[test]
+    fn raw_child_stream_is_not_rebroadcast_to_parent() {
+        let hub = test_hub();
+        let mut events = hub.events.subscribe();
+        let prompt_slots = Arc::new(Semaphore::new(1));
+        let mut backlog = VecDeque::new();
+        handle_subagent_event(
+            SubagentEvent {
+                sequence: 7,
+                parent_id: "parent".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                kind: SubagentEventKind::AgentEvent(AgentEvent::AgentStart),
+            },
+            &hub,
+            &prompt_slots,
+            &mut backlog,
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(backlog.is_empty());
+        assert_eq!(hub.state.borrow().subagents[0].last_sequence, 7);
+    }
 }

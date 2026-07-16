@@ -14,6 +14,7 @@ pub const DATA_DIR_ENV: &str = "PHI_DAEMON_DATA_DIR";
 pub const DEFAULT_DATA_DIR: &str = ".phi/daemon";
 pub const AUTH_KEY_FILE_ENV: &str = "PHI_DAEMON_AUTH_KEY_FILE";
 pub const SKILLS_ENABLED_ENV: &str = "PHI_DAEMON_SKILLS_ENABLED";
+pub const SUBAGENTS_ENABLED_ENV: &str = "PHI_DAEMON_SUBAGENTS_ENABLED";
 pub const WORKSPACE_DIR_ENV: &str = "PHI_DAEMON_WORKSPACE_DIR";
 pub const GLOBAL_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_GLOBAL_SKILLS_DIRS";
 pub const WORKSPACE_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_WORKSPACE_SKILLS_DIRS";
@@ -29,6 +30,7 @@ pub struct DaemonConfig {
     data_dir: PathBuf,
     auth_key: String,
     skills_enabled: bool,
+    subagents_enabled: bool,
     workspace_dir: PathBuf,
     global_skill_dirs: Vec<PathBuf>,
     workspace_skill_dirs: Vec<PathBuf>,
@@ -43,6 +45,7 @@ impl DaemonConfig {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             auth_key,
             skills_enabled: true,
+            subagents_enabled: true,
             workspace_dir,
             global_skill_dirs: default_global_skill_dirs(),
             workspace_skill_dirs: DEFAULT_WORKSPACE_SKILLS_DIRS
@@ -59,6 +62,11 @@ impl DaemonConfig {
 
     pub fn with_skills_enabled(mut self, enabled: bool) -> Self {
         self.skills_enabled = enabled;
+        self
+    }
+
+    pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
+        self.subagents_enabled = enabled;
         self
     }
 
@@ -101,6 +109,9 @@ impl DaemonConfig {
         if let Some(value) = optional_environment(SKILLS_ENABLED_ENV)? {
             config.skills_enabled = parse_boolean(SKILLS_ENABLED_ENV, &value)?;
         }
+        if let Some(value) = optional_environment(SUBAGENTS_ENABLED_ENV)? {
+            config.subagents_enabled = parse_boolean(SUBAGENTS_ENABLED_ENV, &value)?;
+        }
         if let Some(value) = optional_environment(WORKSPACE_DIR_ENV)? {
             if value.trim().is_empty() {
                 return Err(ConfigError::InvalidDirectory {
@@ -129,6 +140,10 @@ impl DaemonConfig {
 
     pub fn skills_enabled(&self) -> bool {
         self.skills_enabled
+    }
+
+    pub fn subagents_enabled(&self) -> bool {
+        self.subagents_enabled
     }
 
     pub fn workspace_dir(&self) -> &Path {
@@ -180,6 +195,7 @@ impl fmt::Debug for DaemonConfig {
             .field("bind_address", &self.bind_address)
             .field("data_dir", &self.data_dir)
             .field("skills_enabled", &self.skills_enabled)
+            .field("subagents_enabled", &self.subagents_enabled)
             .field("workspace_dir", &self.workspace_dir)
             .field("global_skill_dirs", &self.global_skill_dirs)
             .field("workspace_skill_dirs", &self.workspace_skill_dirs)
@@ -320,6 +336,7 @@ mod tests {
         assert!(config.bind_address().ip().is_loopback());
         assert_eq!(config.data_dir(), Path::new(DEFAULT_DATA_DIR));
         assert!(config.skills_enabled());
+        assert!(config.subagents_enabled());
         assert!(
             config
                 .global_skill_dirs()
@@ -386,6 +403,7 @@ mod tests {
         assert!(parse_path_list(std::ffi::OsString::new()).is_empty());
         assert!(!parse_boolean(SKILLS_ENABLED_ENV, "off").unwrap());
         assert!(parse_boolean(SKILLS_ENABLED_ENV, "YES").unwrap());
+        assert!(!parse_boolean(SUBAGENTS_ENABLED_ENV, "false").unwrap());
     }
 
     #[test]

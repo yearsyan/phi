@@ -11,10 +11,12 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use phi::{
-    Agent, AgentEvent, AgentMode, AssistantDelta, AssistantMessage, Content, InMemoryPlanStore,
-    InMemorySessionStorage, LlmProvider, Message, PlanStore, ProviderError, ProviderEvent,
-    ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot, SessionStorage,
-    SkillCatalog, StorageError, Tool, ToolCall, ToolDefinition, ToolError, ToolOutput,
+    Agent, AgentEvent, AgentMode, AssistantDelta, AssistantMessage, Content,
+    ContextCompactionError, ContextCompactionPlan, ContextCompactionRequest, ContextCompactor,
+    InMemoryPlanStore, InMemorySessionStorage, LlmProvider, Message, PlanStore, ProviderError,
+    ProviderEvent, ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot,
+    SessionStorage, SkillCatalog, StorageError, TokenUsage, Tool, ToolCall, ToolDefinition,
+    ToolError, ToolOutput,
 };
 use phi_daemon::{
     api::AppState,
@@ -69,6 +71,7 @@ enum ProviderScript {
     PlanBatchExitThenWrite,
     ToolCall,
     PanickingToolCall,
+    Subagent,
 }
 
 #[derive(Clone)]
@@ -399,6 +402,67 @@ impl LlmProvider for ScriptedProvider {
                     usage: None,
                 }))]))
             }
+            ProviderScript::Subagent => {
+                let is_parent = request.tools.iter().any(|tool| tool.name == "spawn_agent");
+                if is_parent {
+                    let tool_names = request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>();
+                    assert!(tool_names.contains(&"send_agent_message"));
+                    assert!(tool_names.contains(&"close_agent"));
+                    let already_spawned = request.messages.iter().any(|message| {
+                        message.role == Role::Tool
+                            && message.tool_call_id.as_deref() == Some("spawn-call-1")
+                    });
+                    if already_spawned {
+                        immediate_stream(call)
+                    } else {
+                        Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                            message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                                "spawn-call-1",
+                                "spawn_agent",
+                                json!({
+                                    "description": "observer test child",
+                                    "prompt": "report status and finish"
+                                }),
+                            )]),
+                            usage: None,
+                        }))]))
+                    }
+                } else {
+                    assert!(
+                        request
+                            .tools
+                            .iter()
+                            .any(|tool| tool.name == "notify_parent")
+                    );
+                    assert!(request.tools.iter().all(|tool| !matches!(
+                        tool.name.as_str(),
+                        "spawn_agent" | "send_agent_message" | "close_agent"
+                    )));
+                    let already_notified = request.messages.iter().any(|message| {
+                        message.role == Role::Tool
+                            && message.tool_call_id.as_deref() == Some("notify-call-1")
+                    });
+                    if already_notified {
+                        immediate_stream(call)
+                    } else {
+                        Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                            message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                                "notify-call-1",
+                                "notify_parent",
+                                json!({
+                                    "kind": "blocker",
+                                    "message": "child needs parent attention"
+                                }),
+                            )]),
+                            usage: None,
+                        }))]))
+                    }
+                }
+            }
             ProviderScript::Immediate
             | ProviderScript::PauseAtAgentEnd { .. }
             | ProviderScript::PanicFirst
@@ -464,6 +528,46 @@ impl Tool for PanickingTool {
 
     async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
         panic!("injected tool panic")
+    }
+}
+
+#[derive(Clone)]
+struct BlockingCompactor {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl ContextCompactor for BlockingCompactor {
+    fn name(&self) -> &'static str {
+        "blocking_test"
+    }
+
+    fn should_compact(&self, request: &ContextCompactionRequest) -> bool {
+        !request.messages.is_empty()
+    }
+
+    fn prompt(&self, request: &ContextCompactionRequest) -> String {
+        format!(
+            "test compaction prompt: {}",
+            request.trigger.instructions().unwrap_or("no instructions")
+        )
+    }
+
+    async fn compact(
+        &self,
+        _provider: &dyn LlmProvider,
+        _request: ContextCompactionRequest,
+        _prompt: String,
+    ) -> Result<ContextCompactionPlan, ContextCompactionError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(ContextCompactionPlan {
+            messages: vec![Message::user("compacted summary")],
+            summary: "compacted summary".to_owned(),
+            usage: Some(TokenUsage::new(6, 2, 0)),
+            estimated_context_tokens: 3,
+        })
     }
 }
 
@@ -533,6 +637,7 @@ struct TestFactory {
     provider_calls: Arc<AtomicUsize>,
     builds: Arc<AtomicUsize>,
     tool: Option<BlockingTool>,
+    context_compactor: Option<Arc<dyn ContextCompactor>>,
 }
 
 impl TestFactory {
@@ -542,11 +647,17 @@ impl TestFactory {
             provider_calls: Arc::new(AtomicUsize::new(0)),
             builds: Arc::new(AtomicUsize::new(0)),
             tool: None,
+            context_compactor: None,
         }
     }
 
     fn with_tool(mut self, tool: BlockingTool) -> Self {
         self.tool = Some(tool);
+        self
+    }
+
+    fn with_context_compactor(mut self, compactor: impl ContextCompactor + 'static) -> Self {
+        self.context_compactor = Some(Arc::new(compactor));
         self
     }
 
@@ -567,6 +678,9 @@ impl AgentFactory for TestFactory {
         .model(model.clone());
         if let Some(tool) = self.tool.clone() {
             builder = builder.tool(tool);
+        }
+        if let Some(compactor) = &self.context_compactor {
+            builder = builder.shared_context_compactor(Arc::clone(compactor));
         }
         if matches!(&self.script, ProviderScript::PanickingToolCall) {
             builder = builder.tool(PanickingTool);
@@ -772,6 +886,26 @@ impl RawWebSocket {
                 _ => {}
             }
         }
+    }
+
+    async fn receive_close(&mut self) -> (u16, String) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (opcode, payload) = self.read_frame().await;
+                match opcode {
+                    0x8 => {
+                        assert!(payload.len() >= 2, "close frame must include a status code");
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        let reason = String::from_utf8(payload[2..].to_vec()).unwrap();
+                        return (code, reason);
+                    }
+                    0x9 => self.write_frame(0xA, &payload).await,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("server did not close the WebSocket")
     }
 
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) {
@@ -1308,6 +1442,181 @@ async fn two_attach_websockets_get_history_and_the_same_live_updates() {
     assert!(service.shutdown().await.is_empty());
 }
 
+#[tokio::test]
+async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_patch() {
+    let compaction_started = Arc::new(Notify::new());
+    let release_compaction = Arc::new(Notify::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let factory = Arc::new(
+        TestFactory::new(ProviderScript::Immediate).with_context_compactor(BlockingCompactor {
+            started: Arc::clone(&compaction_started),
+            release: Arc::clone(&release_compaction),
+        }),
+    );
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::clone(&storage),
+        factory,
+    ));
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let mut runtime_events = handle.subscribe();
+    let initial = handle
+        .enqueue_prompt(Content::text("history to compact"))
+        .await
+        .unwrap();
+    wait_for_run_completed(&mut runtime_events, initial.run_id).await;
+    assert_eq!(handle.snapshot().messages.len(), 2);
+
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let path = format!("/v1/ws/attach/{}", handle.session_id());
+    let mut client_a = RawWebSocket::connect(address, &path).await;
+    let mut client_b = RawWebSocket::connect(address, &path).await;
+    assert_eq!(client_a.receive_json().await["type"], "snapshot");
+    assert_eq!(client_b.receive_json().await["type"], "snapshot");
+
+    client_a
+        .send_json(json!({
+            "type": "compact",
+            "request_id": "compact-now",
+            "instructions": "Preserve deployment decisions"
+        }))
+        .await;
+    let accepted = receive_command_response(&mut client_a, "compact-now").await;
+    assert_eq!(accepted["type"], "command_accepted");
+    assert_eq!(accepted["command"], "compact");
+
+    tokio::time::timeout(Duration::from_secs(2), compaction_started.notified())
+        .await
+        .expect("the admitted compaction did not start");
+    assert_eq!(handle.status(), AgentStatus::Compacting);
+    let (started_a, started_b) = tokio::join!(
+        receive_wire_event(&mut client_a, "context_compaction_started"),
+        receive_wire_event(&mut client_b, "context_compaction_started")
+    );
+    assert_eq!(started_a["sequence"], started_b["sequence"]);
+    assert_eq!(started_a["run_id"], serde_json::Value::Null);
+    assert_eq!(started_a["event"]["trigger"]["type"], "manual");
+    assert_eq!(
+        started_a["event"]["trigger"]["instructions"],
+        "Preserve deployment decisions"
+    );
+    assert_eq!(
+        started_a["event"]["prompt"],
+        "test compaction prompt: Preserve deployment decisions"
+    );
+
+    client_b
+        .send_json(json!({
+            "type": "compact",
+            "request_id": "compact-again"
+        }))
+        .await;
+    let rejected = receive_command_response(&mut client_b, "compact-again").await;
+    assert_eq!(rejected["type"], "command_rejected");
+    assert_eq!(rejected["code"], "session_busy");
+
+    release_compaction.notify_one();
+    let (completed_a, completed_b) = tokio::join!(
+        receive_wire_event(&mut client_a, "context_compaction_completed"),
+        receive_wire_event(&mut client_b, "context_compaction_completed")
+    );
+    assert_eq!(completed_a["sequence"], completed_b["sequence"]);
+    let event = &completed_a["event"];
+    assert_eq!(event["before_message_count"], 2);
+    assert_eq!(event["after_message_count"], 1);
+    assert_eq!(event["changed_from"], 0);
+    assert_eq!(event["replacement"][0]["role"], "user");
+    assert_eq!(
+        event["replacement"][0]["content"]["value"],
+        "compacted summary"
+    );
+    assert_eq!(event["usage"]["total_tokens"], 8);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.status() != AgentStatus::Idle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actor did not return to idle after compaction");
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.messages, [Message::user("compacted summary")]);
+    assert_eq!(snapshot.last_usage, None);
+    assert_eq!(snapshot.context_usage, None);
+    assert_eq!(snapshot.cumulative_usage, TokenUsage::new(6, 2, 0));
+    let persisted = storage
+        .load(&handle.session_id().to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.messages, snapshot.messages);
+    assert_eq!(persisted.cumulative_usage, snapshot.cumulative_usage);
+
+    let mut new_socket = RawWebSocket::connect(address, "/v1/ws/new").await;
+    assert_eq!(new_socket.receive_json().await["type"], "building");
+    assert_eq!(new_socket.receive_json().await["type"], "ready");
+    new_socket
+        .send_json(json!({
+            "type": "compact",
+            "request_id": "compact-new"
+        }))
+        .await;
+    let rejected = receive_command_response(&mut new_socket, "compact-new").await;
+    assert_eq!(rejected["type"], "command_rejected");
+    assert_eq!(rejected["code"], "invalid_command");
+
+    drop(new_socket);
+    drop(client_a);
+    drop(client_b);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn context_compaction_is_rejected_while_a_run_is_active() {
+    let provider_started = Arc::new(Notify::new());
+    let compaction_started = Arc::new(Notify::new());
+    let factory = Arc::new(
+        TestFactory::new(ProviderScript::HangFirst {
+            started: Arc::clone(&provider_started),
+        })
+        .with_context_compactor(BlockingCompactor {
+            started: compaction_started,
+            release: Arc::new(Notify::new()),
+        }),
+    );
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        factory,
+    );
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let mut events = handle.subscribe();
+    let run = handle
+        .enqueue_prompt(Content::text("keep running"))
+        .await
+        .unwrap();
+    provider_started.notified().await;
+    assert_eq!(handle.status(), AgentStatus::Running);
+
+    assert!(matches!(
+        handle.compact_context(None).await,
+        Err(AgentHandleError::Busy {
+            status: AgentStatus::Running,
+            ..
+        })
+    ));
+
+    handle.stop(run.run_id).unwrap();
+    wait_for_run_stopped(&mut events, run.run_id).await;
+    assert!(service.shutdown().await.is_empty());
+}
+
 async fn collect_wire_run(socket: &mut RawWebSocket, run_id: &str) -> Vec<(u64, String)> {
     let mut events = Vec::new();
     loop {
@@ -1346,6 +1655,168 @@ async fn receive_wire_event(socket: &mut RawWebSocket, kind: &str) -> serde_json
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for wire event {kind}"))
+}
+
+async fn receive_command_response(
+    socket: &mut RawWebSocket,
+    request_id: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let message = socket.receive_json().await;
+            if matches!(
+                message["type"].as_str(),
+                Some("command_accepted" | "command_rejected")
+            ) && message["request_id"] == request_id
+            {
+                return message;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for command response {request_id}"))
+}
+
+#[tokio::test]
+async fn subagent_spawn_is_broadcast_and_child_websocket_is_strictly_read_only() {
+    let factory = Arc::new(TestFactory::new(ProviderScript::Subagent));
+    let service = Arc::new(
+        test_service(
+            AgentRegistry::new(),
+            Arc::new(MemoryControlStore::new()),
+            Arc::new(InMemorySessionStorage::new()),
+            Arc::clone(&factory),
+        )
+        .with_subagents_enabled(true),
+    );
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    assert!(handle.subagents().is_some());
+
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let parent_path = format!("/v1/ws/attach/{}", handle.session_id());
+    let mut parent = RawWebSocket::connect(address, &parent_path).await;
+    let initial = parent.receive_json().await;
+    assert_eq!(initial["type"], "snapshot");
+    assert_eq!(initial["session"]["subagents"], json!([]));
+
+    parent
+        .send_json(json!({
+            "type": "prompt",
+            "request_id": "spawn-child",
+            "content": { "type": "text", "value": "delegate this work" }
+        }))
+        .await;
+
+    let (agent_id, observer_path) = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut spawned = None;
+        let mut child_notification_seen = false;
+        loop {
+            let message = parent.receive_json().await;
+            if message["type"] != "event" {
+                continue;
+            }
+            match message["event"]["type"].as_str() {
+                Some("subagent_spawned") => {
+                    assert_eq!(message["event"]["description"], "observer test child");
+                    spawned = Some((
+                        message["event"]["agent_id"].as_str().unwrap().to_owned(),
+                        message["event"]["observer_path"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    ));
+                }
+                Some("subagent_notification")
+                    if message["event"]["notification"]["source"] == "child" =>
+                {
+                    assert_eq!(message["event"]["notification"]["kind"], "blocker");
+                    assert_eq!(message["event"]["notification"]["wake_parent"], true);
+                    child_notification_seen = true;
+                }
+                _ => {}
+            }
+            if child_notification_seen && let Some(spawned) = spawned {
+                break spawned;
+            }
+        }
+    })
+    .await
+    .expect("parent caller did not receive subagent creation and notification events");
+    assert_eq!(
+        observer_path,
+        format!("/v1/ws/attach/{}/subagents/{agent_id}", handle.session_id())
+    );
+
+    let mut observer = RawWebSocket::connect(address, &observer_path).await;
+    let snapshot = observer.receive_json().await;
+    assert_eq!(snapshot["type"], "subagent_snapshot");
+    assert_eq!(snapshot["input_allowed"], false);
+    assert_eq!(
+        snapshot["subagent"]["parent_session_id"],
+        handle.session_id().to_string()
+    );
+    assert_eq!(snapshot["subagent"]["agent_id"], agent_id);
+
+    let runtime = handle.subagents().unwrap().clone();
+    let queued = runtime
+        .send_message(&agent_id, "follow-up from the parent runtime")
+        .unwrap();
+    let queued_event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = observer.receive_json().await;
+            if message["type"] == "subagent_event" && message["event"]["type"] == "message_queued" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("child observer did not receive a live event");
+    assert_eq!(queued_event["agent_id"], agent_id);
+    assert_eq!(queued_event["event"]["delivery_id"], queued.delivery_id);
+
+    let forbidden = "observer input must never reach the child";
+    observer
+        .send_json(json!({
+            "type": "prompt",
+            "request_id": "forbidden",
+            "content": { "type": "text", "value": forbidden }
+        }))
+        .await;
+    let (code, reason) = observer.receive_close().await;
+    assert_eq!(code, 1008);
+    assert_eq!(reason, "read_only_subagent_stream");
+
+    let mut binary_observer = RawWebSocket::connect(address, &observer_path).await;
+    assert_eq!(
+        binary_observer.receive_json().await["type"],
+        "subagent_snapshot"
+    );
+    binary_observer
+        .write_frame(0x2, b"binary input is forbidden")
+        .await;
+    let (code, reason) = binary_observer.receive_close().await;
+    assert_eq!(code, 1008);
+    assert_eq!(reason, "read_only_subagent_stream");
+
+    tokio::task::yield_now().await;
+    let child = runtime.snapshot(&agent_id).unwrap();
+    assert!(child.messages.iter().all(|message| {
+        message
+            .text_content()
+            .is_none_or(|content| !content.contains(forbidden))
+    }));
+
+    let first_close = runtime.close(&agent_id, "test complete").await.unwrap();
+    assert!(!first_close.already_closed);
+    let second_close = runtime.close(&agent_id, "duplicate").await.unwrap();
+    assert!(second_close.already_closed);
+    assert!(runtime.send_message(&agent_id, "too late").is_err());
+
+    drop(parent);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
 }
 
 #[tokio::test]

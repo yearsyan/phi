@@ -26,6 +26,7 @@
 - `agent_start`、turn、message、tool progress 和 error 生命周期事件
 - 可协作停止的 run control，以及协议安全的停止检查点
 - 可持久化的 Default/Plan 模式、工具能力硬限制与独立版本化计划文件
+- 可显式启用的异步 subagent runtime，支持双向通知、安全边界消息注入和永久关闭
 - 持续工具轮次与可复用对话历史
 - 独立 `phi-daemon` 二进制：session registry、HTTP 列表、new/attach WebSocket、可重连的 `askuser` 与 Plan Exit 审批
 
@@ -221,6 +222,28 @@ Agent 默认最多同时执行 8 个被分类为 `Safe` 的调用，可通过 `m
 Agent 还会对每个工具调用施加默认 300 秒的外层超时，可通过 Builder 的 `tool_call_timeout` / `without_tool_call_timeout`，或运行期的 `Agent::set_tool_call_timeout` 修改。外层超时和 stop 会把已开始但未确认完成的调用标记为 `unknown`；对于 Bash，取消时还会终止其进程组。
 
 这些工具遵循 Pi 的本地工具语义：工作目录只用于解析相对路径，不是安全沙箱；绝对路径和包含 `..` 的路径仍可访问工作目录以外的位置，`bash` 也可以执行当前进程权限允许的任意命令。只应向可信 Agent 显式开放所需的最小能力。
+
+## Subagent
+
+Subagent 是 library 的显式 opt-in 能力。调用方提供 `SubagentFactory`，创建一个父 Agent 作用域的 `SubagentRuntime`，再选择性注册三个父工具；省略注册就是关闭，不会隐式增加模型能力：
+
+```rust
+use std::sync::Arc;
+use phi::{Agent, SubagentConfig, SubagentFactory, SubagentRuntime, SubagentTools};
+
+# fn build(parent: &mut Agent, child_factory: Arc<dyn SubagentFactory>) {
+let runtime = SubagentRuntime::new("parent-session", child_factory, SubagentConfig::default());
+let SubagentTools { spawn_agent, send_agent_message, close_agent } =
+    SubagentTools::new(runtime.clone());
+parent.add_tool(spawn_agent);
+parent.add_tool(send_agent_message);
+parent.add_tool(close_agent);
+# }
+```
+
+`spawn_agent` 立即返回稳定 ID，child 在独立 task 中继续运行；`send_agent_message` 在 provider/tool 协议安全边界注入消息，idle child 会被唤醒。runtime 自动只给 child 注入 `notify_parent`：`progress` 可观察但不唤醒父 Agent，`blocker`/`result` 会唤醒；失败和关闭也会产生 runtime 通知。`close_agent` 可关闭 Starting、Running 或 Idle child，永久拒绝后续消息且幂等。child 默认不会得到 `spawn_agent`，因此不能递归创建下一级 Agent。
+
+daemon 默认注册这组父工具，可用 `PHI_DAEMON_SUBAGENTS_ENABLED=false` 关闭；library 本身始终保持显式启用。
 
 ## MCP Server
 
@@ -663,35 +686,34 @@ println!("Agent 累计 API 用量：{}", agent.cumulative_usage().total_tokens);
 
 `run_usage` 是本次 Agent loop 内所有模型请求的 token 总和，适合用量/成本统计；`context_usage` 只采用最后一次模型响应的 `total_tokens`，用于衡量当前对话实际占用，二者不能混用。
 
-### 异步上下文管理
+### 上下文压缩
 
-`ContextManager` 是独立于生命周期 `Hook` 的异步 hook 类型。Agent 默认在成功响应报告的上下文占用达到 `80%` 时运行 manager 链；可以通过 `context_management_threshold_percent` 调整阈值，并通过多次 `context_manager` 或一个 `ContextManagerRegistry` 注册多个 manager：
+`ContextCompactor` 是每个 Agent 选择一个的可替换压缩策略。library 不隐式安装策略；创建 Agent 时显式声明，owner 持有 `&mut Agent` 且 Agent 空闲时也可以通过 `set_context_compactor` 原子切换实现：
 
 ```rust
-use async_trait::async_trait;
-use phi::{ContextManagementContext, ContextManager, HookError};
+use phi::{Agent, DefaultContextCompactor};
 
-struct ApplicationContextManager;
-
-#[async_trait]
-impl ContextManager for ApplicationContextManager {
-    async fn manage_context(
-        &self,
-        context: &mut ContextManagementContext<'_>,
-    ) -> Result<bool, HookError> {
-        // 应用可以异步生成摘要，然后通过 replace_prefix、
-        // replace_messages、truncate、clear_messages 或 messages_mut 改写 transcript。
-        let _ = context.messages();
-        Ok(false)
-    }
-}
+# fn build(provider: impl phi::LlmProvider + 'static) {
+let agent = Agent::builder(provider)
+    .max_context_tokens(200_000)
+    .max_tokens(20_000)
+    .context_compactor(DefaultContextCompactor::default())
+    .build();
+# let _ = agent;
+# }
 ```
 
-返回 `true` 会继续运行下一个已注册 manager，返回 `false` 会终止同类 hook 链。完整链执行后 Agent 会验证 assistant tool call 与 tool result 仍然成组；合法修改会在继续下一次模型请求前持久化，非法修改或 hook 错误会回滚。
+`DefaultContextCompactor` 是内置的默认方案实现：使用当前 Agent 的同一模型生成纯文本摘要，禁用工具和 reasoning，summary 最多输出 20k tokens；图片和文档在摘要请求中替换为标记，opaque provider state 不参与摘要。成功前不会修改 live transcript；成功后用 `Conversation compacted` boundary 和 synthetic user summary 原子替换 active history，并通过 `save_replacing_from` 持久化。摘要请求自身超出窗口时会按协议安全的完整消息组从头裁剪，最多重试 3 次。
 
-当 Provider 在尚未产生任何 assistant delta 时返回上下文超限错误，同一条 manager 链也会以 `ContextManagementTrigger::ContextLengthExceeded` 触发。内置 HTTP Provider 会识别常见的上下文超限错误码和消息；自定义 Provider 可以返回 `ProviderError::context_length_exceeded(...)`。错误触发完成后原请求仍返回该 Provider 错误，不会隐式重试。没有配置 `max_context_tokens` 或 Provider 没有返回 usage 时，成功响应无法进行百分比判断，但显式的上下文超限错误仍可触发 manager。
+自动压缩不是固定百分比。默认实现采用固定余量公式：
 
-SDK 暂不提供具体的摘要、滑动窗口或裁剪策略，策略由注册的 `ContextManager` 实现。
+```text
+max_context_tokens - min(max_output_tokens, 20_000) - 13_000
+```
+
+Agent 在每次真正发送下一条 LLM 请求前，以最近 Provider usage 加上此后新增消息的估算量做判断。因此普通最终回答不会刚生成就立刻被摘要；tool loop 的下一轮和下一个用户 prompt 会先压缩再请求模型。连续 3 次自动压缩失败后，该 Agent 会停止自动重试；手动压缩和上下文超限恢复仍可执行。
+
+调用方可主动执行 `agent.compact_context(Some("额外摘要要求".into())).await`。压缩会发出 `ContextCompactionStarted`（含实际 summary prompt）、`ContextCompactionCompleted`（含 history replace-tail patch）或 `ContextCompactionFailed`。Provider 在尚未输出有效 assistant delta 时返回上下文超限后，Agent 会触发所选 compactor；只在 transcript 实际改变时重试原请求一次，第二次超限直接返回，避免恢复循环。压缩后 `last_usage/context_usage` 清空，压缩 API usage 只计入累计/本次计费用量，下一次正常响应会重新建立占用统计。
 
 ## 图片与文档输入
 
@@ -762,13 +784,15 @@ HTTP/WebSocket 接口：
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
 - `POST /v1/auth/token`：使用长期 bearer key 换取 60 秒有效、单次使用的 WebSocket subprotocol token。
 - `GET /v1/ws/new?profile_id=...`：用指定 profile 构建 Agent，首个 prompt 才初始化并持久化 session。
-- `GET /v1/ws/attach/{session_id}`：返回历史与当前快照，并持续订阅流式事件。
+- `GET /v1/ws/attach/{session_id}`：返回历史与当前快照，并持续订阅流式事件；可发送 `compact` 主动触发默认上下文压缩。
+- `GET /v1/ws/attach/{session_id}/subagents/{agent_id}`：只读观察 child Agent；任何 text/binary 输入都以 `1008` 拒绝。
 
 同一 session 可以被多个 WebSocket 同时 attach；运行期间的新 prompt 会进入有界
 FIFO，stop、状态和模型配置变化会同步广播。每个 session 由单独 actor 串行拥有
 `Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会自动获得
-`askuser` 以及三个 Plan 工具；问题和 Exit 审批通过广播发送，任一 attach 客户端可
-处理，断线重连可从 snapshot 的 pending 状态恢复。
+`askuser`、subagent 工具以及三个 Plan 工具；父 Agent 创建 child 时会向 session
+调用方广播结构化事件，child 的流式过程可通过独立只读 WebSocket 观察。问题和 Exit
+审批通过广播发送，任一 attach 客户端可处理，断线重连可从 snapshot 的 pending 状态恢复。
 
 ```bash
 PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key cargo run -p phi-daemon
@@ -779,6 +803,7 @@ daemon 要求 key 文件至少包含 32 个可打印非空白 ASCII 字节，建
 ```bash
 PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
   PHI_DAEMON_BIND=127.0.0.1:9000 \
+  PHI_DAEMON_SUBAGENTS_ENABLED=true \
   cargo run -p phi-daemon
 ```
 
@@ -799,4 +824,4 @@ read/edit/write/bash 等工具，可提供自定义 `AgentFactory`。
 - `crates/phi-daemon`：daemon 进程、HTTP/WS transport、session actor 与持久化编排
 
 这是精简的 agent-core 与单进程 daemon，而不是 Pi coding-agent CLI 的完整复刻；
-TUI、上下文压缩、TLS/origin 校验、多租户和分布式 actor 协调尚未包含。
+TUI、partial/micro compaction、TLS/origin 校验、多租户和分布式 actor 协调尚未包含。

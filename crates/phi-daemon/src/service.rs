@@ -1,9 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use phi::{
-    Content, InMemoryPlanStore, InMemorySessionStorage, PlanStore, SessionStorage, SkillCatalog,
-    SkillsConfig,
+    Agent, Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage, PlanStore,
+    ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
+    SubagentConfig, SubagentFactory, SubagentFactoryError, SubagentRuntime, SubagentTools,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
@@ -11,8 +13,8 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use crate::{
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandle, AgentHandleError,
-        AgentRegistry, AgentSummary, ConfiguredAgentFactory, QueuedRun, RegistryError, SessionId,
-        ShutdownFailure, UnconfiguredAgentFactory, normalize_provider_config,
+        AgentRegistry, AgentSummary, BuiltAgent, ConfiguredAgentFactory, QueuedRun, RegistryError,
+        SessionId, ShutdownFailure, UnconfiguredAgentFactory, normalize_provider_config,
     },
     store::{
         ControlStore, ControlStoreError, DEFAULT_PROFILE_ID, MemoryControlStore, ProviderConfig,
@@ -28,6 +30,7 @@ pub struct ApplicationService {
     plan_store: Arc<dyn PlanStore>,
     factory: Arc<dyn AgentFactory>,
     provider_store: Option<Arc<dyn ProviderStore>>,
+    subagents_enabled: bool,
     prepared: Arc<Mutex<HashMap<SessionId, AgentHandle>>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
 }
@@ -35,6 +38,48 @@ pub struct ApplicationService {
 #[derive(Default)]
 struct LifecycleState {
     closing: bool,
+}
+
+/// Adapts the daemon's provider-backed root factory to the library subagent
+/// runtime. Children inherit the parent's effective profile and generation
+/// settings, but are not registered as independently writable daemon sessions.
+#[derive(Clone)]
+struct DaemonSubagentFactory {
+    factory: Arc<dyn AgentFactory>,
+    profile_id: String,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[async_trait]
+impl SubagentFactory for DaemonSubagentFactory {
+    async fn build(&self, request: SubagentBuildRequest) -> Result<Agent, SubagentFactoryError> {
+        if request.allow_nested_subagents {
+            return Err(SubagentFactoryError::new(
+                "nested subagents are disabled by the daemon",
+            ));
+        }
+
+        let model = request
+            .generation_config
+            .model
+            .unwrap_or_else(|| self.model.clone());
+        let reasoning_effort = request
+            .generation_config
+            .reasoning_effort
+            .or(self.reasoning_effort);
+        let build =
+            AgentBuildRequest::new(SessionId::new(), self.profile_id.clone()).with_model(model);
+        let build = match reasoning_effort {
+            Some(reasoning_effort) => build.with_reasoning_effort(reasoning_effort),
+            None => build.without_reasoning_effort(),
+        };
+        self.factory
+            .build(&build)
+            .await
+            .map(|built| built.agent)
+            .map_err(|error| SubagentFactoryError::new(error.to_string()))
+    }
 }
 
 impl ApplicationService {
@@ -67,6 +112,9 @@ impl ApplicationService {
             plan_store,
             factory,
             provider_store: None,
+            // Embedders opt in by installing the daemon integration. The
+            // standalone daemon enables it from DaemonConfig by default.
+            subagents_enabled: false,
             prepared: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(RwLock::new(LifecycleState::default())),
         }
@@ -132,6 +180,15 @@ impl ApplicationService {
         )
     }
 
+    pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
+        self.subagents_enabled = enabled;
+        self
+    }
+
+    pub fn subagents_enabled(&self) -> bool {
+        self.subagents_enabled
+    }
+
     /// Builds provider, tools and future MCP resources, but deliberately does
     /// not create persistent session metadata yet.
     pub async fn prepare_session(
@@ -144,15 +201,7 @@ impl ApplicationService {
         let profile_id = normalize_profile_id(&profile_id)?;
         let request = AgentBuildRequest::new(session_id, profile_id);
         let built = self.factory.build(&request).await?;
-        let handle = AgentHandle::spawn_with_plan_store_and_skills(
-            session_id,
-            built.agent,
-            built.profile_id,
-            built.model,
-            built.reasoning_effort,
-            Arc::clone(&self.plan_store),
-            built.skills,
-        );
+        let handle = self.spawn_handle(session_id, built);
         self.prepared
             .lock()
             .await
@@ -270,15 +319,7 @@ impl ApplicationService {
             None => request.without_reasoning_effort(),
         };
         let built = self.factory.build(&request).await?;
-        let handle = AgentHandle::spawn_with_plan_store_and_skills(
-            session_id,
-            built.agent,
-            record.profile_id.clone(),
-            record.model.clone(),
-            record.reasoning_effort,
-            Arc::clone(&self.plan_store),
-            built.skills,
-        );
+        let handle = self.spawn_handle(session_id, built);
         if let Err(error) = handle
             .initialize(
                 record,
@@ -404,6 +445,49 @@ impl ApplicationService {
 
     pub fn registry(&self) -> &AgentRegistry {
         &self.registry
+    }
+
+    fn spawn_handle(&self, session_id: SessionId, mut built: BuiltAgent) -> AgentHandle {
+        let subagents = self
+            .subagents_enabled
+            .then(|| self.install_subagents(session_id, &mut built));
+        AgentHandle::spawn_with_plan_store_skills_and_subagents(
+            session_id,
+            built.agent,
+            built.profile_id,
+            built.model,
+            built.reasoning_effort,
+            Arc::clone(&self.plan_store),
+            built.skills,
+            subagents,
+        )
+    }
+
+    fn install_subagents(&self, session_id: SessionId, built: &mut BuiltAgent) -> SubagentRuntime {
+        let config = SubagentConfig {
+            generation_config: GenerationConfig {
+                model: Some(built.model.clone()),
+                reasoning_effort: built.reasoning_effort,
+                ..GenerationConfig::default()
+            },
+            ..SubagentConfig::default()
+        };
+        let child_factory: Arc<dyn SubagentFactory> = Arc::new(DaemonSubagentFactory {
+            factory: Arc::clone(&self.factory),
+            profile_id: built.profile_id.clone(),
+            model: built.model.clone(),
+            reasoning_effort: built.reasoning_effort,
+        });
+        let runtime = SubagentRuntime::new(session_id.to_string(), child_factory, config);
+        let SubagentTools {
+            spawn_agent,
+            send_agent_message,
+            close_agent,
+        } = SubagentTools::new(runtime.clone());
+        built.agent.add_tool(spawn_agent);
+        built.agent.add_tool(send_agent_message);
+        built.agent.add_tool(close_agent);
+        runtime
     }
 
     pub async fn discard_prepared(&self, prepared: &PreparedSession) {

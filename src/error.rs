@@ -20,6 +20,20 @@ impl HookError {
 }
 
 #[derive(Debug, Error)]
+#[error("{message}")]
+pub struct ContextCompactionError {
+    message: String,
+}
+
+impl ContextCompactionError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum McpError {
     #[error("failed to start MCP stdio server: {0}")]
     Spawn(#[source] std::io::Error),
@@ -182,4 +196,7 @@ pub enum AgentError {
 
     #[error("agent hook failed: {0}")]
     Hook(#[from] HookError),
+
+    #[error("context compaction failed: {0}")]
+    ContextCompaction(#[from] ContextCompactionError),
 }

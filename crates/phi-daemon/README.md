@@ -2,7 +2,7 @@
 
 `phi-daemon` 把 `phi::Agent` 包装成一个常驻进程：进程内维护 `session_id -> Agent actor` 映射，通过 HTTP 列出已经激活的 session，通过 WebSocket 创建、恢复、操纵 session，并把 Agent 的流式事件广播给所有 attach 的客户端。
 
-当前实现的重点是 session 生命周期、排队、广播、停止和磁盘恢复。命名 Provider profile 通过 HTTP 配置并持久化，session 以 `profile_id` 选择其中一个；daemon 不读取 `LLM_*` 环境变量。每个 daemon 创建的 Agent 都会自动获得交互式 `askuser`，以及 `read_plan`、`write_plan`、`exit_plan_mode` 三个 Plan Mode 工具。Skills 默认从全局与工作目录加载；其他内置工具和 MCP 尚未通过 daemon 配置接入，需要这些能力时应提供自定义 `AgentFactory`。
+当前实现的重点是 session 生命周期、排队、广播、停止和磁盘恢复。命名 Provider profile 通过 HTTP 配置并持久化，session 以 `profile_id` 选择其中一个；daemon 不读取 `LLM_*` 环境变量。每个 daemon 创建的 Agent 都会自动获得交互式 `askuser`、`spawn_agent`/`send_agent_message`/`close_agent`，以及 `read_plan`、`write_plan`、`exit_plan_mode` 三个 Plan Mode 工具。Skills 默认从全局与工作目录加载；其他内置工具和 MCP 尚未通过 daemon 配置接入，需要这些能力时应提供自定义 `AgentFactory`。
 
 ## 架构
 
@@ -31,6 +31,7 @@ flowchart LR
 - 每个 actor 同时维护一个最新快照和一个有序广播环。多个 WebSocket attach 到同一 actor，会收到相同顺序的 live event。
 - Agent 调用 `askuser` 时，actor 保持当前 run 为 `running`，把问题放进快照并广播；任一 attach 客户端都可回答，回答后原 tool future 恢复执行。
 - Agent 调用 `exit_plan_mode` 时，actor 同样保持 run，发布带 revision 的不可变计划审批请求。只有批准仍是当前 revision 的计划才会切回 Default；拒绝、过期、stop 或保存失败都保持/恢复 Plan。
+- Agent 调用 `spawn_agent` 时，child 在独立 runtime 中异步运行；创建事件先广播给父 session 调用方。父模型可在协议安全边界发送后续消息或永久关闭 child；child 的 blocker/result/failed/closed 通知会排队唤醒父 Agent，progress 只广播、不唤醒。
 - `ApplicationService` 负责首个 prompt 的延迟激活、持久化 metadata、进程重启后的单飞恢复，以及 registry 生命周期。
 - `phi::SessionStorage` 保存完整 transcript 和 Provider 回放状态；WebSocket 的 public history 刻意不暴露 opaque `provider_state`。
 
@@ -57,6 +58,7 @@ cargo run -p phi-daemon
 | `PHI_DAEMON_DATA_DIR` | `.phi/daemon` | metadata 与 transcript 根目录 |
 | `PHI_DAEMON_AUTH_KEY_FILE` | 无，必须设置 | 只包含长期 bearer key 的文件；key 长度为 32–4096 字节，建议文件权限 `0600` |
 | `PHI_DAEMON_SKILLS_ENABLED` | `true` | 是否为 daemon session 启用 skills；library 默认仍为关闭 |
+| `PHI_DAEMON_SUBAGENTS_ENABLED` | `true` | 是否注入父 Agent 的 subagent 工具并开放只读 child observer；library 仍需显式注册工具 |
 | `PHI_DAEMON_WORKSPACE_DIR` | daemon 启动工作目录 | 所有 session 共用的工作目录根路径 |
 | `PHI_DAEMON_GLOBAL_SKILLS_DIRS` | `~/.phy/skills` | 全局 skill 根目录列表，可配置多个 |
 | `PHI_DAEMON_WORKSPACE_SKILLS_DIRS` | `.phy/skills`、`.claude/skills` | 相对工作目录的 skill 根目录列表，可配置多个 |
@@ -209,7 +211,7 @@ curl -X PUT http://127.0.0.1:8787/v1/providers/openai-main \
 
 `provider` 支持 `openai_chat`、`openai_responses`、`anthropic`。`provider`、`api_key`、`base_url`、`model` 和 `max_context_tokens` 必填；`max_context_tokens` 必须是正整数，用于上下文占用统计，并作为后续压缩和精简策略的预算上限。默认 `max_retries=10`、`request_timeout_secs=30`、`stream_idle_timeout_secs=120`，其余可选字段可省略或为 `null`。连接响应头超时和 SSE 完整事件间空闲超时都必须大于零。`request_timeout_secs` 命中后请求会直接失败，不会自动重发，以免已经被 Provider 接收的 POST 重复计费。该接口只做本地格式和 Provider URL 校验，不会发送探测请求。daemon factory 为所有 session 构建的 Provider 复用同一个 HTTP client 和连接池。
 
-嵌入 daemon library 的调用方可以通过 `ConfiguredAgentFactory::context_manager` 注册多个异步 `ContextManager`，并以 `context_management_threshold_percent` 设置所有新 Agent 的触发阈值。默认 daemon 可执行文件尚未注册任何具体压缩策略。
+daemon factory 会为每个新 Agent 显式创建一份 `DefaultContextCompactor`。嵌入 daemon library 的调用方可通过 `ConfiguredAgentFactory::context_compactor` 或 `context_compactor_factory` 替换默认策略。
 
 旧 `provider.json` 中缺少 `max_context_tokens` 或将其设为 `null` 的 profile 必须先补成正整数，否则新版本会拒绝加载该配置文件。
 
@@ -249,7 +251,7 @@ curl http://127.0.0.1:8787/v1/sessions \
 }
 ```
 
-`status` 可能是 `awaiting_first_prompt`、`idle`、`running`、`stopping`、`closing`、`closed` 或 `offline`；正常已持久化 session 通常是前述状态中的 `idle`/`running`/`stopping`，而尚未恢复进本进程的是 `offline`。live session 的 `mode` 是 `default` 或 `plan`；离线 summary 不加载 transcript，因此为 `null`。
+`status` 可能是 `awaiting_first_prompt`、`idle`、`compacting`、`running`、`stopping`、`closing`、`closed` 或 `offline`；正常已持久化 session 通常是前述状态中的 `idle`/`compacting`/`running`/`stopping`，而尚未恢复进本进程的是 `offline`。live session 的 `mode` 是 `default` 或 `plan`；离线 summary 不加载 transcript，因此为 `null`。
 
 ### `GET /v1/sessions/{session_id}`
 
@@ -278,7 +280,7 @@ curl http://127.0.0.1:8787/v1/sessions \
 
 ## WebSocket API
 
-所有应用层消息都是 UTF-8 JSON text frame。单条 WebSocket message/frame 上限均为 1 MiB；binary frame 被忽略。服务器单次写等待超过 10 秒会结束该 socket。
+父 session WebSocket 的应用层消息都是 UTF-8 JSON text frame。单条 WebSocket message/frame 上限均为 1 MiB；父连接的 binary frame 被忽略。child observer 是严格只读连接，任何 text 或 binary 输入都会以 WebSocket close code `1008` 关闭。服务器单次写等待超过 10 秒会结束该 socket。
 
 客户端发出的每个命令都带由客户端生成的 `request_id`。命令的直接结果只回给发送该命令的 socket；由命令产生的 `event` 会广播给同一 session 的所有 socket。
 
@@ -304,6 +306,9 @@ curl http://127.0.0.1:8787/v1/sessions \
 | `ready` | `config`、`mode` | `/new` 已可接受命令，但尚未激活 session |
 | `session_created` | `session_id` | 首 prompt 已激活并持久化 session |
 | `snapshot` | `session` | `/attach` 的完整当前状态 |
+| `subagent_snapshot` | `subagent`、`input_allowed=false` | child observer 的完整当前状态 |
+| `subagent_event` | `sequence`、`parent_session_id`、`agent_id`、`event` | child observer 的有序只读事件 |
+| `subagent_resync_required` | `skipped`、`subagent`、`input_allowed=false` | child observer lag 后的完整状态替换 |
 | `command_accepted` | `request_id`、`command`，可选 `run_id`、`queue_position` | 命令已被接纳 |
 | `command_rejected` | `request_id`、`code`、`message` | 命令未被接纳 |
 | `event` | `sequence`、`session_id`、可选 `run_id`、`event` | 有序广播事件 |
@@ -416,6 +421,7 @@ const socket = new WebSocket(
     },
     "pending_asks": [],
     "pending_plan_approvals": [],
+    "subagents": [],
     "usage": {
       "last": null,
       "context": null,
@@ -434,6 +440,14 @@ const socket = new WebSocket(
 连接 attach 时会先订阅广播、再读取快照，并按 sequence 去重，所以快照与 live event 交界处不会因竞争而丢更新。若 snapshot 为 `running`/`stopping`，`draft` 是当前尚未提交的 assistant 流；后续 delta 会继续以 event 发送。`pending_asks` 与 `pending_plan_approvals` 始终是数组，重连客户端应据此重新渲染尚未回答的问题或审批。
 
 未知 session 会在 WebSocket upgrade 后收到 `fatal_error`，code 为 `attach_failed`。多个客户端可以同时 attach；任一客户端提交的 prompt、stop 或配置变更所产生的事件都会同步给所有客户端。
+
+### 只读子 Agent：`GET /v1/ws/attach/{parent_session_id}/subagents/{agent_id}`
+
+父 Agent 成功调用 `spawn_agent` 后，父 session 的所有 attach 客户端都会收到 `subagent_spawned`，其中包含稳定的 `agent_id`、`initial_delivery_id` 和 `observer_path`。父 session snapshot 的 `subagents` 也包含当前状态与同一路径。
+
+使用新的单次临时 token 连接 `observer_path` 后，服务端先发送 `subagent_snapshot`，再持续发送 `subagent_event`。该连接只用于观察 child 的 transcript、流式 draft、通知与生命周期；它不接受 prompt、消息、stop 或 close 命令。WebSocket control ping/pong/close 正常工作，但任何应用层 text（包括 JSON ping）或 binary frame 都会收到 policy-violation `1008` close，且内容不会被反序列化或执行。
+
+child observer 使用自己独立的 sequence。消费过慢时服务端发送 `subagent_resync_required`；客户端应以其中 snapshot 的 `last_sequence` 重建状态。child 永久关闭后在父 actor 生命周期内保留 tombstone，observer 可以读取最终 snapshot，但不能恢复或再次输入。当前 child registry 与事件 cursor 是进程内状态，daemon 重启恢复父 session 时不会恢复之前的 live child。
 
 ## 客户端命令
 
@@ -486,7 +500,33 @@ const socket = new WebSocket(
 }
 ```
 
-`queue_position` 是命令被 actor 接纳时的等待队列位置。即使 session 当前正在输出，prompt 也会被接纳并按 actor 的 FIFO 顺序等待；当前 run 终止后才会开始下一 run。等待 prompt 的容量当前为 64，满时返回 `queue_full`。
+`queue_position` 是命令被 actor 接纳时的等待队列位置。即使 session 当前正在输出、停止或压缩，prompt 也会被接纳并按 actor 的 FIFO 顺序等待；当前操作终止后才会开始下一 run。等待 prompt 的容量当前为 64，满时返回 `queue_full`。
+
+### 主动压缩上下文
+
+主动压缩只允许从已经建立的 `/attach` 连接发起，`/new` 会以 `invalid_command` 拒绝。session 必须处于 `idle` 且已有对话历史；压缩或 run 正在执行时返回 `session_busy`。`instructions` 可省略，也可补充本次摘要应特别保留的内容：
+
+```json
+{
+  "type": "compact",
+  "request_id": "compact-1",
+  "instructions": "保留所有已确认的存储不变量"
+}
+```
+
+actor 接纳任务并切换到 `compacting` 后，发送者会先收到：
+
+```json
+{
+  "type": "command_accepted",
+  "request_id": "compact-1",
+  "command": "compact"
+}
+```
+
+随后所有 attach 客户端按同一 sequence 收到 `context_compaction_started`，其中 `prompt` 是实际交给压缩模型的摘要提示；成功时收到 `context_compaction_completed`，其 `changed_from` 与 `replacement` 是应用到 `snapshot.session.history` 的 replace-tail patch。失败时收到 `context_compaction_failed`，原 history 不变。完成或失败后状态回到 `idle`。
+
+daemon 创建每个 Agent 时显式安装一份新的 `DefaultContextCompactor`。它按固定 token 余量自动压缩，同时也是上述主动命令使用的默认实现；factory 保留按 Agent 构造策略的入口，便于未来在创建 session 时选择实现，并在 session 空闲时安全切换。
 
 ### stop
 
@@ -512,7 +552,7 @@ const socket = new WebSocket(
 }
 ```
 
-model 必须非空。该命令只允许在 `awaiting_first_prompt` 或 `idle` 状态执行；`running`、`stopping`、`closing`、`closed` 状态返回 `session_busy`。成功后 revision 加一，并广播 `config_changed`。
+model 必须非空。该命令只允许在 `awaiting_first_prompt` 或 `idle` 状态执行；`compacting`、`running`、`stopping`、`closing`、`closed` 状态返回 `session_busy`。成功后 revision 加一，并广播 `config_changed`。
 
 ### 修改思考强度
 
@@ -720,10 +760,10 @@ WebSocket control ping 也会得到 control pong。
 
 事件类型分组如下：
 
-- runtime 生命周期：`state_changed`、`session_initialized`、`run_queued`、`run_started`、`run_completed`、`run_stopped`、`run_failed`、`config_changed`、`mode_changed`、`askuser_requested`、`askuser_answered`、`askuser_cancelled`、`plan_approval_requested`、`plan_approval_decided`、`plan_approval_cancelled`、`operation_failed`、`actor_crashed`。
+- runtime 生命周期：`state_changed`、`session_initialized`、`run_queued`、`run_started`、`run_completed`、`run_stopped`、`run_failed`、`config_changed`、`mode_changed`、`askuser_requested`、`askuser_answered`、`askuser_cancelled`、`plan_approval_requested`、`plan_approval_decided`、`plan_approval_cancelled`、`subagent_spawned`、`subagent_state_changed`、`subagent_message_queued`、`subagent_notification`、`subagent_run_finished`、`subagent_closed`、`subagents_resynced`、`operation_failed`、`actor_crashed`。
 - Agent 生命周期：`agent_start`、`agent_end`、`agent_stopped`、`turn_start`、`turn_end`。
 - 流式消息：`message_start`、`message_update`、`message_end`、`message_aborted`。
-- 工具与统计：`tool_execution_start`、`tool_execution_end`、`usage_update`、`provider_retry`、`error`。
+- 工具、压缩与统计：`tool_execution_start`、`tool_execution_end`、`usage_update`、`provider_retry`、`context_compaction_started`、`context_compaction_completed`、`context_compaction_failed`、`error`。
 
 `event` 对象的字段如下；没有列出字段的事件只有 `type`：
 
@@ -740,6 +780,13 @@ WebSocket control ping 也会得到 control pong。
 | `plan_approval_requested` | `request`，包含 `approval_id` 与不可变 `plan` revision/content |
 | `plan_approval_decided` | `approval_id`、`decision` |
 | `plan_approval_cancelled` | `approval_id` |
+| `subagent_spawned` | `agent_id`、`description`、`initial_delivery_id`、`observer_path` |
+| `subagent_state_changed` | `agent_id`、`state` |
+| `subagent_message_queued` | `agent_id`、`delivery_id` |
+| `subagent_notification` | `agent_id`、`notification`（含 `kind`、`source`、`message`、`wake_parent`） |
+| `subagent_run_finished` | `agent_id`、`run_id`、`outcome` |
+| `subagent_closed` | `agent_id`、`delivery_id`、`reason`、`wake_parent` |
+| `subagents_resynced` | `subagents` 完整父投影 |
 | `operation_failed` | `operation`、`message` |
 | `actor_crashed` | `message` |
 | `agent_start`、`agent_end`、`agent_stopped` | 无；完整历史在 snapshot 投影中，不随终止 marker 重复广播 |
@@ -752,9 +799,12 @@ WebSocket control ping 也会得到 control pong。
 | `tool_execution_end` | `call`、`content`、`is_error` |
 | `usage_update` | `usage`、`context_usage` |
 | `provider_retry` | `retry_number`、`max_retries`、`delay_ms`、`reason` |
+| `context_compaction_started` | `trigger`、`compactor`、`prompt` |
+| `context_compaction_completed` | `trigger`、`compactor`、`before_message_count`、`after_message_count`、`changed_from`、`replacement`、`summary`、`usage`、`estimated_context_tokens` |
+| `context_compaction_failed` | `trigger`、`compactor`、`message` |
 | `error` | `message` |
 
-Public `message` 固定包含 `role`、`content`、`tool_calls`、`tool_call_id`、`tool_result_is_error`。`call` 固定包含 `id`、`name`、任意 JSON `arguments`。`context_usage` 非空时包含 `max_tokens`、`used_tokens`、`remaining_tokens`。`provider_retry.reason.type` 为 `request_timeout`、`transport` 或 `http_status`，分别携带 `timeout_ms`、`message`，或 `status` + `body`；`request_timeout` 为事件协议兼容保留，内置 Provider 对响应头超时直接失败，不再发出该 retry 事件。
+Public `message` 固定包含 `role`、`content`、`tool_calls`、`tool_call_id`、`tool_result_is_error`。`call` 固定包含 `id`、`name`、任意 JSON `arguments`。`context_usage` 非空时包含 `max_tokens`、`used_tokens`、`remaining_tokens`。压缩 `trigger.type` 为 `manual`、`automatic` 或 `context_length_exceeded`；手动 trigger 可带 `instructions`，自动 trigger 带触发前的 `usage`。`provider_retry.reason.type` 为 `request_timeout`、`transport` 或 `http_status`，分别携带 `timeout_ms`、`message`，或 `status` + `body`；`request_timeout` 为事件协议兼容保留，内置 Provider 对响应头超时直接失败，不再发出该 retry 事件。
 
 常见 run 顺序是：
 
@@ -815,7 +865,7 @@ stop 是合作式停止，不是把 session 简单截断到“最后一个数组
 
 - TLS、WebSocket origin 校验、租户与权限模型。
 - HTTP session detail/create/delete、queued-run cancel、队列清空和 session 删除协议。
-- daemon binary 中除 `askuser`、`read_plan`、`write_plan`、`exit_plan_mode` 之外的内置工具和 MCP 配置；相关能力存在于 `phi` library，但当前 HTTP-managed factory 没有接线。
+- daemon binary 中除 `askuser`、subagent 工具、`read_plan`、`write_plan`、`exit_plan_mode` 之外的内置工具和 MCP 配置；相关能力存在于 `phi` library，但当前 HTTP-managed factory 没有接线。
 - 跨 daemon 实例共享 live actor、分布式锁或事件总线；当前 mapping 与广播都是单进程的。
 - durable event cursor/replay；重连通过 snapshot 恢复，不按旧 sequence 重放。
 - 工具外部副作用的事务回滚或强制中断。

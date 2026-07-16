@@ -4,7 +4,7 @@ use axum::{
     Router,
     extract::{
         Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, header},
     response::Response,
@@ -17,7 +17,10 @@ use tokio::sync::broadcast;
 use super::{
     AppState,
     auth::{self, WS_AUTH_PROTOCOL_PREFIX, WS_PROTOCOL},
-    dto::{ClientCommand, ServerMessage, SessionConfigDto, SessionDto},
+    dto::{
+        ClientCommand, ServerMessage, SessionConfigDto, SessionDto, SubagentEventDto,
+        SubagentSnapshotDto,
+    },
 };
 use crate::{
     runtime::{
@@ -33,6 +36,10 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/ws/new", get(new_session))
         .route("/v1/ws/attach/{session_id}", get(attach_session))
+        .route(
+            "/v1/ws/attach/{parent_session_id}/subagents/{agent_id}",
+            get(attach_subagent),
+        )
 }
 
 #[derive(Default, Deserialize)]
@@ -44,6 +51,10 @@ struct NewSessionQuery {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttachSessionQuery {}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachSubagentQuery {}
 
 async fn new_session(
     State(state): State<AppState>,
@@ -81,6 +92,26 @@ async fn attach_session(
         .max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_attach(socket, service, session_id))
+}
+
+async fn attach_subagent(
+    State(state): State<AppState>,
+    Path((parent_session_id, agent_id)): Path<(SessionId, String)>,
+    Query(_query): Query<AttachSubagentQuery>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if !authenticate_websocket(&headers, &state) {
+        return auth::unauthorized_response();
+    }
+    let service = Arc::clone(state.service());
+    websocket
+        .protocols([WS_PROTOCOL])
+        .max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            handle_subagent_attach(socket, service, parent_session_id, agent_id)
+        })
 }
 
 /// Browser WebSocket APIs cannot set an Authorization header. They can,
@@ -163,6 +194,7 @@ async fn handle_new(socket: WebSocket, service: Arc<ApplicationService>, profile
             prepared,
             activated: false,
         }),
+        ConnectionKind::New,
         summary.last_event_sequence,
     )
     .await;
@@ -209,9 +241,194 @@ async fn handle_attach(socket: WebSocket, service: Arc<ApplicationService>, sess
         events,
         handle,
         None,
+        ConnectionKind::Attach,
         snapshot.last_event_sequence,
     )
     .await;
+}
+
+async fn handle_subagent_attach(
+    socket: WebSocket,
+    service: Arc<ApplicationService>,
+    parent_session_id: SessionId,
+    agent_id: String,
+) {
+    let (mut sender, receiver) = socket.split();
+    let handle = match service.attach_session(parent_session_id).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = send_json(
+                &mut sender,
+                &ServerMessage::FatalError {
+                    code: "attach_failed",
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(runtime) = handle.subagents().cloned() else {
+        let _ = send_json(
+            &mut sender,
+            &ServerMessage::FatalError {
+                code: "subagents_disabled",
+                message: "subagents are disabled for this session".to_owned(),
+            },
+        )
+        .await;
+        return;
+    };
+
+    // Subscribe before taking the child snapshot. Events racing with the
+    // snapshot are buffered and deduplicated by the child sequence.
+    let events = runtime.subscribe();
+    let Some(snapshot) = runtime.snapshot(&agent_id) else {
+        let _ = send_json(
+            &mut sender,
+            &ServerMessage::FatalError {
+                code: "subagent_not_found",
+                message: format!("subagent `{agent_id}` was not found"),
+            },
+        )
+        .await;
+        return;
+    };
+    if snapshot.parent_id != parent_session_id.to_string() {
+        let _ = send_json(
+            &mut sender,
+            &ServerMessage::FatalError {
+                code: "subagent_not_found",
+                message: format!("subagent `{agent_id}` was not found"),
+            },
+        )
+        .await;
+        return;
+    }
+    let last_sequence = snapshot.last_sequence;
+    let closed = snapshot.state == phi::SubagentState::Closed;
+    if send_json(
+        &mut sender,
+        &ServerMessage::SubagentSnapshot {
+            subagent: SubagentSnapshotDto::from(&snapshot),
+            input_allowed: false,
+        },
+    )
+    .await
+    .is_err()
+        || closed
+    {
+        return;
+    }
+
+    subagent_observer_loop(
+        sender,
+        receiver,
+        events,
+        runtime,
+        parent_session_id,
+        agent_id,
+        last_sequence,
+    )
+    .await;
+}
+
+async fn subagent_observer_loop(
+    mut sender: SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    mut events: broadcast::Receiver<phi::SubagentEvent>,
+    runtime: phi::SubagentRuntime,
+    parent_session_id: SessionId,
+    agent_id: String,
+    mut skip_through: u64,
+) {
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                let Some(incoming) = incoming else { break };
+                match incoming {
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Text(_) | Message::Binary(_)) => {
+                        let close = Message::Close(Some(CloseFrame {
+                            code: close_code::POLICY,
+                            reason: "read_only_subagent_stream".into(),
+                        }));
+                        let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, sender.send(close)).await;
+                        break;
+                    }
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if event.sequence <= skip_through {
+                            continue;
+                        }
+                        skip_through = event.sequence;
+                        if event.agent_id != agent_id
+                            || event.parent_id != parent_session_id.to_string()
+                        {
+                            continue;
+                        }
+                        let closed = matches!(&event.kind, phi::SubagentEventKind::Closed { .. });
+                        let message = ServerMessage::SubagentEvent {
+                            sequence: event.sequence,
+                            parent_session_id: event.parent_id,
+                            agent_id: event.agent_id,
+                            event: SubagentEventDto::from(event.kind),
+                        };
+                        if send_json(&mut sender, &message).await.is_err() {
+                            break;
+                        }
+                        if closed {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let Some(snapshot) = runtime.snapshot(&agent_id) else {
+                            let _ = send_json(
+                                &mut sender,
+                                &ServerMessage::FatalError {
+                                    code: "subagent_not_found",
+                                    message: format!("subagent `{agent_id}` was not found"),
+                                },
+                            )
+                            .await;
+                            break;
+                        };
+                        if snapshot.parent_id != parent_session_id.to_string() {
+                            break;
+                        }
+                        let closed = snapshot.state == phi::SubagentState::Closed;
+                        skip_through = snapshot.last_sequence;
+                        if send_json(
+                            &mut sender,
+                            &ServerMessage::SubagentResyncRequired {
+                                skipped,
+                                subagent: SubagentSnapshotDto::from(&snapshot),
+                                input_allowed: false,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                        if closed {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 }
 
 struct PendingActivation {
@@ -220,12 +437,19 @@ struct PendingActivation {
     activated: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionKind {
+    New,
+    Attach,
+}
+
 async fn socket_loop(
     mut sender: SplitSink<WebSocket, Message>,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     mut events: broadcast::Receiver<RuntimeEvent>,
     handle: AgentHandle,
     mut pending: Option<PendingActivation>,
+    connection_kind: ConnectionKind,
     mut skip_through: u64,
 ) -> bool {
     loop {
@@ -247,7 +471,13 @@ async fn socket_loop(
                                 continue;
                             }
                         };
-                        if handle_command(&mut sender, &handle, &mut pending, command)
+                        if handle_command(
+                            &mut sender,
+                            &handle,
+                            &mut pending,
+                            connection_kind,
+                            command,
+                        )
                             .await
                             .is_err()
                         {
@@ -312,6 +542,7 @@ async fn handle_command(
     sender: &mut SplitSink<WebSocket, Message>,
     handle: &AgentHandle,
     pending: &mut Option<PendingActivation>,
+    connection_kind: ConnectionKind,
     command: ClientCommand,
 ) -> Result<(), ()> {
     let request_id = command.request_id().to_owned();
@@ -385,6 +616,32 @@ async fn handle_command(
             }
             Err(error) => reject_handle(sender, request_id, error).await,
         },
+        ClientCommand::Compact { instructions, .. } => {
+            if connection_kind != ConnectionKind::Attach {
+                return reject(
+                    sender,
+                    request_id,
+                    "invalid_command",
+                    "context compaction is available only on an attached session".to_owned(),
+                )
+                .await;
+            }
+            match handle.compact_context(instructions).await {
+                Ok(()) => {
+                    send_json(
+                        sender,
+                        &ServerMessage::CommandAccepted {
+                            request_id,
+                            command: "compact",
+                            run_id: None,
+                            queue_position: None,
+                        },
+                    )
+                    .await
+                }
+                Err(error) => reject_handle(sender, request_id, error).await,
+            }
+        }
         ClientCommand::SetModel { model, .. } => match handle.set_model(model).await {
             Ok(()) => {
                 send_json(

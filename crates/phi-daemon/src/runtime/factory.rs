@@ -2,9 +2,9 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use phi::{
-    Agent, AnthropicMessagesProvider, ContextManager, ContextManagerRegistry,
-    DEFAULT_CONTEXT_MANAGEMENT_THRESHOLD_PERCENT, OpenAiChatProvider, OpenAiResponsesProvider,
-    ProviderError, ReasoningEffort, RetryConfig, SkillCatalog, SkillError, SkillsConfig,
+    Agent, AnthropicMessagesProvider, ContextCompactor, DefaultContextCompactor,
+    OpenAiChatProvider, OpenAiResponsesProvider, ProviderError, ReasoningEffort, RetryConfig,
+    SkillCatalog, SkillError, SkillsConfig,
 };
 use thiserror::Error;
 
@@ -68,13 +68,15 @@ pub trait AgentFactory: Send + Sync {
 /// Factory backed by the Provider configuration managed through the daemon's
 /// HTTP API. Every build reads the latest committed configuration, so new and
 /// restart-restored actors do not require process environment variables.
+type ContextCompactorFactory =
+    dyn Fn(&AgentBuildRequest) -> Arc<dyn ContextCompactor> + Send + Sync + 'static;
+
 #[derive(Clone)]
 pub struct ConfiguredAgentFactory {
     providers: Arc<dyn ProviderStore>,
     http_client: reqwest::Client,
     skills: SkillsConfig,
-    context_management_threshold_percent: u8,
-    context_managers: ContextManagerRegistry,
+    context_compactor_factory: Arc<ContextCompactorFactory>,
 }
 
 impl ConfiguredAgentFactory {
@@ -83,8 +85,12 @@ impl ConfiguredAgentFactory {
             providers,
             http_client: reqwest::Client::new(),
             skills: SkillsConfig::disabled(),
-            context_management_threshold_percent: DEFAULT_CONTEXT_MANAGEMENT_THRESHOLD_PERCENT,
-            context_managers: ContextManagerRegistry::default(),
+            // Construct one strategy per Agent. The default implementation is
+            // stateless today, but this boundary also supports future
+            // session-scoped compactors without accidentally sharing state.
+            context_compactor_factory: Arc::new(|_request| {
+                Arc::new(DefaultContextCompactor::default())
+            }),
         }
     }
 
@@ -100,21 +106,33 @@ impl ConfiguredAgentFactory {
         self
     }
 
-    /// Sets the context-usage percentage that activates registered context
-    /// managers for every Agent built by this factory.
-    pub fn context_management_threshold_percent(mut self, threshold_percent: u8) -> Self {
-        self.context_management_threshold_percent = threshold_percent.clamp(1, 100);
+    /// Replaces the context compactor selected for every Agent subsequently
+    /// built by this factory. The standalone daemon uses the library's default
+    /// strategy, while embedders retain an explicit seam for a session-specific
+    /// resolver in the future.
+    pub fn context_compactor<C>(mut self, compactor: C) -> Self
+    where
+        C: ContextCompactor + Clone + 'static,
+    {
+        self.context_compactor_factory = Arc::new(move |_request| Arc::new(compactor.clone()));
         self
     }
 
-    /// Registers one context manager for every Agent built by this factory.
-    pub fn context_manager(mut self, manager: impl ContextManager + 'static) -> Self {
-        self.context_managers.register(manager);
+    /// Selects a fresh context compactor from the complete Agent build
+    /// request. This keeps session-creation policy outside the runtime actor
+    /// and permits different strategies per profile, model, or session.
+    pub fn context_compactor_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(&AgentBuildRequest) -> Arc<dyn ContextCompactor> + Send + Sync + 'static,
+    {
+        self.context_compactor_factory = Arc::new(factory);
         self
     }
 
-    pub fn context_managers(mut self, managers: ContextManagerRegistry) -> Self {
-        self.context_managers.extend(managers);
+    /// Explicitly shares one compactor object across Agents. Prefer
+    /// [`Self::context_compactor_factory`] for stateful implementations.
+    pub fn shared_context_compactor(mut self, compactor: Arc<dyn ContextCompactor>) -> Self {
+        self.context_compactor_factory = Arc::new(move |_request| Arc::clone(&compactor));
         self
     }
 }
@@ -125,11 +143,7 @@ impl fmt::Debug for ConfiguredAgentFactory {
             .debug_struct("ConfiguredAgentFactory")
             .field("skills_enabled", &self.skills.enabled)
             .field("skill_directories", &self.skills.directories.len())
-            .field(
-                "context_management_threshold_percent",
-                &self.context_management_threshold_percent,
-            )
-            .field("context_manager_count", &self.context_managers.len())
+            .field("context_compactor_factory", &"configured")
             .finish_non_exhaustive()
     }
 }
@@ -208,10 +222,10 @@ impl AgentFactory for ConfiguredAgentFactory {
             builder = builder.reasoning_effort(reasoning_effort);
         }
         let skills = SkillCatalog::load(&self.skills).await?;
+        let context_compactor = (self.context_compactor_factory)(request);
         builder = builder
             .skills(skills.clone())
-            .context_management_threshold_percent(self.context_management_threshold_percent)
-            .context_managers(self.context_managers.clone());
+            .shared_context_compactor(context_compactor);
 
         Ok(BuiltAgent {
             agent: builder.build(),
@@ -320,8 +334,40 @@ pub enum AgentFactoryError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::store::{DEFAULT_PROFILE_ID, MemoryProviderStore, ProviderStore};
+
+    struct TestCompactor {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl ContextCompactor for TestCompactor {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn should_compact(&self, _request: &phi::ContextCompactionRequest) -> bool {
+            true
+        }
+
+        fn prompt(&self, _request: &phi::ContextCompactionRequest) -> String {
+            "test prompt".to_owned()
+        }
+
+        async fn compact(
+            &self,
+            _provider: &dyn phi::LlmProvider,
+            _request: phi::ContextCompactionRequest,
+            _prompt: String,
+        ) -> Result<phi::ContextCompactionPlan, phi::ContextCompactionError> {
+            Err(phi::ContextCompactionError::new(
+                "not used by this factory test",
+            ))
+        }
+    }
 
     async fn configured_factory() -> ConfiguredAgentFactory {
         let store = Arc::new(MemoryProviderStore::new());
@@ -364,6 +410,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cleared.reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn builds_a_fresh_default_or_selected_context_compactor_per_agent() {
+        let factory = configured_factory().await;
+        let default = factory
+            .build(&AgentBuildRequest::new(
+                SessionId::new(),
+                DEFAULT_PROFILE_ID,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(default.agent.context_compactor_name(), Some("default"));
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&builds);
+        let factory = factory.context_compactor_factory(move |request| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let name = match request.model.as_deref() {
+                Some("compact-model") => "model_compactor",
+                _ => "profile_compactor",
+            };
+            Arc::new(TestCompactor { name })
+        });
+        let built = factory
+            .build(&AgentBuildRequest::new(
+                SessionId::new(),
+                DEFAULT_PROFILE_ID,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            built.agent.context_compactor_name(),
+            Some("profile_compactor")
+        );
+
+        let built = factory
+            .build(
+                &AgentBuildRequest::new(SessionId::new(), DEFAULT_PROFILE_ID)
+                    .with_model("compact-model"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            built.agent.context_compactor_name(),
+            Some("model_compactor")
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

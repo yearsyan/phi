@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, ops::AddAssign, str::FromStr, time::Duration};
 
+use crate::context::ContextCompactionTrigger;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -633,6 +635,33 @@ pub enum AgentEvent {
     },
     ProviderRetry {
         event: ProviderRetryEvent,
+    },
+    /// A selected compactor is about to send its summary request.
+    ContextCompactionStarted {
+        trigger: ContextCompactionTrigger,
+        compactor: String,
+        /// Exact summary prompt sent to the compaction model.
+        prompt: String,
+    },
+    /// A generated replacement was validated and persisted atomically.
+    ContextCompactionCompleted {
+        trigger: ContextCompactionTrigger,
+        compactor: String,
+        before_message_count: usize,
+        after_message_count: usize,
+        /// First replaced transcript index.
+        changed_from: usize,
+        /// Complete replacement tail beginning at `changed_from`.
+        replacement: Vec<Message>,
+        summary: String,
+        usage: Option<TokenUsage>,
+        estimated_context_tokens: u64,
+    },
+    /// Compaction failed before changing the durable transcript.
+    ContextCompactionFailed {
+        trigger: ContextCompactionTrigger,
+        compactor: String,
+        message: String,
     },
     Error {
         message: String,

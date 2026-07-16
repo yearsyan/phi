@@ -7,7 +7,7 @@ mod registry;
 
 pub use actor::{
     AgentHandle, AgentHandleError, AgentStatus, AgentSummary, AgentView, AssistantDraft, QueuedRun,
-    RuntimeEvent, RuntimeEventKind, ToolCallDraft,
+    RuntimeEvent, RuntimeEventKind, SubagentSummary, ToolCallDraft,
 };
 pub use ask_user::{AskUserAnswer, AskUserOption, AskUserQuestion, AskUserRequest};
 pub use factory::{

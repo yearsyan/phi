@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub mod builtins;
+pub mod subagent;
 
 /// The agent's execution mode.
 ///

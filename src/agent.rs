@@ -1,18 +1,18 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::{
     context::{
-        ContextManagementContext, ContextManagementTrigger, ContextManager, ContextManagerRegistry,
-        DEFAULT_CONTEXT_MANAGEMENT_THRESHOLD_PERCENT, threshold_reached,
+        ContextCompactionOutcome, ContextCompactionRequest, ContextCompactionRunOutcome,
+        ContextCompactionTrigger, ContextCompactor, estimate_messages_tokens,
     },
-    error::{AgentError, HookError, McpError, ProviderError},
+    error::{AgentError, ContextCompactionError, HookError, McpError, ProviderError},
     hook::{Hook, HookRegistry, LlmResponseContext, TurnEndContext, TurnStartContext},
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
     provider::LlmProvider,
@@ -35,7 +35,301 @@ const INTERRUPTED_TOOL_RESULT: &str =
 const UNKNOWN_TOOL_RESULT: &str = "tool execution outcome is unknown; it may have produced side effects and will not be retried automatically";
 pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+pub const DEFAULT_AGENT_MAILBOX_CAPACITY: usize = 32;
 const PLAN_MODE_SYSTEM_REMINDER: &str = "You are in Plan mode. Explore and design only. Do not modify workspace files, run commands with side effects, or perform external side effects. Use only read-only, internal, and plan-only tools until the plan is approved.";
+
+/// Result of adding a message to an [`AgentMailbox`].
+///
+/// The distinction closes the race between an agent finishing a run and an
+/// external sender adding more work. A runtime only needs to start a new run
+/// for [`AgentMailboxDelivery::WakeRequired`]; `Queued` is guaranteed to be
+/// observed by the active run at its next protocol-safe boundary, unless that
+/// run stops or fails. In that case [`AgentMailboxSender::wait_for_wake`] also
+/// becomes ready so a supervising runtime can resume the pending work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMailboxDelivery {
+    Queued,
+    WakeRequired,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AgentMailboxSendError {
+    #[error("agent mailbox is full (capacity: {capacity})")]
+    Full { capacity: usize },
+    #[error("agent mailbox is closed")]
+    Closed,
+}
+
+/// Clonable sending side of a bounded agent mailbox.
+///
+/// The sender is intended to be owned by a daemon or sub-agent runtime while
+/// the receiving side is installed on an [`Agent`]. Sending never interrupts
+/// an in-progress provider stream or tool call.
+#[derive(Clone, Debug)]
+pub struct AgentMailboxSender {
+    inner: Arc<AgentMailboxInner>,
+}
+
+impl AgentMailboxSender {
+    pub fn send(
+        &self,
+        content: impl Into<Content>,
+    ) -> Result<AgentMailboxDelivery, AgentMailboxSendError> {
+        let mut state = self.inner.lock_state();
+        if state.closed {
+            return Err(AgentMailboxSendError::Closed);
+        }
+        if state.pending.len().saturating_add(state.in_flight) >= self.inner.capacity {
+            return Err(AgentMailboxSendError::Full {
+                capacity: self.inner.capacity,
+            });
+        }
+
+        state.pending.push_back(content.into());
+        let delivery = if state.running {
+            AgentMailboxDelivery::Queued
+        } else {
+            AgentMailboxDelivery::WakeRequired
+        };
+        drop(state);
+        if delivery == AgentMailboxDelivery::WakeRequired {
+            self.inner.wake.notify_one();
+        }
+        Ok(delivery)
+    }
+
+    /// Waits until queued work needs an idle agent to be started.
+    ///
+    /// Returns `false` when the mailbox is closed. The state check is paired
+    /// with `Notify` registration so a wake transition cannot be missed.
+    pub async fn wait_for_wake(&self) -> bool {
+        loop {
+            let notified = self.inner.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.lock_state();
+                if state.closed {
+                    return false;
+                }
+                if !state.running && !state.pending.is_empty() {
+                    return true;
+                }
+            }
+            notified.as_mut().await;
+        }
+    }
+
+    /// Permanently rejects new messages and discards messages that have not
+    /// yet reached the agent transcript. Closing is idempotent.
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock_state().closed
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.inner.lock_state().running
+    }
+
+    /// Number of accepted messages not yet durably committed by the agent.
+    pub fn pending_len(&self) -> usize {
+        let state = self.inner.lock_state();
+        state.pending.len().saturating_add(state.in_flight)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+}
+
+/// Receiving side of a bounded mailbox installed on one [`Agent`].
+#[derive(Debug)]
+pub struct AgentMailbox {
+    inner: Arc<AgentMailboxInner>,
+}
+
+impl AgentMailbox {
+    pub fn bounded(capacity: usize) -> (AgentMailboxSender, Self) {
+        let inner = Arc::new(AgentMailboxInner {
+            capacity: capacity.max(1),
+            state: StdMutex::new(AgentMailboxState::default()),
+            wake: Notify::new(),
+        });
+        (
+            AgentMailboxSender {
+                inner: Arc::clone(&inner),
+            },
+            Self { inner },
+        )
+    }
+
+    pub fn with_default_capacity() -> (AgentMailboxSender, Self) {
+        Self::bounded(DEFAULT_AGENT_MAILBOX_CAPACITY)
+    }
+
+    fn begin_run(&self) -> MailboxRunGuard {
+        let mut state = self.inner.lock_state();
+        debug_assert!(!state.running, "agent mailbox run started twice");
+        state.running = true;
+        drop(state);
+        MailboxRunGuard {
+            inner: Arc::clone(&self.inner),
+            active: true,
+        }
+    }
+
+    fn begin_pending_run(&self) -> Option<(MailboxRunGuard, MailboxBatch)> {
+        let mut state = self.inner.lock_state();
+        if state.closed || state.running || state.pending.is_empty() {
+            return None;
+        }
+        state.running = true;
+        let contents = AgentMailboxInner::claim_pending_locked(&mut state);
+        drop(state);
+        Some((
+            MailboxRunGuard {
+                inner: Arc::clone(&self.inner),
+                active: true,
+            },
+            MailboxBatch::new(Arc::clone(&self.inner), contents),
+        ))
+    }
+}
+
+impl Drop for AgentMailbox {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+#[derive(Debug)]
+struct AgentMailboxInner {
+    capacity: usize,
+    state: StdMutex<AgentMailboxState>,
+    wake: Notify,
+}
+
+impl AgentMailboxInner {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, AgentMailboxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn claim_pending_locked(state: &mut AgentMailboxState) -> Vec<Content> {
+        let contents = state.pending.drain(..).collect::<Vec<_>>();
+        state.in_flight = state.in_flight.saturating_add(contents.len());
+        contents
+    }
+
+    fn close(&self) {
+        let mut state = self.lock_state();
+        state.closed = true;
+        state.pending.clear();
+        drop(state);
+        self.wake.notify_waiters();
+    }
+}
+
+#[derive(Debug, Default)]
+struct AgentMailboxState {
+    pending: VecDeque<Content>,
+    in_flight: usize,
+    running: bool,
+    closed: bool,
+}
+
+struct MailboxRunGuard {
+    inner: Arc<AgentMailboxInner>,
+    active: bool,
+}
+
+impl MailboxRunGuard {
+    fn claim_pending(&self) -> Option<MailboxBatch> {
+        let mut state = self.inner.lock_state();
+        if state.pending.is_empty() {
+            return None;
+        }
+        let contents = AgentMailboxInner::claim_pending_locked(&mut state);
+        drop(state);
+        Some(MailboxBatch::new(Arc::clone(&self.inner), contents))
+    }
+
+    /// Atomically claims messages that raced with run completion, or marks
+    /// the receiver idle so subsequent sends return `WakeRequired`.
+    fn claim_pending_or_finish(&mut self) -> Option<MailboxBatch> {
+        let mut state = self.inner.lock_state();
+        if state.pending.is_empty() {
+            state.running = false;
+            self.active = false;
+            return None;
+        }
+        let contents = AgentMailboxInner::claim_pending_locked(&mut state);
+        drop(state);
+        Some(MailboxBatch::new(Arc::clone(&self.inner), contents))
+    }
+}
+
+impl Drop for MailboxRunGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.inner.lock_state();
+        state.running = false;
+        let wake = !state.closed && !state.pending.is_empty();
+        drop(state);
+        if wake {
+            self.inner.wake.notify_one();
+        }
+    }
+}
+
+struct MailboxBatch {
+    inner: Arc<AgentMailboxInner>,
+    contents: Vec<Content>,
+    resolved: bool,
+}
+
+impl MailboxBatch {
+    fn new(inner: Arc<AgentMailboxInner>, contents: Vec<Content>) -> Self {
+        Self {
+            inner,
+            contents,
+            resolved: false,
+        }
+    }
+
+    fn commit(mut self) {
+        let mut state = self.inner.lock_state();
+        state.in_flight = state.in_flight.saturating_sub(self.contents.len());
+        drop(state);
+        self.resolved = true;
+    }
+}
+
+impl Drop for MailboxBatch {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let mut state = self.inner.lock_state();
+        state.in_flight = state.in_flight.saturating_sub(self.contents.len());
+        if !state.closed {
+            for content in self.contents.drain(..).rev() {
+                state.pending.push_front(content);
+            }
+        }
+        let wake = !state.closed && !state.running && !state.pending.is_empty();
+        drop(state);
+        if wake {
+            self.inner.wake.notify_one();
+        }
+    }
+}
 
 /// Cooperative stop signal for a single agent run.
 ///
@@ -96,9 +390,9 @@ pub struct AgentBuilder {
     mode: AgentMode,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
-    context_management_threshold_percent: u8,
-    context_managers: ContextManagerRegistry,
+    context_compactor: Option<Arc<dyn ContextCompactor>>,
     hooks: HookRegistry,
+    mailbox: Option<AgentMailbox>,
 }
 
 impl AgentBuilder {
@@ -113,9 +407,9 @@ impl AgentBuilder {
             mode: AgentMode::default(),
             generation_config: GenerationConfig::default(),
             max_context_tokens: None,
-            context_management_threshold_percent: DEFAULT_CONTEXT_MANAGEMENT_THRESHOLD_PERCENT,
-            context_managers: ContextManagerRegistry::default(),
+            context_compactor: None,
             hooks: HookRegistry::default(),
+            mailbox: None,
         }
     }
 
@@ -240,21 +534,19 @@ impl AgentBuilder {
         self
     }
 
-    /// Sets the successful-response usage percentage that activates the
-    /// registered context-manager chain. Values are clamped to `1..=100`.
-    pub fn context_management_threshold_percent(mut self, threshold_percent: u8) -> Self {
-        self.context_management_threshold_percent = threshold_percent.clamp(1, 100);
+    /// Selects the context-compaction implementation for this Agent.
+    ///
+    /// The library does not install one implicitly. Owners choose a strategy
+    /// when building the Agent and may replace it later while the Agent is
+    /// idle.
+    pub fn context_compactor(mut self, compactor: impl ContextCompactor + 'static) -> Self {
+        self.context_compactor = Some(Arc::new(compactor));
         self
     }
 
-    /// Registers one asynchronous context manager at the end of the chain.
-    pub fn context_manager(mut self, manager: impl ContextManager + 'static) -> Self {
-        self.context_managers.register(manager);
-        self
-    }
-
-    pub fn context_managers(mut self, managers: ContextManagerRegistry) -> Self {
-        self.context_managers.extend(managers);
+    /// Selects an already shared context-compaction implementation.
+    pub fn shared_context_compactor(mut self, compactor: Arc<dyn ContextCompactor>) -> Self {
+        self.context_compactor = Some(compactor);
         self
     }
 
@@ -267,6 +559,12 @@ impl AgentBuilder {
 
     pub fn hooks(mut self, hooks: HookRegistry) -> Self {
         self.hooks.extend(hooks);
+        self
+    }
+
+    /// Installs an optional external-message mailbox.
+    pub fn mailbox(mut self, mailbox: AgentMailbox) -> Self {
+        self.mailbox = Some(mailbox);
         self
     }
 
@@ -292,13 +590,15 @@ impl AgentBuilder {
             mode_control: AgentModeControl::new(self.mode),
             generation_config: self.generation_config,
             max_context_tokens: self.max_context_tokens,
-            context_management_threshold_percent: self.context_management_threshold_percent,
-            context_managers: self.context_managers,
+            context_compactor: self.context_compactor,
             last_usage: None,
             context_usage: None,
+            context_usage_message_count: None,
+            consecutive_auto_compaction_failures: 0,
             cumulative_usage: TokenUsage::default(),
             session: None,
             hooks: self.hooks,
+            mailbox: self.mailbox,
         }
     }
 }
@@ -316,13 +616,15 @@ pub struct Agent {
     mode_control: AgentModeControl,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
-    context_management_threshold_percent: u8,
-    context_managers: ContextManagerRegistry,
+    context_compactor: Option<Arc<dyn ContextCompactor>>,
     last_usage: Option<TokenUsage>,
     context_usage: Option<ContextUsage>,
+    context_usage_message_count: Option<usize>,
+    consecutive_auto_compaction_failures: u8,
     cumulative_usage: TokenUsage,
     session: Option<SessionBinding>,
     hooks: HookRegistry,
+    mailbox: Option<AgentMailbox>,
 }
 
 impl Agent {
@@ -337,6 +639,14 @@ impl Agent {
         self.tools.insert(tool.definition().name, tool);
     }
 
+    /// Installs or replaces this agent's mailbox while the agent is idle.
+    ///
+    /// Replacing an existing mailbox closes its sender. An `&mut Agent`
+    /// guarantees this cannot race an active prompt future.
+    pub fn set_mailbox(&mut self, mailbox: AgentMailbox) {
+        self.mailbox = Some(mailbox);
+    }
+
     pub fn subscribe(&mut self, listener: impl Fn(&AgentEvent) + Send + Sync + 'static) {
         self.listeners.push(Arc::new(listener));
     }
@@ -349,6 +659,8 @@ impl Agent {
         self.messages.clear();
         self.last_usage = None;
         self.context_usage = None;
+        self.context_usage_message_count = None;
+        self.consecutive_auto_compaction_failures = 0;
         if let Some(session) = &mut self.session {
             session.mark_replace_from(0);
         }
@@ -362,19 +674,29 @@ impl Agent {
         self.context_usage
     }
 
-    pub fn context_management_threshold_percent(&self) -> u8 {
-        self.context_management_threshold_percent
+    pub fn context_compactor_name(&self) -> Option<&'static str> {
+        self.context_compactor
+            .as_ref()
+            .map(|compactor| compactor.name())
     }
 
-    /// Changes the successful-response threshold used by subsequent turns.
-    /// Values are clamped to `1..=100`.
-    pub fn set_context_management_threshold_percent(&mut self, threshold_percent: u8) {
-        self.context_management_threshold_percent = threshold_percent.clamp(1, 100);
+    /// Replaces the selected compactor. The Agent owner must call this only
+    /// while no prompt or compaction future is borrowing the Agent.
+    pub fn set_context_compactor(&mut self, compactor: impl ContextCompactor + 'static) {
+        self.context_compactor = Some(Arc::new(compactor));
+        self.consecutive_auto_compaction_failures = 0;
     }
 
-    /// Registers a context manager on an already built agent.
-    pub fn add_context_manager(&mut self, manager: impl ContextManager + 'static) {
-        self.context_managers.register(manager);
+    /// Shared-object form of [`Agent::set_context_compactor`].
+    pub fn set_shared_context_compactor(&mut self, compactor: Arc<dyn ContextCompactor>) {
+        self.context_compactor = Some(compactor);
+        self.consecutive_auto_compaction_failures = 0;
+    }
+
+    /// Removes automatic and explicit compaction.
+    pub fn clear_context_compactor(&mut self) {
+        self.context_compactor = None;
+        self.consecutive_auto_compaction_failures = 0;
     }
 
     pub fn mode(&self) -> AgentMode {
@@ -484,6 +806,17 @@ impl Agent {
                 self.max_context_tokens
                     .map(|max_tokens| ContextUsage::from_usage(max_tokens, usage))
             });
+            // Provider usage includes the response assistant message, but not
+            // messages committed after it (for example tool results or a user
+            // prompt whose request failed before producing a response).  On
+            // restore, rebuild that boundary from the last assistant message
+            // so the next automatic-compaction check estimates the tail.
+            self.context_usage_message_count = self.context_usage.map(|_| {
+                self.messages
+                    .iter()
+                    .rposition(|message| message.role == Role::Assistant)
+                    .map_or(0, |index| index.saturating_add(1))
+            });
         }
 
         self.session = Some(SessionBinding {
@@ -510,6 +843,49 @@ impl Agent {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session.as_ref().map(|session| session.id.as_str())
+    }
+
+    /// Explicitly compacts the current transcript with the selected strategy.
+    pub async fn compact_context(
+        &mut self,
+        instructions: Option<String>,
+    ) -> Result<ContextCompactionOutcome, AgentError> {
+        match self
+            .compact_context_controlled(instructions, AgentRunControl::new())
+            .await?
+        {
+            ContextCompactionRunOutcome::Completed(outcome) => Ok(outcome),
+            ContextCompactionRunOutcome::Stopped => {
+                unreachable!("a compaction with a private control cannot be stopped")
+            }
+        }
+    }
+
+    /// Cancellable form of [`Agent::compact_context`].
+    pub async fn compact_context_controlled(
+        &mut self,
+        instructions: Option<String>,
+        control: AgentRunControl,
+    ) -> Result<ContextCompactionRunOutcome, AgentError> {
+        let trigger = ContextCompactionTrigger::Manual {
+            instructions: instructions.and_then(|instructions| {
+                let instructions = instructions.trim();
+                (!instructions.is_empty()).then(|| instructions.to_owned())
+            }),
+        };
+        match self.run_context_compactor(trigger, &control, None).await {
+            ContextCompactorRunOutcome::Completed(outcome) => {
+                Ok(ContextCompactionRunOutcome::Completed(outcome))
+            }
+            ContextCompactorRunOutcome::Stopped => Ok(ContextCompactionRunOutcome::Stopped),
+            ContextCompactorRunOutcome::NotRun => Err(ContextCompactionError::new(
+                "no context compactor is configured or the transcript is empty",
+            )
+            .into()),
+            ContextCompactorRunOutcome::Failed(message) => {
+                Err(ContextCompactionError::new(message).into())
+            }
+        }
     }
 
     pub async fn prompt(&mut self, prompt: impl Into<String>) -> Result<AgentRun, AgentError> {
@@ -553,110 +929,212 @@ impl Agent {
         content: Content,
         control: AgentRunControl,
     ) -> Result<AgentRunOutcome, AgentError> {
+        let mailbox_run = self.mailbox.as_ref().map(AgentMailbox::begin_run);
+        self.run_controlled(Some(content), control, mailbox_run, None)
+            .await
+    }
+
+    /// Runs pending mailbox messages without manufacturing an empty user
+    /// prompt. Returns `None` when the mailbox is absent, closed, already
+    /// running, or has no pending messages.
+    pub async fn prompt_from_mailbox(&mut self) -> Result<Option<AgentRun>, AgentError> {
+        match self
+            .prompt_from_mailbox_controlled(AgentRunControl::new())
+            .await?
+        {
+            Some(AgentRunOutcome::Completed(run)) => Ok(Some(run)),
+            Some(AgentRunOutcome::Stopped) => {
+                unreachable!("a run with a private control cannot be stopped")
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Controlled form of [`Agent::prompt_from_mailbox`].
+    pub async fn prompt_from_mailbox_controlled(
+        &mut self,
+        control: AgentRunControl,
+    ) -> Result<Option<AgentRunOutcome>, AgentError> {
+        let Some((mailbox_run, initial_batch)) = self
+            .mailbox
+            .as_ref()
+            .and_then(AgentMailbox::begin_pending_run)
+        else {
+            return Ok(None);
+        };
+        self.run_controlled(None, control, Some(mailbox_run), Some(initial_batch))
+            .await
+            .map(Some)
+    }
+
+    async fn run_controlled(
+        &mut self,
+        content: Option<Content>,
+        control: AgentRunControl,
+        mut mailbox_run: Option<MailboxRunGuard>,
+        initial_batch: Option<MailboxBatch>,
+    ) -> Result<AgentRunOutcome, AgentError> {
         let mut run_usage = TokenUsage::default();
-        let user_message = Message::user_content(content);
-        let mut run_messages = vec![user_message.clone()];
+        let mut run_messages = Vec::new();
         let mut checkpoint = AgentCheckpoint::capture(self);
 
         self.emit(AgentEvent::AgentStart);
         if control.is_stopped() {
             return self.finish_stopped_run(false).await;
         }
-        self.messages.push(user_message.clone());
-        self.commit_or_rollback(&checkpoint).await?;
-        checkpoint = AgentCheckpoint::capture(self);
-        self.emit(AgentEvent::MessageStart {
-            message: user_message.clone(),
-        });
-        self.emit(AgentEvent::MessageEnd {
-            message: user_message,
-        });
+
+        if let Some(content) = content {
+            let user_message = Message::user_content(content);
+            self.messages.push(user_message.clone());
+            self.commit_or_rollback(&checkpoint).await?;
+            checkpoint = AgentCheckpoint::capture(self);
+            self.emit(AgentEvent::MessageStart {
+                message: user_message.clone(),
+            });
+            self.emit(AgentEvent::MessageEnd {
+                message: user_message.clone(),
+            });
+            run_messages.push(user_message);
+        }
+        if let Some(batch) = initial_batch {
+            self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
+                .await?;
+        }
         if control.is_stopped() {
             return self.finish_stopped_run(false).await;
         }
 
         let mut turn = 0usize;
         loop {
+            if let Some(batch) = mailbox_run
+                .as_ref()
+                .and_then(MailboxRunGuard::claim_pending)
+            {
+                self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
+                    .await?;
+            }
             turn = turn.saturating_add(1);
             if control.is_stopped() {
                 return self.finish_stopped_run(false).await;
             }
             self.emit(AgentEvent::TurnStart { turn });
 
-            let mut turn_start = TurnStartContext {
-                turn,
-                request: ProviderRequest {
-                    messages: std::iter::once(Message::system(self.system_prompt.clone()))
-                        .chain(self.messages.iter().cloned())
-                        .collect(),
-                    tools: self.tool_definitions_for_mode(self.mode()),
-                    config: self.generation_config.clone(),
-                },
-            };
-            let turn_start_result = tokio::select! {
-                biased;
-                result = self.hooks.run_turn_start(&mut turn_start) => result,
-                _ = control.stopped() => {
+            let mut context_overflow_recovery_attempted = false;
+            let (response, request_mode, message_started) = loop {
+                if let Some(trigger) = self.automatic_compaction_trigger() {
+                    match self
+                        .run_context_compactor(trigger, &control, Some(&mut run_usage))
+                        .await
+                    {
+                        ContextCompactorRunOutcome::Stopped => {
+                            return self.finish_stopped_run(false).await;
+                        }
+                        ContextCompactorRunOutcome::Completed(_) => {
+                            checkpoint = AgentCheckpoint::capture(self);
+                        }
+                        ContextCompactorRunOutcome::NotRun
+                        | ContextCompactorRunOutcome::Failed(_) => {}
+                    }
+                }
+
+                let mut turn_start = TurnStartContext {
+                    turn,
+                    request: ProviderRequest {
+                        messages: std::iter::once(Message::system(self.system_prompt.clone()))
+                            .chain(self.messages.iter().cloned())
+                            .collect(),
+                        tools: self.tool_definitions_for_mode(self.mode()),
+                        config: self.generation_config.clone(),
+                    },
+                };
+                let turn_start_result = tokio::select! {
+                    biased;
+                    result = self.hooks.run_turn_start(&mut turn_start) => result,
+                    _ = control.stopped() => {
+                        return self.finish_stopped_run(false).await;
+                    }
+                };
+                if let Err(error) = turn_start_result {
+                    return Err(self.hook_failure(error));
+                }
+                if control.is_stopped() {
                     return self.finish_stopped_run(false).await;
                 }
-            };
-            if let Err(error) = turn_start_result {
-                return Err(self.hook_failure(error));
-            }
-            if control.is_stopped() {
-                return self.finish_stopped_run(false).await;
-            }
 
-            // Hooks may mutate the complete request, including reintroducing
-            // hidden tools. Re-apply the capability boundary after every hook
-            // and use the latest mode before the provider sees the request.
-            let request_mode = self.mode();
-            self.enforce_request_mode(&mut turn_start.request, request_mode);
+                // Hooks may mutate the complete request, including
+                // reintroducing hidden tools. Re-apply the capability boundary
+                // after every hook and use the latest mode before the provider
+                // sees the request.
+                let request_mode = self.mode();
+                self.enforce_request_mode(&mut turn_start.request, request_mode);
 
-            let mut stream = self.provider.stream(turn_start.request);
-            let mut message_started = false;
-            let mut received_model_output = false;
-            let response = loop {
-                let event = tokio::select! {
-                    biased;
-                    _ = control.stopped() => {
-                        return self.finish_stopped_run(message_started).await;
-                    }
-                    event = stream.next() => event,
-                };
-                match event {
-                    Some(Ok(ProviderEvent::Retry(event))) => {
-                        self.emit(AgentEvent::ProviderRetry { event });
-                    }
-                    Some(Ok(ProviderEvent::Delta(delta))) => {
-                        received_model_output |= delta_has_output(&delta);
-                        if !message_started {
-                            self.emit(AgentEvent::MessageStart {
-                                message: Message::assistant(None, Vec::new()),
-                            });
-                            message_started = true;
+                let mut stream = self.provider.stream(turn_start.request);
+                let mut message_started = false;
+                let mut received_model_output = false;
+                let response = loop {
+                    let event = tokio::select! {
+                        biased;
+                        _ = control.stopped() => {
+                            return self.finish_stopped_run(message_started).await;
                         }
-                        self.emit(AgentEvent::MessageUpdate { delta });
-                    }
-                    Some(Ok(ProviderEvent::Done(response))) => {
-                        if !message_started {
-                            self.emit(AgentEvent::MessageStart {
-                                message: Message::assistant(None, Vec::new()),
-                            });
-                            message_started = true;
+                        event = stream.next() => event,
+                    };
+                    match event {
+                        Some(Ok(ProviderEvent::Retry(event))) => {
+                            self.emit(AgentEvent::ProviderRetry { event });
                         }
-                        break response;
-                    }
-                    Some(Err(error)) => {
-                        if !received_model_output && error.is_context_length_exceeded() {
-                            let trigger = ContextManagementTrigger::ContextLengthExceeded {
-                                error: error.to_string(),
-                            };
-                            if self.run_context_managers(trigger, &control).await?
-                                == ContextManagerRunOutcome::Stopped
-                            {
-                                return self.finish_stopped_run(false).await;
+                        Some(Ok(ProviderEvent::Delta(delta))) => {
+                            received_model_output |= delta_has_output(&delta);
+                            if !message_started {
+                                self.emit(AgentEvent::MessageStart {
+                                    message: Message::assistant(None, Vec::new()),
+                                });
+                                message_started = true;
                             }
+                            self.emit(AgentEvent::MessageUpdate { delta });
+                        }
+                        Some(Ok(ProviderEvent::Done(response))) => {
+                            if !message_started {
+                                self.emit(AgentEvent::MessageStart {
+                                    message: Message::assistant(None, Vec::new()),
+                                });
+                                message_started = true;
+                            }
+                            break Ok(response);
+                        }
+                        Some(Err(error)) => break Err(error),
+                        None => {
+                            break Err(ProviderError::Stream(
+                                "provider stream ended without a final response".to_owned(),
+                            ));
+                        }
+                    }
+                };
+
+                match response {
+                    Ok(response) => break (response, request_mode, message_started),
+                    Err(error)
+                        if !received_model_output
+                            && error.is_context_length_exceeded()
+                            && !context_overflow_recovery_attempted =>
+                    {
+                        let before = self.messages.clone();
+                        let trigger = ContextCompactionTrigger::ContextLengthExceeded {
+                            error: error.to_string(),
+                        };
+                        let compactor_outcome = self
+                            .run_context_compactor(trigger, &control, Some(&mut run_usage))
+                            .await;
+                        if matches!(compactor_outcome, ContextCompactorRunOutcome::Stopped) {
+                            return self.finish_stopped_run(message_started).await;
+                        }
+                        context_overflow_recovery_attempted = true;
+                        if self.messages != before {
+                            if message_started {
+                                self.emit(AgentEvent::MessageAborted);
+                            }
+                            checkpoint = AgentCheckpoint::capture(self);
+                            continue;
                         }
                         self.emit(AgentEvent::Error {
                             message: error.to_string(),
@@ -664,10 +1142,7 @@ impl Agent {
                         self.emit_agent_end();
                         return Err(error.into());
                     }
-                    None => {
-                        let error = ProviderError::Stream(
-                            "provider stream ended without a final response".to_owned(),
-                        );
+                    Err(error) => {
                         self.emit(AgentEvent::Error {
                             message: error.to_string(),
                         });
@@ -742,6 +1217,8 @@ impl Agent {
                 checkpoint = AgentCheckpoint::capture(self);
 
                 if outcome.stopped || control.is_stopped() {
+                    self.context_usage_message_count =
+                        response_usage.map(|_| journal_start.saturating_add(1));
                     self.emit_committed_turn(turn, &assistant_message, &results, response_usage);
                     return self.finish_stopped_run(false).await;
                 }
@@ -786,6 +1263,9 @@ impl Agent {
                 self.commit_or_rollback(&checkpoint).await?;
             }
 
+            self.context_usage_message_count =
+                response_usage.map(|_| journal_start.saturating_add(1));
+
             self.emit_committed_turn(
                 turn,
                 &turn_end.message,
@@ -800,15 +1280,17 @@ impl Agent {
                 return self.finish_stopped_run(false).await;
             }
 
-            if let Some(trigger) = self.usage_context_management_trigger()
-                && self.run_context_managers(trigger, &control).await?
-                    == ContextManagerRunOutcome::Stopped
-            {
-                return self.finish_stopped_run(false).await;
-            }
             checkpoint = AgentCheckpoint::capture(self);
 
             if turn_end.message.tool_calls.is_empty() {
+                let pending = mailbox_run
+                    .as_mut()
+                    .and_then(MailboxRunGuard::claim_pending_or_finish);
+                if let Some(batch) = pending {
+                    self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
+                        .await?;
+                    continue;
+                }
                 self.emit_agent_end();
                 return Ok(AgentRunOutcome::Completed(AgentRun {
                     final_message,
@@ -819,6 +1301,34 @@ impl Agent {
                 }));
             }
         }
+    }
+
+    async fn commit_mailbox_batch(
+        &mut self,
+        batch: MailboxBatch,
+        run_messages: &mut Vec<Message>,
+        checkpoint: &mut AgentCheckpoint,
+    ) -> Result<(), AgentError> {
+        let messages = batch
+            .contents
+            .iter()
+            .cloned()
+            .map(Message::user_content)
+            .collect::<Vec<_>>();
+        self.messages.extend(messages.iter().cloned());
+        self.commit_or_rollback(checkpoint).await?;
+        batch.commit();
+        *checkpoint = AgentCheckpoint::capture(self);
+        for message in messages {
+            self.emit(AgentEvent::MessageStart {
+                message: message.clone(),
+            });
+            self.emit(AgentEvent::MessageEnd {
+                message: message.clone(),
+            });
+            run_messages.push(message);
+        }
+        Ok(())
     }
 
     fn tool_definitions_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
@@ -853,65 +1363,148 @@ impl Agent {
         }
     }
 
-    fn usage_context_management_trigger(&self) -> Option<ContextManagementTrigger> {
-        if self.context_managers.is_empty() {
+    fn automatic_compaction_trigger(&self) -> Option<ContextCompactionTrigger> {
+        if self.context_compactor.is_none() || self.consecutive_auto_compaction_failures >= 3 {
             return None;
         }
-        let usage = self.context_usage?;
-        threshold_reached(usage, self.context_management_threshold_percent).then_some(
-            ContextManagementTrigger::UsageThreshold {
-                usage,
-                threshold_percent: self.context_management_threshold_percent,
-            },
-        )
+        let mut usage = self.context_usage?;
+        if let Some(included_messages) = self.context_usage_message_count {
+            let included_messages = included_messages.min(self.messages.len());
+            let added_tokens = estimate_messages_tokens(&self.messages[included_messages..]);
+            usage.used_tokens = usage.used_tokens.saturating_add(added_tokens);
+            usage.remaining_tokens = usage.max_tokens.saturating_sub(usage.used_tokens);
+        }
+        Some(ContextCompactionTrigger::Automatic { usage })
     }
 
-    async fn run_context_managers(
+    async fn run_context_compactor(
         &mut self,
-        trigger: ContextManagementTrigger,
+        trigger: ContextCompactionTrigger,
         control: &AgentRunControl,
-    ) -> Result<ContextManagerRunOutcome, AgentError> {
-        if self.context_managers.is_empty() {
-            return Ok(ContextManagerRunOutcome::Completed);
+        run_usage: Option<&mut TokenUsage>,
+    ) -> ContextCompactorRunOutcome {
+        let Some(compactor) = self.context_compactor.clone() else {
+            return ContextCompactorRunOutcome::NotRun;
+        };
+        let request = ContextCompactionRequest {
+            trigger: trigger.clone(),
+            system_prompt: self.system_prompt.clone(),
+            messages: self.messages.clone(),
+            max_context_tokens: self.max_context_tokens,
+            generation_config: self.generation_config.clone(),
+        };
+        if !compactor.should_compact(&request) {
+            return ContextCompactorRunOutcome::NotRun;
         }
+
+        let compactor_name = compactor.name().to_owned();
+        let prompt = compactor.prompt(&request);
+        self.emit(AgentEvent::ContextCompactionStarted {
+            trigger: trigger.clone(),
+            compactor: compactor_name.clone(),
+            prompt: prompt.clone(),
+        });
 
         let checkpoint = AgentCheckpoint::capture(self);
-        let managers = self.context_managers.clone();
-        let result = {
-            let mut context = ContextManagementContext::new(
-                trigger,
-                &self.system_prompt,
-                self.max_context_tokens,
-                &mut self.messages,
-            );
-            tokio::select! {
-                biased;
-                result = managers.run(&mut context) => Some(result),
-                _ = control.stopped() => None,
-            }
+        let result = tokio::select! {
+            biased;
+            result = compactor.compact(self.provider.as_ref(), request, prompt) => Some(result),
+            _ = control.stopped() => None,
         };
-
         let Some(result) = result else {
-            checkpoint.restore(self);
-            return Ok(ContextManagerRunOutcome::Stopped);
+            let message = "context compaction was stopped".to_owned();
+            self.emit(AgentEvent::ContextCompactionFailed {
+                trigger,
+                compactor: compactor_name,
+                message,
+            });
+            return ContextCompactorRunOutcome::Stopped;
         };
-        if let Err(error) = result {
-            checkpoint.restore(self);
-            return Err(self.hook_failure(error));
-        }
-        if let Err(error) = validate_context_transcript(&self.messages) {
-            checkpoint.restore(self);
-            return Err(self.hook_failure(error));
-        }
-
-        if let Some(changed_from) = first_changed_message(&checkpoint.messages, &self.messages) {
-            if let Some(session) = &mut self.session {
-                session.mark_replace_from(changed_from);
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.record_context_compaction_failure(&trigger);
+                let message = error.to_string();
+                self.emit(AgentEvent::ContextCompactionFailed {
+                    trigger,
+                    compactor: compactor_name,
+                    message: message.clone(),
+                });
+                return ContextCompactorRunOutcome::Failed(message);
             }
-            self.commit_or_rollback(&checkpoint).await?;
+        };
+
+        if let Err(error) = validate_context_transcript(&plan.messages) {
+            self.record_context_compaction_failure(&trigger);
+            let message = format!("context compactor returned an invalid transcript: {error}");
+            self.emit(AgentEvent::ContextCompactionFailed {
+                trigger,
+                compactor: compactor_name,
+                message: message.clone(),
+            });
+            return ContextCompactorRunOutcome::Failed(message);
         }
 
-        Ok(ContextManagerRunOutcome::Completed)
+        let before_message_count = self.messages.len();
+        let changed_from = first_changed_message(&self.messages, &plan.messages)
+            .unwrap_or_else(|| self.messages.len().min(plan.messages.len()));
+        self.messages = plan.messages;
+        self.last_usage = None;
+        self.context_usage = None;
+        self.context_usage_message_count = None;
+        self.consecutive_auto_compaction_failures = 0;
+        if let Some(usage) = plan.usage {
+            self.cumulative_usage += usage;
+        }
+        if let Some(session) = &mut self.session {
+            session.mark_replace_from(changed_from);
+        }
+        if let Err(error) = self.synchronize_session().await {
+            checkpoint.restore(self);
+            self.record_context_compaction_failure(&trigger);
+            let message = format!("could not persist compacted context: {error}");
+            self.emit(AgentEvent::ContextCompactionFailed {
+                trigger,
+                compactor: compactor_name,
+                message: message.clone(),
+            });
+            return ContextCompactorRunOutcome::Failed(message);
+        }
+
+        if let (Some(run_usage), Some(usage)) = (run_usage, plan.usage) {
+            *run_usage += usage;
+        }
+        let replacement = self.messages[changed_from..].to_vec();
+        let outcome = ContextCompactionOutcome {
+            compactor: compactor_name.clone(),
+            trigger: trigger.clone(),
+            before_message_count,
+            after_message_count: self.messages.len(),
+            changed_from,
+            replacement: replacement.clone(),
+            summary: plan.summary.clone(),
+            usage: plan.usage,
+            estimated_context_tokens: plan.estimated_context_tokens,
+        };
+        self.emit(AgentEvent::ContextCompactionCompleted {
+            trigger,
+            compactor: compactor_name,
+            before_message_count,
+            after_message_count: self.messages.len(),
+            changed_from,
+            replacement,
+            summary: plan.summary,
+            usage: plan.usage,
+            estimated_context_tokens: plan.estimated_context_tokens,
+        });
+        ContextCompactorRunOutcome::Completed(outcome)
+    }
+
+    fn record_context_compaction_failure(&mut self, trigger: &ContextCompactionTrigger) {
+        if matches!(trigger, ContextCompactionTrigger::Automatic { .. }) {
+            self.consecutive_auto_compaction_failures =
+                self.consecutive_auto_compaction_failures.saturating_add(1);
+        }
     }
 
     async fn synchronize_session_or_end(&mut self) -> Result<(), AgentError> {
@@ -1318,9 +1911,10 @@ struct ToolExecutionOutcome {
     stopped: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContextManagerRunOutcome {
-    Completed,
+enum ContextCompactorRunOutcome {
+    NotRun,
+    Completed(ContextCompactionOutcome),
+    Failed(String),
     Stopped,
 }
 
@@ -1393,6 +1987,8 @@ struct AgentCheckpoint {
     messages: Vec<Message>,
     last_usage: Option<TokenUsage>,
     context_usage: Option<ContextUsage>,
+    context_usage_message_count: Option<usize>,
+    consecutive_auto_compaction_failures: u8,
     cumulative_usage: TokenUsage,
     mode: AgentMode,
 }
@@ -1403,6 +1999,8 @@ impl AgentCheckpoint {
             messages: agent.messages.clone(),
             last_usage: agent.last_usage,
             context_usage: agent.context_usage,
+            context_usage_message_count: agent.context_usage_message_count,
+            consecutive_auto_compaction_failures: agent.consecutive_auto_compaction_failures,
             cumulative_usage: agent.cumulative_usage,
             mode: agent.mode(),
         }
@@ -1412,6 +2010,8 @@ impl AgentCheckpoint {
         agent.messages.clone_from(&self.messages);
         agent.last_usage = self.last_usage;
         agent.context_usage = self.context_usage;
+        agent.context_usage_message_count = self.context_usage_message_count;
+        agent.consecutive_auto_compaction_failures = self.consecutive_auto_compaction_failures;
         agent.cumulative_usage = self.cumulative_usage;
         agent.mode_control.restore_safely(self.mode);
     }
@@ -1441,43 +2041,43 @@ fn validate_protocol_turn(assistant: &Message, tool_results: &[Message]) -> Resu
     Ok(())
 }
 
-fn validate_context_transcript(messages: &[Message]) -> Result<(), HookError> {
+fn validate_context_transcript(messages: &[Message]) -> Result<(), ContextCompactionError> {
     let mut pending = VecDeque::new();
     for message in messages {
         match &message.role {
             Role::Assistant => {
                 if !pending.is_empty() {
-                    return Err(HookError::new(
-                        "context manager left an assistant message before prior tool calls were paired",
+                    return Err(ContextCompactionError::new(
+                        "context transcript contains an assistant message before prior tool calls were paired",
                     ));
                 }
                 pending.extend(message.tool_calls.iter().map(|call| call.id.as_str()));
             }
             Role::Tool => {
                 let Some(expected) = pending.pop_front() else {
-                    return Err(HookError::new(
-                        "context manager left a tool result without a preceding assistant tool call",
+                    return Err(ContextCompactionError::new(
+                        "context transcript contains a tool result without a preceding assistant tool call",
                     ));
                 };
                 if message.tool_call_id.as_deref() != Some(expected) {
-                    return Err(HookError::new(format!(
-                        "context manager left tool result {:?}, expected call {:?}",
+                    return Err(ContextCompactionError::new(format!(
+                        "context transcript contains tool result {:?}, expected call {:?}",
                         message.tool_call_id, expected
                     )));
                 }
             }
             Role::System | Role::User => {
                 if !pending.is_empty() {
-                    return Err(HookError::new(
-                        "context manager split an assistant tool-call batch from its results",
+                    return Err(ContextCompactionError::new(
+                        "context transcript splits an assistant tool-call batch from its results",
                     ));
                 }
             }
         }
     }
     if !pending.is_empty() {
-        return Err(HookError::new(
-            "context manager left assistant tool calls without matching results",
+        return Err(ContextCompactionError::new(
+            "context transcript contains assistant tool calls without matching results",
         ));
     }
     Ok(())
@@ -1661,6 +2261,18 @@ mod tests {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
     }
 
+    struct ScriptedProvider {
+        results: Mutex<VecDeque<Result<ProviderResponse, ProviderError>>>,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    struct PausedMailboxProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        first_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+        calls: AtomicUsize,
+    }
+
     impl LlmProvider for RecordingQueueProvider {
         fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
             self.requests.lock().unwrap().push(request);
@@ -1670,6 +2282,45 @@ mod tests {
             Box::pin(futures_util::stream::iter([
                 response.map(ProviderEvent::Done)
             ]))
+        }
+    }
+
+    impl LlmProvider for ScriptedProvider {
+        fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
+            self.requests.lock().unwrap().push(request);
+            let result = self.results.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(ProviderError::InvalidResponse(
+                    "scripted provider queue is empty".to_owned(),
+                ))
+            });
+            Box::pin(futures_util::stream::iter(
+                [result.map(ProviderEvent::Done)],
+            ))
+        }
+    }
+
+    impl LlmProvider for PausedMailboxProvider {
+        fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
+            self.requests.lock().unwrap().push(request);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let first_started = Arc::clone(&self.first_started);
+                let release_first = Arc::clone(&self.release_first);
+                Box::pin(async_stream::stream! {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                    yield Ok(ProviderEvent::Done(ProviderResponse {
+                        message: AssistantMessage::text("first response"),
+                        usage: None,
+                    }));
+                })
+            } else {
+                Box::pin(futures_util::stream::iter([Ok(ProviderEvent::Done(
+                    ProviderResponse {
+                        message: AssistantMessage::text("response after mailbox"),
+                        usage: None,
+                    },
+                ))]))
+            }
         }
     }
 
@@ -1752,76 +2403,8 @@ mod tests {
         started: Arc<Notify>,
     }
 
-    struct ReplacingContextManager {
-        triggers: Arc<Mutex<Vec<ContextManagementTrigger>>>,
-        replacement: &'static str,
-        continue_chain: bool,
-    }
-
-    struct CountingContextManager {
-        calls: Arc<AtomicUsize>,
-    }
-
-    struct InvalidContextManager;
-
-    struct HangingContextManager {
-        started: Arc<Notify>,
-    }
-
     struct ContextOverflowProvider {
         emit_partial_delta: bool,
-    }
-
-    #[async_trait]
-    impl ContextManager for ReplacingContextManager {
-        async fn manage_context(
-            &self,
-            context: &mut ContextManagementContext<'_>,
-        ) -> Result<bool, HookError> {
-            tokio::task::yield_now().await;
-            self.triggers
-                .lock()
-                .unwrap()
-                .push(context.trigger().clone());
-            context.replace_messages(vec![Message::user(self.replacement)]);
-            Ok(self.continue_chain)
-        }
-    }
-
-    #[async_trait]
-    impl ContextManager for CountingContextManager {
-        async fn manage_context(
-            &self,
-            _context: &mut ContextManagementContext<'_>,
-        ) -> Result<bool, HookError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(true)
-        }
-    }
-
-    #[async_trait]
-    impl ContextManager for InvalidContextManager {
-        async fn manage_context(
-            &self,
-            context: &mut ContextManagementContext<'_>,
-        ) -> Result<bool, HookError> {
-            context
-                .messages_mut()
-                .push(Message::tool("orphan", "invalid orphan result"));
-            Ok(false)
-        }
-    }
-
-    #[async_trait]
-    impl ContextManager for HangingContextManager {
-        async fn manage_context(
-            &self,
-            context: &mut ContextManagementContext<'_>,
-        ) -> Result<bool, HookError> {
-            context.replace_messages(vec![Message::user("uncommitted manager rewrite")]);
-            self.started.notify_one();
-            std::future::pending().await
-        }
     }
 
     impl LlmProvider for ContextOverflowProvider {
@@ -3242,217 +3825,360 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_manager_rewrites_and_persists_context_after_threshold_response() {
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::from([ProviderResponse {
-                message: AssistantMessage::text("answer"),
-                usage: Some(TokenUsage::new(75, 10, 0)),
-            }])),
+    async fn default_compactor_runs_before_the_next_provider_request() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("first answer"),
+                    usage: Some(TokenUsage::with_total(179_000, 1_000, 180_000, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text(
+                        "<analysis>draft</analysis><summary>The second request is pending.</summary>",
+                    ),
+                    usage: Some(TokenUsage::new(100, 10, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("second answer"),
+                    usage: Some(TokenUsage::new(1_000, 100, 0)),
+                }),
+            ])),
+            requests: Arc::clone(&requests),
         };
-        let triggers = Arc::new(Mutex::new(Vec::new()));
-        let storage = RecordingStorage::default();
-        let observed = storage.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
         let mut agent = Agent::builder(provider)
-            .max_context_tokens(100)
-            .context_management_threshold_percent(80)
-            .context_manager(ReplacingContextManager {
-                triggers: Arc::clone(&triggers),
-                replacement: "summary",
-                continue_chain: false,
-            })
-            .build()
-            .with_session("context-threshold", storage)
-            .await
-            .unwrap();
+            .model("test-model")
+            .max_tokens(20_000)
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
 
-        let result = agent.prompt("question").await.unwrap();
+        agent.prompt("first request").await.unwrap();
+        let second = agent.prompt("second request").await.unwrap();
 
-        assert_eq!(agent.messages(), [Message::user("summary")]);
+        assert_eq!(second.text(), Some("second answer"));
+        assert_eq!(second.run_usage.total_tokens, 1_210);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].tools.is_empty());
         assert_eq!(
-            result.new_messages,
-            [
-                Message::user("question"),
-                Message::assistant(Some(Content::text("answer")), Vec::new()),
-            ]
-        );
-        assert!(matches!(
-            triggers.lock().unwrap().as_slice(),
-            [ContextManagementTrigger::UsageThreshold {
-                usage: ContextUsage {
-                    used_tokens: 85,
-                    ..
-                },
-                threshold_percent: 80,
-            }]
-        ));
-        assert_eq!(
-            *observed.operations.lock().unwrap(),
-            [
-                SaveOperation::Incremental(0),
-                SaveOperation::Incremental(1),
-                SaveOperation::ReplaceFrom(0),
-            ]
+            requests[1].config.reasoning_effort,
+            Some(ReasoningEffort::None)
         );
         assert_eq!(
-            observed
-                .snapshots
-                .lock()
-                .unwrap()
+            requests[1].messages.first().unwrap().text_content(),
+            Some("You are a helpful AI assistant tasked with summarizing conversations.")
+        );
+        assert!(
+            requests[1]
+                .messages
                 .last()
                 .unwrap()
-                .messages
-                .as_slice(),
-            [Message::user("summary")].as_slice()
+                .text_content()
+                .unwrap()
+                .contains("Primary request and intent")
+        );
+        assert_eq!(
+            requests[2].messages[1].text_content(),
+            Some("Conversation compacted")
+        );
+        assert!(
+            requests[2].messages[2]
+                .text_content()
+                .unwrap()
+                .contains("The second request is pending")
+        );
+        drop(requests);
+
+        assert_eq!(agent.messages().len(), 3);
+        assert_eq!(agent.messages()[0].role, Role::System);
+        assert_eq!(agent.messages()[2].text_content(), Some("second answer"));
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompactionStarted {
+                trigger: ContextCompactionTrigger::Automatic { .. },
+                compactor,
+                ..
+            } if compactor == "default"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompactionCompleted {
+                changed_from: 0,
+                replacement,
+                ..
+            } if replacement.len() == 2
+        )));
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_stops_after_three_consecutive_failures() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let high_usage = || Some(TokenUsage::with_total(179_000, 1_000, 180_000, 0));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer 1"),
+                    usage: high_usage(),
+                }),
+                Err(ProviderError::Stream("summary failure 1".to_owned())),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer 2"),
+                    usage: high_usage(),
+                }),
+                Err(ProviderError::Stream("summary failure 2".to_owned())),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer 3"),
+                    usage: high_usage(),
+                }),
+                Err(ProviderError::Stream("summary failure 3".to_owned())),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer 4"),
+                    usage: high_usage(),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer 5"),
+                    usage: high_usage(),
+                }),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut agent = Agent::builder(provider)
+            .max_tokens(20_000)
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
+
+        for prompt in 1..=5 {
+            agent.prompt(format!("request {prompt}")).await.unwrap();
+        }
+
+        assert_eq!(requests.lock().unwrap().len(), 8);
+        assert_eq!(agent.consecutive_auto_compaction_failures, 3);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ContextCompactionStarted { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ContextCompactionFailed { .. }))
+                .count(),
+            3
         );
     }
 
     #[tokio::test]
-    async fn context_manager_does_not_run_below_the_usage_threshold() {
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::from([ProviderResponse {
-                message: AssistantMessage::text("answer"),
-                usage: Some(TokenUsage::new(70, 9, 0)),
-            }])),
+    async fn explicit_compaction_persists_replacement_and_announces_prompt() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("answer"),
+                    usage: Some(TokenUsage::new(100, 10, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text(
+                        "<analysis>discard</analysis><summary>Keep storage invariants.</summary>",
+                    ),
+                    usage: Some(TokenUsage::new(50, 5, 0)),
+                }),
+            ])),
+            requests,
         };
-        let calls = Arc::new(AtomicUsize::new(0));
+        let storage = InMemorySessionStorage::new();
+        let observed_storage = storage.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
         let mut agent = Agent::builder(provider)
-            .max_context_tokens(100)
-            .context_management_threshold_percent(80)
-            .context_manager(CountingContextManager {
-                calls: Arc::clone(&calls),
-            })
-            .build();
-
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build()
+            .with_session("manual-compaction", storage)
+            .await
+            .unwrap();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
         agent.prompt("question").await.unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(agent.messages().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn invalid_context_manager_rewrite_is_rejected_and_rolled_back() {
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::from([ProviderResponse {
-                message: AssistantMessage::text("answer"),
-                usage: Some(TokenUsage::new(75, 10, 0)),
-            }])),
-        };
-        let storage = RecordingStorage::default();
-        let observed = storage.clone();
-        let mut agent = Agent::builder(provider)
-            .max_context_tokens(100)
-            .context_manager(InvalidContextManager)
-            .build()
-            .with_session("invalid-context-rewrite", storage)
+        let outcome = agent
+            .compact_context(Some("Focus on storage invariants".to_owned()))
             .await
             .unwrap();
 
-        let error = agent.prompt("question").await.unwrap_err();
+        assert_eq!(outcome.compactor, "default");
+        assert_eq!(outcome.changed_from, 0);
+        assert_eq!(outcome.replacement, agent.messages());
+        assert!(agent.last_usage().is_none());
+        assert!(agent.context_usage().is_none());
+        let snapshot = observed_storage
+            .load("manual-compaction")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.messages, agent.messages());
+        assert!(snapshot.last_usage.is_none());
+        assert_eq!(snapshot.cumulative_usage.total_tokens, 165);
 
-        assert!(matches!(error, AgentError::Hook(_)));
-        assert_eq!(
-            agent.messages(),
-            [
-                Message::user("question"),
-                Message::assistant(Some(Content::text("answer")), Vec::new()),
-            ]
-        );
-        assert_eq!(
-            *observed.operations.lock().unwrap(),
-            [SaveOperation::Incremental(0), SaveOperation::Incremental(1)]
-        );
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompactionStarted {
+                trigger: ContextCompactionTrigger::Manual { instructions },
+                prompt,
+                ..
+            } if instructions.as_deref() == Some("Focus on storage invariants")
+                && prompt.contains("Focus on storage invariants")
+        )));
     }
 
     #[tokio::test]
-    async fn stop_interrupts_an_async_context_manager_and_rolls_back_its_rewrite() {
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::from([ProviderResponse {
-                message: AssistantMessage::text("answer"),
-                usage: Some(TokenUsage::new(75, 10, 0)),
-            }])),
+    async fn failed_compaction_persistence_restores_the_live_transcript() {
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("durable answer"),
+                    usage: Some(TokenUsage::new(100, 10, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text(
+                        "<analysis>discard</analysis><summary>replacement</summary>",
+                    ),
+                    usage: Some(TokenUsage::new(50, 5, 0)),
+                }),
+            ])),
+            requests: Arc::new(Mutex::new(Vec::new())),
         };
-        let started = Arc::new(Notify::new());
-        let control = AgentRunControl::new();
-        let stop = control.clone();
-        let manager_started = Arc::clone(&started);
-        let task = tokio::spawn(async move {
-            let mut agent = Agent::builder(provider)
-                .max_context_tokens(100)
-                .context_manager(HangingContextManager {
-                    started: manager_started,
-                })
-                .build();
-            let outcome = agent
-                .prompt_content_controlled(Content::text("question"), control)
-                .await
-                .unwrap();
-            (agent, outcome)
-        });
+        let storage = FailOnSaveStorage::new(3);
+        let observed_storage = storage.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut agent = Agent::builder(provider)
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build()
+            .with_session("failed-manual-compaction", storage)
+            .await
+            .unwrap();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
+        agent.prompt("durable question").await.unwrap();
+        let messages_before = agent.messages().to_vec();
+        let usage_before = agent.last_usage();
+        let cumulative_before = agent.cumulative_usage();
 
-        started.notified().await;
-        stop.stop();
-        let (agent, outcome) = task.await.unwrap();
+        let error = agent.compact_context(None).await.unwrap_err();
 
-        assert_eq!(outcome, AgentRunOutcome::Stopped);
+        assert!(matches!(error, AgentError::ContextCompaction(_)));
+        assert_eq!(agent.messages(), messages_before);
+        assert_eq!(agent.last_usage(), usage_before);
+        assert_eq!(agent.cumulative_usage(), cumulative_before);
         assert_eq!(
-            agent.messages(),
-            [
-                Message::user("question"),
-                Message::assistant(Some(Content::text("answer")), Vec::new()),
-            ]
+            observed_storage.snapshot().unwrap().messages,
+            messages_before
+        );
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompactionFailed { message, .. }
+                if message.contains("could not persist compacted context")
+        )));
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_the_request_once() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Err(ProviderError::context_length_exceeded("too much context")),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text(
+                        "<analysis>draft</analysis><summary>Resume overflow request.</summary>",
+                    ),
+                    usage: Some(TokenUsage::new(80, 8, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("recovered"),
+                    usage: Some(TokenUsage::new(90, 9, 0)),
+                }),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build();
+
+        let run = agent.prompt("oversized request").await.unwrap();
+
+        assert_eq!(run.text(), Some("recovered"));
+        assert_eq!(run.run_usage.total_tokens, 187);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            agent.messages()[0].text_content(),
+            Some("Conversation compacted")
+        );
+        assert_eq!(
+            agent.messages().last().unwrap().text_content(),
+            Some("recovered")
         );
     }
 
     #[tokio::test]
-    async fn context_length_error_before_output_runs_managers_and_persists_changes() {
-        let triggers = Arc::new(Mutex::new(Vec::new()));
-        let storage = RecordingStorage::default();
-        let observed = storage.clone();
-        let mut agent = Agent::builder(ContextOverflowProvider {
-            emit_partial_delta: false,
-        })
-        .max_context_tokens(100)
-        .context_manager(ReplacingContextManager {
-            triggers: Arc::clone(&triggers),
-            replacement: "compacted after overflow",
-            continue_chain: false,
-        })
-        .build()
-        .with_session("context-overflow", storage)
-        .await
-        .unwrap();
+    async fn second_context_overflow_is_not_compacted_in_a_loop() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Err(ProviderError::context_length_exceeded("first overflow")),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text(
+                        "<analysis>draft</analysis><summary>Small replacement.</summary>",
+                    ),
+                    usage: None,
+                }),
+                Err(ProviderError::context_length_exceeded("second overflow")),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .max_context_tokens(200_000)
+            .context_compactor(crate::DefaultContextCompactor::default())
+            .build();
 
-        let error = agent.prompt("oversized question").await.unwrap_err();
+        let error = agent.prompt("oversized request").await.unwrap_err();
 
         assert!(matches!(
             error,
-            AgentError::Provider(ProviderError::ContextLengthExceeded { .. })
+            AgentError::Provider(ProviderError::ContextLengthExceeded { message })
+                if message.contains("second overflow")
         ));
-        assert!(matches!(
-            triggers.lock().unwrap().as_slice(),
-            [ContextManagementTrigger::ContextLengthExceeded { error }]
-                if error.contains("maximum context length exceeded")
-        ));
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(agent.messages().len(), 2);
         assert_eq!(
-            agent.messages(),
-            [Message::user("compacted after overflow")]
-        );
-        assert_eq!(
-            *observed.operations.lock().unwrap(),
-            [SaveOperation::Incremental(0), SaveOperation::ReplaceFrom(0),]
+            agent.messages()[0].text_content(),
+            Some("Conversation compacted")
         );
     }
 
     #[tokio::test]
-    async fn context_length_error_after_partial_output_does_not_run_managers() {
-        let calls = Arc::new(AtomicUsize::new(0));
+    async fn context_length_error_after_partial_output_does_not_compact() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
         let mut agent = Agent::builder(ContextOverflowProvider {
             emit_partial_delta: true,
         })
-        .context_manager(CountingContextManager {
-            calls: Arc::clone(&calls),
-        })
+        .max_context_tokens(100)
+        .context_compactor(crate::DefaultContextCompactor::default())
         .build();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
 
         let error = agent.prompt("question").await.unwrap_err();
 
@@ -3460,7 +4186,13 @@ mod tests {
             error,
             AgentError::Provider(ProviderError::ContextLengthExceeded { .. })
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ContextCompactionStarted { .. }))
+        );
         assert_eq!(agent.messages(), [Message::user("question")]);
     }
 
@@ -4096,7 +4828,197 @@ mod tests {
         assert_eq!(agent.messages()[0].text_content(), Some("before restart"));
         assert_eq!(agent.last_usage().unwrap().total_tokens, 120);
         assert_eq!(agent.context_usage().unwrap().remaining_tokens, 880);
+        assert_eq!(agent.context_usage_message_count, Some(0));
         assert_eq!(agent.cumulative_usage().total_tokens, 300);
         assert_eq!(agent.mode(), AgentMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn mailbox_is_bounded_and_closes_the_running_to_idle_race() {
+        let (sender, mailbox) = AgentMailbox::bounded(2);
+        assert_eq!(sender.capacity(), 2);
+        assert_eq!(
+            sender.send("first").unwrap(),
+            AgentMailboxDelivery::WakeRequired
+        );
+
+        let (mut run, first_batch) = mailbox.begin_pending_run().unwrap();
+        assert!(sender.is_running());
+        assert_eq!(sender.pending_len(), 1);
+        assert_eq!(sender.send("second").unwrap(), AgentMailboxDelivery::Queued);
+        assert_eq!(
+            sender.send("overflow").unwrap_err(),
+            AgentMailboxSendError::Full { capacity: 2 }
+        );
+
+        first_batch.commit();
+        run.claim_pending_or_finish().unwrap().commit();
+        assert!(run.claim_pending_or_finish().is_none());
+        assert!(!sender.is_running());
+        assert_eq!(sender.pending_len(), 0);
+        assert_eq!(
+            sender.send("after idle").unwrap(),
+            AgentMailboxDelivery::WakeRequired
+        );
+        assert!(sender.wait_for_wake().await);
+
+        sender.close();
+        assert!(sender.is_closed());
+        assert!(!sender.wait_for_wake().await);
+        assert_eq!(
+            sender.send("too late").unwrap_err(),
+            AgentMailboxSendError::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_messages_join_the_next_safe_round_and_are_persisted_and_emitted() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let provider = PausedMailboxProvider {
+            requests: Arc::clone(&requests),
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            calls: AtomicUsize::new(0),
+        };
+        let (sender, mailbox) = AgentMailbox::bounded(4);
+        let storage = InMemorySessionStorage::new();
+        let events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+        let observed_events = Arc::clone(&events);
+        let mut agent = Agent::builder(provider)
+            .mailbox(mailbox)
+            .build()
+            .with_session("mailbox-safe-round", storage.clone())
+            .await
+            .unwrap();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
+
+        let task = tokio::spawn(async move {
+            let result = agent.prompt("initial prompt").await;
+            (agent, result)
+        });
+        first_started.notified().await;
+
+        assert!(sender.is_running());
+        assert_eq!(
+            sender.send("steer while streaming").unwrap(),
+            AgentMailboxDelivery::Queued
+        );
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                !requests[0]
+                    .messages
+                    .iter()
+                    .any(|message| message.text_content() == Some("steer while streaming"))
+            );
+        }
+
+        release_first.notify_one();
+        let (mut agent, run) = task.await.unwrap();
+        let run = run.unwrap();
+        assert_eq!(run.turns, 2);
+        assert!(!sender.is_running());
+        assert_eq!(sender.pending_len(), 0);
+
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                !requests[0]
+                    .messages
+                    .iter()
+                    .any(|message| message.text_content() == Some("steer while streaming"))
+            );
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .any(|message| message.text_content() == Some("steer while streaming"))
+            );
+        }
+        let snapshot = storage.load("mailbox-safe-round").await.unwrap().unwrap();
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.text_content() == Some("steer while streaming"))
+        );
+        let emitted = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if message.role == Role::User
+                            && message.text_content() == Some("steer while streaming")
+                )
+            })
+            .count();
+        assert_eq!(emitted, 1);
+
+        assert_eq!(
+            sender.send("follow-up from idle").unwrap(),
+            AgentMailboxDelivery::WakeRequired
+        );
+        let resumed = agent.prompt_from_mailbox().await.unwrap().unwrap();
+        assert_eq!(resumed.turns, 1);
+        assert_eq!(
+            resumed.new_messages[0].text_content(),
+            Some("follow-up from idle")
+        );
+        assert!(agent.prompt_from_mailbox().await.unwrap().is_none());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|message| message.text_content() == Some("follow-up from idle"))
+        );
+        assert!(
+            !requests[2].messages.iter().any(|message| {
+                message.role == Role::User && message.text_content() == Some("")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_mailbox_persistence_requeues_the_message_for_wake() {
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([ProviderResponse {
+                message: AssistantMessage::text("eventually handled"),
+                usage: None,
+            }])),
+        };
+        let storage = FailOnSaveStorage::new(1);
+        let (sender, mailbox) = AgentMailbox::bounded(1);
+        let mut agent = Agent::builder(provider)
+            .mailbox(mailbox)
+            .build()
+            .with_session("mailbox-save-retry", storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            sender.send("must survive save failure").unwrap(),
+            AgentMailboxDelivery::WakeRequired
+        );
+
+        assert!(agent.prompt_from_mailbox().await.is_err());
+        assert!(!sender.is_running());
+        assert_eq!(sender.pending_len(), 1);
+        assert!(sender.wait_for_wake().await);
+
+        let run = agent.prompt_from_mailbox().await.unwrap().unwrap();
+        assert_eq!(
+            run.new_messages[0].text_content(),
+            Some("must survive save failure")
+        );
+        assert_eq!(sender.pending_len(), 0);
+        assert!(!sender.is_running());
     }
 }

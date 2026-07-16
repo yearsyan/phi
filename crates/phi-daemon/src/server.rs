@@ -83,6 +83,7 @@ fn application_service(config: &DaemonConfig) -> ApplicationService {
         provider_store,
         config.skills_config(),
     )
+    .with_subagents_enabled(config.subagents_enabled())
 }
 
 pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> Result<(), io::Error>

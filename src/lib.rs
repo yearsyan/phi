@@ -9,17 +9,25 @@ pub mod plan;
 pub mod provider;
 pub mod skills;
 pub mod storage;
+pub mod subagent;
 pub mod tool;
 pub mod types;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentRunControl, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_TOOL_CALL_TIMEOUT,
+    Agent, AgentBuilder, AgentMailbox, AgentMailboxDelivery, AgentMailboxSendError,
+    AgentMailboxSender, AgentRunControl, DEFAULT_AGENT_MAILBOX_CAPACITY,
+    DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_TOOL_CALL_TIMEOUT,
 };
 pub use context::{
-    ContextManagementContext, ContextManagementTrigger, ContextManager, ContextManagerRegistry,
-    DEFAULT_CONTEXT_MANAGEMENT_THRESHOLD_PERCENT,
+    ContextCompactionOutcome, ContextCompactionPlan, ContextCompactionRequest,
+    ContextCompactionRunOutcome, ContextCompactionTrigger, ContextCompactor,
+    DEFAULT_CONTEXT_COMPACTION_BUFFER_TOKENS, DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES,
+    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS, DefaultContextCompactor,
+    default_context_compaction_threshold,
 };
-pub use error::{AgentError, HookError, McpError, ProviderError, ToolError};
+pub use error::{
+    AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError,
+};
 pub use hook::{
     BeforeRequestContext, Hook, HookRegistry, LlmResponseContext, ProviderApi, TurnEndContext,
     TurnStartContext,
@@ -45,9 +53,23 @@ pub use skills::{
 pub use storage::{
     DiskSessionStorage, InMemorySessionStorage, SessionSnapshot, SessionStorage, StorageError,
 };
+pub use subagent::{
+    ActiveSubagentRun, CloseSubagentResult, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES,
+    DEFAULT_MAX_SUBAGENTS, DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY,
+    QueuedSubagentMessage, SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest,
+    SubagentConfig, SubagentError, SubagentEvent, SubagentEventKind, SubagentFactory,
+    SubagentFactoryError, SubagentNotification, SubagentNotificationKind,
+    SubagentNotificationSource, SubagentRunOutcome, SubagentRuntime, SubagentSnapshot,
+    SubagentState,
+};
 pub use tool::builtins::{
     BashTool, BuiltinTools, DEFAULT_BASH_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_MAX_EDIT_BYTES,
     DEFAULT_MAX_LINES, EditTool, ReadTool, WriteTool,
+};
+pub use tool::subagent::{
+    CLOSE_AGENT_TOOL_NAME, CloseAgentTool, NOTIFY_PARENT_TOOL_NAME, NotifyParentTool,
+    SEND_AGENT_MESSAGE_TOOL_NAME, SPAWN_AGENT_TOOL_NAME, SendAgentMessageTool, SpawnAgentTool,
+    SubagentTools,
 };
 pub use tool::{
     AgentMode, AgentModeControl, Tool, ToolCancellation, ToolConcurrency, ToolEffect,

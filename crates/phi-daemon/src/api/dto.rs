@@ -1,9 +1,11 @@
 use std::{fmt, time::Duration};
 
 use phi::{
-    AgentEvent, AgentMode, AssistantDelta, Content, ContentPart, ContextUsage, Message,
-    ProviderRetryReason, ReasoningEffort, Role, SkillDiagnostic, SkillInvocation, SkillMetadata,
-    TokenUsage, ToolCall, ToolProgress,
+    ActiveSubagentRun, AgentEvent, AgentMode, AssistantDelta, Content, ContentPart,
+    ContextCompactionTrigger, ContextUsage, Message, ProviderRetryReason, ReasoningEffort, Role,
+    SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind,
+    SubagentNotification, SubagentRunOutcome, SubagentSnapshot, SubagentState, TokenUsage,
+    ToolCall, ToolProgress,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +14,7 @@ use crate::{
     runtime::{
         AgentStatus, AgentSummary, AgentView, AskUserAnswer, AskUserId, AskUserRequest,
         AssistantDraft, PlanApprovalDecision, PlanApprovalId, PlanApprovalRequest, RunId,
-        RuntimeEvent, RuntimeEventKind, SessionId, ToolCallDraft,
+        RuntimeEvent, RuntimeEventKind, SessionId, SubagentSummary, ToolCallDraft,
     },
     service::SessionListing,
     store::{
@@ -174,6 +176,11 @@ pub enum ClientCommand {
         request_id: String,
         run_id: RunId,
     },
+    Compact {
+        request_id: String,
+        #[serde(default)]
+        instructions: Option<String>,
+    },
     SetModel {
         request_id: String,
         model: String,
@@ -207,6 +214,7 @@ impl ClientCommand {
         match self {
             Self::Prompt { request_id, .. }
             | Self::Stop { request_id, .. }
+            | Self::Compact { request_id, .. }
             | Self::SetModel { request_id, .. }
             | Self::SetReasoningEffort { request_id, .. }
             | Self::SetMode { request_id, .. }
@@ -230,6 +238,24 @@ pub enum ServerMessage {
     },
     Snapshot {
         session: SessionDto,
+    },
+    /// Initial state for the read-only child-agent observer endpoint.
+    SubagentSnapshot {
+        subagent: SubagentSnapshotDto,
+        input_allowed: bool,
+    },
+    /// One ordered event from a child-agent observer stream.
+    SubagentEvent {
+        sequence: u64,
+        parent_session_id: String,
+        agent_id: String,
+        event: SubagentEventDto,
+    },
+    /// The observer fell behind and must replace its local child state.
+    SubagentResyncRequired {
+        skipped: u64,
+        subagent: SubagentSnapshotDto,
+        input_allowed: bool,
     },
     CommandAccepted {
         request_id: String,
@@ -265,6 +291,101 @@ pub enum ServerMessage {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SubagentSnapshotDto {
+    pub parent_session_id: String,
+    pub agent_id: String,
+    pub description: String,
+    pub state: SubagentState,
+    pub active_run: Option<ActiveSubagentRun>,
+    pub messages: Vec<PublicMessage>,
+    pub draft: Option<String>,
+    pub cumulative_usage: TokenUsage,
+    pub context_usage: Option<ContextUsageDto>,
+    pub last_outcome: Option<SubagentRunOutcome>,
+    pub last_sequence: u64,
+}
+
+impl From<&SubagentSnapshot> for SubagentSnapshotDto {
+    fn from(snapshot: &SubagentSnapshot) -> Self {
+        Self {
+            parent_session_id: snapshot.parent_id.clone(),
+            agent_id: snapshot.agent_id.clone(),
+            description: snapshot.description.clone(),
+            state: snapshot.state.clone(),
+            active_run: snapshot.active_run.clone(),
+            messages: snapshot.messages.iter().map(PublicMessage::from).collect(),
+            draft: snapshot.draft.clone(),
+            cumulative_usage: snapshot.cumulative_usage,
+            context_usage: snapshot.context_usage.map(ContextUsageDto::from),
+            last_outcome: snapshot.last_outcome.clone(),
+            last_sequence: snapshot.last_sequence,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SubagentEventDto {
+    Spawned {
+        description: String,
+        initial_delivery_id: String,
+    },
+    StateChanged {
+        state: SubagentState,
+    },
+    MessageQueued {
+        delivery_id: String,
+    },
+    Notification {
+        notification: SubagentNotification,
+    },
+    AgentEvent {
+        event: Box<EventDto>,
+    },
+    RunFinished {
+        run_id: String,
+        outcome: SubagentRunOutcome,
+    },
+    Closed {
+        delivery_id: String,
+        reason: String,
+        wake_parent: bool,
+    },
+}
+
+impl From<SubagentEventKind> for SubagentEventDto {
+    fn from(event: SubagentEventKind) -> Self {
+        match event {
+            SubagentEventKind::Spawned {
+                description,
+                initial_delivery_id,
+            } => Self::Spawned {
+                description,
+                initial_delivery_id,
+            },
+            SubagentEventKind::StateChanged { state } => Self::StateChanged { state },
+            SubagentEventKind::MessageQueued { delivery_id } => Self::MessageQueued { delivery_id },
+            SubagentEventKind::Notification(notification) => Self::Notification { notification },
+            SubagentEventKind::AgentEvent(event) => Self::AgentEvent {
+                event: Box::new(EventDto::from(event)),
+            },
+            SubagentEventKind::RunFinished { run_id, outcome } => {
+                Self::RunFinished { run_id, outcome }
+            }
+            SubagentEventKind::Closed {
+                delivery_id,
+                reason,
+                wake_parent,
+            } => Self::Closed {
+                delivery_id,
+                reason,
+                wake_parent,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SessionDto {
     pub session_id: SessionId,
     pub profile_id: String,
@@ -278,6 +399,7 @@ pub struct SessionDto {
     pub draft: Option<AssistantDraftDto>,
     pub pending_asks: Vec<AskUserRequest>,
     pub pending_plan_approvals: Vec<PlanApprovalRequest>,
+    pub subagents: Vec<SubagentSummaryDto>,
     pub usage: UsageDto,
     pub last_sequence: u64,
 }
@@ -301,12 +423,41 @@ impl From<&AgentView> for SessionDto {
             draft: view.draft.as_ref().map(AssistantDraftDto::from),
             pending_asks: view.pending_asks.clone(),
             pending_plan_approvals: view.pending_plan_approvals.clone(),
+            subagents: view
+                .subagents
+                .iter()
+                .map(|summary| SubagentSummaryDto::from_parent(summary, view.session_id))
+                .collect(),
             usage: UsageDto {
                 last: view.last_usage,
                 context: view.context_usage.map(ContextUsageDto::from),
                 cumulative: view.cumulative_usage,
             },
             last_sequence: view.last_event_sequence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SubagentSummaryDto {
+    pub agent_id: String,
+    pub description: String,
+    pub state: SubagentState,
+    pub last_sequence: u64,
+    pub observer_path: String,
+}
+
+impl SubagentSummaryDto {
+    fn from_parent(summary: &SubagentSummary, parent_session_id: impl fmt::Display) -> Self {
+        Self {
+            agent_id: summary.agent_id.clone(),
+            description: summary.description.clone(),
+            state: summary.state.clone(),
+            last_sequence: summary.last_sequence,
+            observer_path: format!(
+                "/v1/ws/attach/{parent_session_id}/subagents/{}",
+                summary.agent_id
+            ),
         }
     }
 }
@@ -333,6 +484,7 @@ impl SessionConfigDto {
 pub enum SessionStatusDto {
     AwaitingFirstPrompt,
     Idle,
+    Compacting,
     Running,
     Stopping,
     Closing,
@@ -345,6 +497,7 @@ impl From<AgentStatus> for SessionStatusDto {
         match value {
             AgentStatus::AwaitingFirstPrompt => Self::AwaitingFirstPrompt,
             AgentStatus::Idle => Self::Idle,
+            AgentStatus::Compacting => Self::Compacting,
             AgentStatus::Running => Self::Running,
             AgentStatus::Stopping => Self::Stopping,
             AgentStatus::Closing => Self::Closing,
@@ -522,6 +675,7 @@ pub struct SessionSummaryDto {
     pub mode: Option<AgentMode>,
     pub config: SessionConfigDto,
     pub message_count: Option<usize>,
+    pub subagents: Vec<SubagentSummaryDto>,
 }
 
 impl From<SessionListing> for SessionSummaryDto {
@@ -540,6 +694,11 @@ impl From<SessionListing> for SessionSummaryDto {
                     revision: state.config_revision,
                 },
                 message_count: Some(state.message_count),
+                subagents: state
+                    .subagents
+                    .iter()
+                    .map(|summary| SubagentSummaryDto::from_parent(summary, state.session_id))
+                    .collect(),
             },
             None => Self {
                 session_id: listing.record.id,
@@ -554,6 +713,7 @@ impl From<SessionListing> for SessionSummaryDto {
                     revision: listing.record.config_revision,
                 },
                 message_count: None,
+                subagents: Vec::new(),
             },
         }
     }
@@ -617,6 +777,42 @@ pub enum EventDto {
     ActorCrashed {
         message: String,
     },
+    SubagentSpawned {
+        agent_id: String,
+        description: String,
+        initial_delivery_id: String,
+        observer_path: String,
+    },
+    SubagentStateChanged {
+        agent_id: String,
+        state: SubagentState,
+    },
+    SubagentMessageQueued {
+        agent_id: String,
+        delivery_id: String,
+    },
+    SubagentNotification {
+        agent_id: String,
+        notification: SubagentNotification,
+    },
+    SubagentAgentEvent {
+        agent_id: String,
+        event: Box<EventDto>,
+    },
+    SubagentRunFinished {
+        agent_id: String,
+        run_id: String,
+        outcome: SubagentRunOutcome,
+    },
+    SubagentClosed {
+        agent_id: String,
+        delivery_id: String,
+        reason: String,
+        wake_parent: bool,
+    },
+    SubagentsResynced {
+        subagents: Vec<SubagentSummaryDto>,
+    },
     AgentStart,
     AgentEnd,
     AgentStopped,
@@ -664,6 +860,27 @@ pub enum EventDto {
         delay_ms: u64,
         reason: RetryReasonDto,
     },
+    ContextCompactionStarted {
+        trigger: ContextCompactionTriggerDto,
+        compactor: String,
+        prompt: String,
+    },
+    ContextCompactionCompleted {
+        trigger: ContextCompactionTriggerDto,
+        compactor: String,
+        before_message_count: usize,
+        after_message_count: usize,
+        changed_from: usize,
+        replacement: Vec<PublicMessage>,
+        summary: String,
+        usage: Option<TokenUsage>,
+        estimated_context_tokens: u64,
+    },
+    ContextCompactionFailed {
+        trigger: ContextCompactionTriggerDto,
+        compactor: String,
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -671,17 +888,18 @@ pub enum EventDto {
 
 impl From<RuntimeEvent> for ServerMessage {
     fn from(event: RuntimeEvent) -> Self {
+        let session_id = event.session_id;
         Self::Event {
             sequence: event.sequence,
-            session_id: event.session_id,
+            session_id,
             run_id: event.run_id,
-            event: EventDto::from(event.kind),
+            event: EventDto::from_runtime(event.kind, session_id),
         }
     }
 }
 
-impl From<RuntimeEventKind> for EventDto {
-    fn from(event: RuntimeEventKind) -> Self {
+impl EventDto {
+    fn from_runtime(event: RuntimeEventKind, parent_session_id: SessionId) -> Self {
         match event {
             RuntimeEventKind::StateChanged { status } => Self::StateChanged {
                 status: status.into(),
@@ -724,7 +942,61 @@ impl From<RuntimeEventKind> for EventDto {
                 Self::OperationFailed { operation, message }
             }
             RuntimeEventKind::ActorCrashed { message } => Self::ActorCrashed { message },
+            RuntimeEventKind::Subagent(event) => Self::from(event),
+            RuntimeEventKind::SubagentsResynced { subagents } => Self::SubagentsResynced {
+                subagents: subagents
+                    .iter()
+                    .map(|summary| SubagentSummaryDto::from_parent(summary, parent_session_id))
+                    .collect(),
+            },
             RuntimeEventKind::Agent(event) => Self::from(event),
+        }
+    }
+}
+
+impl From<SubagentEvent> for EventDto {
+    fn from(event: SubagentEvent) -> Self {
+        let agent_id = event.agent_id;
+        match event.kind {
+            SubagentEventKind::Spawned {
+                description,
+                initial_delivery_id,
+            } => Self::SubagentSpawned {
+                observer_path: format!("/v1/ws/attach/{}/subagents/{agent_id}", event.parent_id),
+                agent_id,
+                description,
+                initial_delivery_id,
+            },
+            SubagentEventKind::StateChanged { state } => {
+                Self::SubagentStateChanged { agent_id, state }
+            }
+            SubagentEventKind::MessageQueued { delivery_id } => Self::SubagentMessageQueued {
+                agent_id,
+                delivery_id,
+            },
+            SubagentEventKind::Notification(notification) => Self::SubagentNotification {
+                agent_id,
+                notification,
+            },
+            SubagentEventKind::AgentEvent(event) => Self::SubagentAgentEvent {
+                agent_id,
+                event: Box::new(Self::from(event)),
+            },
+            SubagentEventKind::RunFinished { run_id, outcome } => Self::SubagentRunFinished {
+                agent_id,
+                run_id,
+                outcome,
+            },
+            SubagentEventKind::Closed {
+                delivery_id,
+                reason,
+                wake_parent,
+            } => Self::SubagentClosed {
+                agent_id,
+                delivery_id,
+                reason,
+                wake_parent,
+            },
         }
     }
 }
@@ -785,7 +1057,66 @@ impl From<AgentEvent> for EventDto {
                 delay_ms: duration_millis(event.delay),
                 reason: event.reason.into(),
             },
+            AgentEvent::ContextCompactionStarted {
+                trigger,
+                compactor,
+                prompt,
+            } => Self::ContextCompactionStarted {
+                trigger: trigger.into(),
+                compactor,
+                prompt,
+            },
+            AgentEvent::ContextCompactionCompleted {
+                trigger,
+                compactor,
+                before_message_count,
+                after_message_count,
+                changed_from,
+                replacement,
+                summary,
+                usage,
+                estimated_context_tokens,
+            } => Self::ContextCompactionCompleted {
+                trigger: trigger.into(),
+                compactor,
+                before_message_count,
+                after_message_count,
+                changed_from,
+                replacement: replacement.iter().map(PublicMessage::from).collect(),
+                summary,
+                usage,
+                estimated_context_tokens,
+            },
+            AgentEvent::ContextCompactionFailed {
+                trigger,
+                compactor,
+                message,
+            } => Self::ContextCompactionFailed {
+                trigger: trigger.into(),
+                compactor,
+                message,
+            },
             AgentEvent::Error { message } => Self::Error { message },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContextCompactionTriggerDto {
+    Automatic { usage: ContextUsageDto },
+    Manual { instructions: Option<String> },
+    ContextLengthExceeded,
+}
+
+impl From<ContextCompactionTrigger> for ContextCompactionTriggerDto {
+    fn from(trigger: ContextCompactionTrigger) -> Self {
+        match trigger {
+            ContextCompactionTrigger::Automatic { usage } => Self::Automatic {
+                usage: usage.into(),
+            },
+            ContextCompactionTrigger::Manual { instructions } => Self::Manual { instructions },
+            ContextCompactionTrigger::ContextLengthExceeded { .. } => Self::ContextLengthExceeded,
         }
     }
 }
@@ -912,5 +1243,99 @@ mod tests {
             ClientCommand::Prompt { skill: Some(skill), .. }
                 if skill.name == "review" && skill.arguments.as_deref() == Some("--security")
         ));
+    }
+
+    #[test]
+    fn compact_command_accepts_optional_instructions() {
+        let plain: ClientCommand = serde_json::from_value(serde_json::json!({
+            "type": "compact",
+            "request_id": "compact-plain"
+        }))
+        .unwrap();
+        assert!(matches!(
+            plain,
+            ClientCommand::Compact {
+                request_id,
+                instructions: None,
+            } if request_id == "compact-plain"
+        ));
+
+        let instructed: ClientCommand = serde_json::from_value(serde_json::json!({
+            "type": "compact",
+            "request_id": "compact-instructed",
+            "instructions": "Keep the deployment decisions"
+        }))
+        .unwrap();
+        assert!(matches!(
+            instructed,
+            ClientCommand::Compact {
+                request_id,
+                instructions: Some(instructions),
+            } if request_id == "compact-instructed"
+                && instructions == "Keep the deployment decisions"
+        ));
+    }
+
+    #[test]
+    fn compaction_event_serializes_trigger_prompt_and_replacement_patch() {
+        let started = EventDto::from(AgentEvent::ContextCompactionStarted {
+            trigger: ContextCompactionTrigger::Manual {
+                instructions: Some("Preserve decisions".to_owned()),
+            },
+            compactor: "test_compactor".to_owned(),
+            prompt: "Summarize this conversation".to_owned(),
+        });
+        let started = serde_json::to_value(started).unwrap();
+        assert_eq!(started["type"], "context_compaction_started");
+        assert_eq!(started["prompt"], "Summarize this conversation");
+
+        let automatic = serde_json::to_value(ContextCompactionTriggerDto::from(
+            ContextCompactionTrigger::Automatic {
+                usage: ContextUsage {
+                    max_tokens: 200_000,
+                    used_tokens: 167_000,
+                    remaining_tokens: 33_000,
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(automatic["type"], "automatic");
+        assert_eq!(automatic["usage"]["used_tokens"], 167_000);
+
+        let event = EventDto::from(AgentEvent::ContextCompactionCompleted {
+            trigger: ContextCompactionTrigger::Manual {
+                instructions: Some("Preserve decisions".to_owned()),
+            },
+            compactor: "test_compactor".to_owned(),
+            before_message_count: 4,
+            after_message_count: 1,
+            changed_from: 0,
+            replacement: vec![Message::user("summary")],
+            summary: "summary".to_owned(),
+            usage: Some(TokenUsage::new(10, 2, 0)),
+            estimated_context_tokens: 7,
+        });
+
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "context_compaction_completed");
+        assert_eq!(value["trigger"]["type"], "manual");
+        assert_eq!(value["trigger"]["instructions"], "Preserve decisions");
+        assert_eq!(value["compactor"], "test_compactor");
+        assert_eq!(value["changed_from"], 0);
+        assert_eq!(value["replacement"][0]["role"], "user");
+        assert_eq!(value["replacement"][0]["content"]["value"], "summary");
+        assert_eq!(value["usage"]["total_tokens"], 12);
+        assert_eq!(value["estimated_context_tokens"], 7);
+
+        let overflow = serde_json::to_value(ContextCompactionTriggerDto::from(
+            ContextCompactionTrigger::ContextLengthExceeded {
+                error: "raw provider response must stay internal".to_owned(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            overflow,
+            serde_json::json!({ "type": "context_length_exceeded" })
+        );
     }
 }
