@@ -13,8 +13,11 @@ pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8787";
 pub const DATA_DIR_ENV: &str = "PHI_DAEMON_DATA_DIR";
 pub const DEFAULT_DATA_DIR: &str = ".phi/daemon";
 pub const AUTH_KEY_FILE_ENV: &str = "PHI_DAEMON_AUTH_KEY_FILE";
+pub const TLS_CERT_FILE_ENV: &str = "PHI_DAEMON_TLS_CERT_FILE";
+pub const TLS_KEY_FILE_ENV: &str = "PHI_DAEMON_TLS_KEY_FILE";
 pub const SKILLS_ENABLED_ENV: &str = "PHI_DAEMON_SKILLS_ENABLED";
 pub const SUBAGENTS_ENABLED_ENV: &str = "PHI_DAEMON_SUBAGENTS_ENABLED";
+pub const SESSION_TITLE_PROFILE_ID_ENV: &str = "PHI_DAEMON_SESSION_TITLE_PROFILE_ID";
 pub const WORKSPACE_DIR_ENV: &str = "PHI_DAEMON_WORKSPACE_DIR";
 pub const GLOBAL_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_GLOBAL_SKILLS_DIRS";
 pub const WORKSPACE_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_WORKSPACE_SKILLS_DIRS";
@@ -25,12 +28,50 @@ const MIN_AUTH_KEY_BYTES: usize = 32;
 const MAX_AUTH_KEY_BYTES: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    certificate_file: PathBuf,
+    private_key_file: PathBuf,
+}
+
+impl TlsConfig {
+    pub fn new(
+        certificate_file: impl Into<PathBuf>,
+        private_key_file: impl Into<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            certificate_file: validate_tls_file_path(TLS_CERT_FILE_ENV, certificate_file.into())?,
+            private_key_file: validate_tls_file_path(TLS_KEY_FILE_ENV, private_key_file.into())?,
+        })
+    }
+
+    pub fn certificate_file(&self) -> &Path {
+        &self.certificate_file
+    }
+
+    pub fn private_key_file(&self) -> &Path {
+        &self.private_key_file
+    }
+}
+
+impl fmt::Debug for TlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsConfig")
+            .field("certificate_file", &self.certificate_file)
+            .field("private_key_file", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     bind_address: SocketAddr,
     data_dir: PathBuf,
     auth_key: String,
+    tls: Option<TlsConfig>,
     skills_enabled: bool,
     subagents_enabled: bool,
+    session_title_profile_id: Option<String>,
     workspace_dir: PathBuf,
     global_skill_dirs: Vec<PathBuf>,
     workspace_skill_dirs: Vec<PathBuf>,
@@ -44,8 +85,10 @@ impl DaemonConfig {
             bind_address,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             auth_key,
+            tls: None,
             skills_enabled: true,
             subagents_enabled: true,
+            session_title_profile_id: None,
             workspace_dir,
             global_skill_dirs: default_global_skill_dirs(),
             workspace_skill_dirs: DEFAULT_WORKSPACE_SKILLS_DIRS
@@ -60,6 +103,15 @@ impl DaemonConfig {
         self
     }
 
+    pub fn with_tls(
+        mut self,
+        certificate_file: impl Into<PathBuf>,
+        private_key_file: impl Into<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        self.tls = Some(TlsConfig::new(certificate_file, private_key_file)?);
+        Ok(self)
+    }
+
     pub fn with_skills_enabled(mut self, enabled: bool) -> Self {
         self.skills_enabled = enabled;
         self
@@ -68,6 +120,17 @@ impl DaemonConfig {
     pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
         self.subagents_enabled = enabled;
         self
+    }
+
+    pub fn with_session_title_profile_id(
+        mut self,
+        profile_id: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        self.session_title_profile_id = Some(normalize_profile_id(
+            SESSION_TITLE_PROFILE_ID_ENV,
+            profile_id.into(),
+        )?);
+        Ok(self)
     }
 
     pub fn with_workspace_dir(mut self, workspace_dir: impl Into<PathBuf>) -> Self {
@@ -106,11 +169,19 @@ impl DaemonConfig {
         }
         let auth_key = read_auth_key(Path::new(&auth_key_file))?;
         let mut config = Self::new(bind_address, auth_key)?.with_data_dir(data_dir);
+        config.tls = tls_config_from_values(
+            optional_environment(TLS_CERT_FILE_ENV)?,
+            optional_environment(TLS_KEY_FILE_ENV)?,
+        )?;
         if let Some(value) = optional_environment(SKILLS_ENABLED_ENV)? {
             config.skills_enabled = parse_boolean(SKILLS_ENABLED_ENV, &value)?;
         }
         if let Some(value) = optional_environment(SUBAGENTS_ENABLED_ENV)? {
             config.subagents_enabled = parse_boolean(SUBAGENTS_ENABLED_ENV, &value)?;
+        }
+        if let Some(value) = optional_environment(SESSION_TITLE_PROFILE_ID_ENV)? {
+            config.session_title_profile_id =
+                Some(normalize_profile_id(SESSION_TITLE_PROFILE_ID_ENV, value)?);
         }
         if let Some(value) = optional_environment(WORKSPACE_DIR_ENV)? {
             if value.trim().is_empty() {
@@ -138,12 +209,20 @@ impl DaemonConfig {
         &self.data_dir
     }
 
+    pub fn tls_config(&self) -> Option<&TlsConfig> {
+        self.tls.as_ref()
+    }
+
     pub fn skills_enabled(&self) -> bool {
         self.skills_enabled
     }
 
     pub fn subagents_enabled(&self) -> bool {
         self.subagents_enabled
+    }
+
+    pub fn session_title_profile_id(&self) -> Option<&str> {
+        self.session_title_profile_id.as_deref()
     }
 
     pub fn workspace_dir(&self) -> &Path {
@@ -187,8 +266,10 @@ impl fmt::Debug for DaemonConfig {
             .debug_struct("DaemonConfig")
             .field("bind_address", &self.bind_address)
             .field("data_dir", &self.data_dir)
+            .field("tls", &self.tls)
             .field("skills_enabled", &self.skills_enabled)
             .field("subagents_enabled", &self.subagents_enabled)
+            .field("session_title_profile_id", &self.session_title_profile_id)
             .field("workspace_dir", &self.workspace_dir)
             .field("global_skill_dirs", &self.global_skill_dirs)
             .field("workspace_skill_dirs", &self.workspace_skill_dirs)
@@ -232,6 +313,41 @@ fn parse_boolean(name: &'static str, value: &str) -> Result<bool, ConfigError> {
             value: value.to_owned(),
         }),
     }
+}
+
+fn tls_config_from_values(
+    certificate_file: Option<String>,
+    private_key_file: Option<String>,
+) -> Result<Option<TlsConfig>, ConfigError> {
+    match (certificate_file, private_key_file) {
+        (None, None) => Ok(None),
+        (Some(certificate_file), Some(private_key_file)) => {
+            TlsConfig::new(certificate_file, private_key_file).map(Some)
+        }
+        (None, Some(_)) => Err(ConfigError::IncompleteTlsConfiguration {
+            missing: TLS_CERT_FILE_ENV,
+        }),
+        (Some(_), None) => Err(ConfigError::IncompleteTlsConfiguration {
+            missing: TLS_KEY_FILE_ENV,
+        }),
+    }
+}
+
+fn validate_tls_file_path(name: &'static str, path: PathBuf) -> Result<PathBuf, ConfigError> {
+    let is_blank =
+        path.as_os_str().is_empty() || path.to_str().is_some_and(|value| value.trim().is_empty());
+    if is_blank {
+        return Err(ConfigError::InvalidTlsFilePath { name });
+    }
+    Ok(path)
+}
+
+fn normalize_profile_id(name: &'static str, value: String) -> Result<String, ConfigError> {
+    let profile_id = value.trim();
+    if profile_id.is_empty() || profile_id.len() > 128 || profile_id.chars().any(char::is_control) {
+        return Err(ConfigError::InvalidProfileId { name, value });
+    }
+    Ok(profile_id.to_owned())
 }
 
 fn default_global_skill_dirs() -> Vec<PathBuf> {
@@ -304,8 +420,19 @@ pub enum ConfigError {
     #[error("daemon boolean environment variable {name} has invalid value {value:?}")]
     InvalidBoolean { name: &'static str, value: String },
 
+    #[error("daemon Provider profile environment variable {name} has invalid value {value:?}")]
+    InvalidProfileId { name: &'static str, value: String },
+
     #[error("daemon auth key file path must not be empty")]
     InvalidAuthKeyFilePath,
+
+    #[error(
+        "PHI_DAEMON_TLS_CERT_FILE and PHI_DAEMON_TLS_KEY_FILE must be configured together (missing {missing})"
+    )]
+    IncompleteTlsConfiguration { missing: &'static str },
+
+    #[error("daemon TLS file path {name} must not be empty")]
+    InvalidTlsFilePath { name: &'static str },
 
     #[error("could not read daemon auth key file {path}: {source}")]
     AuthKeyFile {
@@ -332,8 +459,10 @@ mod tests {
         assert_eq!(config.bind_address().to_string(), DEFAULT_BIND_ADDRESS);
         assert!(config.bind_address().ip().is_loopback());
         assert_eq!(config.data_dir(), Path::new(DEFAULT_DATA_DIR));
+        assert_eq!(config.tls_config(), None);
         assert!(config.skills_enabled());
         assert!(config.subagents_enabled());
+        assert_eq!(config.session_title_profile_id(), None);
         assert!(
             config
                 .global_skill_dirs()
@@ -358,11 +487,78 @@ mod tests {
     }
 
     #[test]
+    fn builder_configures_tls_certificate_and_private_key_files() {
+        let config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap()
+        .with_tls("localhost.crt", "localhost.key")
+        .unwrap();
+
+        let tls = config.tls_config().unwrap();
+        assert_eq!(tls.certificate_file(), Path::new("localhost.crt"));
+        assert_eq!(tls.private_key_file(), Path::new("localhost.key"));
+    }
+
+    #[test]
+    fn tls_certificate_and_private_key_must_be_configured_together() {
+        assert!(matches!(
+            tls_config_from_values(Some("localhost.crt".to_owned()), None),
+            Err(ConfigError::IncompleteTlsConfiguration {
+                missing: TLS_KEY_FILE_ENV
+            })
+        ));
+        assert!(matches!(
+            tls_config_from_values(None, Some("localhost.key".to_owned())),
+            Err(ConfigError::IncompleteTlsConfiguration {
+                missing: TLS_CERT_FILE_ENV
+            })
+        ));
+        assert!(matches!(
+            tls_config_from_values(Some("  ".to_owned()), Some("localhost.key".to_owned())),
+            Err(ConfigError::InvalidTlsFilePath {
+                name: TLS_CERT_FILE_ENV
+            })
+        ));
+    }
+
+    #[test]
+    fn builder_configures_a_dedicated_session_title_profile() {
+        let config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap()
+        .with_session_title_profile_id(" titles ")
+        .unwrap();
+
+        assert_eq!(config.session_title_profile_id(), Some("titles"));
+        assert!(matches!(
+            DaemonConfig::new(
+                DEFAULT_BIND_ADDRESS.parse().unwrap(),
+                "a-secure-test-key-with-at-least-32-bytes",
+            )
+            .unwrap()
+            .with_session_title_profile_id(" \n "),
+            Err(ConfigError::InvalidProfileId {
+                name: SESSION_TITLE_PROFILE_ID_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn debug_redacts_auth_key() {
         let secret = "canary-auth-key-that-must-never-appear";
-        let config = DaemonConfig::new(DEFAULT_BIND_ADDRESS.parse().unwrap(), secret).unwrap();
+        let private_key_path = "canary-private-key-path";
+        let config = DaemonConfig::new(DEFAULT_BIND_ADDRESS.parse().unwrap(), secret)
+            .unwrap()
+            .with_tls("localhost.crt", private_key_path)
+            .unwrap();
         let debug = format!("{config:?}");
         assert!(!debug.contains(secret));
+        assert!(!debug.contains(private_key_path));
         assert!(debug.contains("[REDACTED]"));
     }
 

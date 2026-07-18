@@ -1,0 +1,30 @@
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.row::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentcolor;
+  opacity: 0.6;
+}
+
+.info {
+  color: var(--phi-text-dim);
+}
+
+.warn {
+  color: var(--phi-warning);
+}
+
+.error {
+  color: var(--phi-danger);
+}

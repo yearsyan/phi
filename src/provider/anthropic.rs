@@ -338,6 +338,7 @@ impl LlmProvider for AnthropicMessagesProvider {
 
 #[derive(Default)]
 struct AnthropicStreamState {
+    reasoning: String,
     text: String,
     tools: BTreeMap<usize, PendingToolUse>,
     raw_content: BTreeMap<usize, Value>,
@@ -393,6 +394,17 @@ impl AnthropicStreamState {
             self.raw_content.insert(index, block.clone());
         }
         match block["type"].as_str() {
+            Some("thinking") => {
+                let thinking = block["thinking"].as_str().unwrap_or_default();
+                if thinking.is_empty() {
+                    Vec::new()
+                } else {
+                    self.reasoning.push_str(thinking);
+                    vec![AssistantDelta::Reasoning {
+                        delta: thinking.to_owned(),
+                    }]
+                }
+            }
             Some("text") => {
                 let text = block["text"].as_str().unwrap_or_default();
                 if text.is_empty() {
@@ -444,7 +456,14 @@ impl AnthropicStreamState {
             Some("thinking_delta") => {
                 let thinking = delta["thinking"].as_str().unwrap_or_default();
                 self.append_raw_string(index, "thinking", thinking);
-                Vec::new()
+                if thinking.is_empty() {
+                    Vec::new()
+                } else {
+                    self.reasoning.push_str(thinking);
+                    vec![AssistantDelta::Reasoning {
+                        delta: thinking.to_owned(),
+                    }]
+                }
             }
             Some("signature_delta") => {
                 let signature = delta["signature"].as_str().unwrap_or_default();
@@ -532,6 +551,7 @@ impl AnthropicStreamState {
         Ok(ProviderResponse {
             message: AssistantMessage {
                 content,
+                reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 tool_calls,
                 provider_state: has_reasoning.then_some(ProviderState::AnthropicMessages {
                     content: self.raw_content.into_values().collect(),
@@ -706,9 +726,15 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
         .as_array()
         .ok_or_else(|| ProviderError::InvalidResponse("content is not an array".to_owned()))?;
     let mut text = Vec::new();
+    let mut reasoning = Vec::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block["type"].as_str() {
+            Some("thinking") => {
+                if let Some(value) = block["thinking"].as_str() {
+                    reasoning.push(value.to_owned());
+                }
+            }
             Some("text") => {
                 if let Some(value) = block["text"].as_str() {
                     text.push(value.to_owned());
@@ -736,6 +762,7 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
     Ok(ProviderResponse {
         message: AssistantMessage {
             content,
+            reasoning: (!reasoning.is_empty()).then(|| reasoning.join("")),
             tool_calls,
             provider_state: blocks
                 .iter()
@@ -1185,11 +1212,17 @@ mod tests {
                 "signature": ""
             }
         }));
-        state.apply(&json!({
+        let reasoning_delta = state.apply(&json!({
             "type": "content_block_delta",
             "index": 0,
             "delta": { "type": "thinking_delta", "thinking": "use echo" }
         }));
+        assert_eq!(
+            reasoning_delta,
+            vec![AssistantDelta::Reasoning {
+                delta: "use echo".to_owned()
+            }]
+        );
         state.apply(&json!({
             "type": "content_block_delta",
             "index": 0,
@@ -1221,6 +1254,7 @@ mod tests {
         }));
 
         let response = state.finish().unwrap();
+        assert_eq!(response.message.reasoning.as_deref(), Some("use echo"));
         assert_eq!(
             response.message.tool_calls[0].arguments,
             json!({"text": "hi"})

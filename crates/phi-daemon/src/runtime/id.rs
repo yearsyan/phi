@@ -48,7 +48,6 @@ macro_rules! define_id {
 define_id!(SessionId);
 define_id!(RunId);
 define_id!(AskUserId);
-define_id!(PlanApprovalId);
 
 #[cfg(test)]
 mod tests {
@@ -64,8 +63,5 @@ mod tests {
 
         let ask_user_id = AskUserId::new();
         assert_eq!(ask_user_id.to_string().parse(), Ok(ask_user_id));
-
-        let plan_approval_id = PlanApprovalId::new();
-        assert_eq!(plan_approval_id.to_string().parse(), Ok(plan_approval_id));
     }
 }

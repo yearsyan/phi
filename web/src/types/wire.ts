@@ -14,6 +14,7 @@
 /* -------------------------------------------------------------------------- */
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
+export type MessageVisibility = 'public' | 'internal';
 
 export interface ImageUrl {
   url: string;
@@ -49,7 +50,10 @@ export interface ToolCall {
 /** A provider-neutral message as projected in the public session history. */
 export interface PublicMessage {
   role: Role;
+  /** Omitted for ordinary public messages. */
+  visibility?: MessageVisibility;
   content: Content | null;
+  reasoning?: string | null;
   tool_calls: ToolCall[];
   tool_call_id: string | null;
   tool_result_is_error: boolean;
@@ -57,7 +61,7 @@ export interface PublicMessage {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Reasoning / mode / status                                                  */
+/* Reasoning / capability / status                                            */
 /* -------------------------------------------------------------------------- */
 
 export type ReasoningEffort =
@@ -68,8 +72,6 @@ export type ReasoningEffort =
   | 'high'
   | 'xhigh'
   | 'max';
-
-export type AgentMode = 'default' | 'plan';
 
 export type CapabilityMode = 'read_only' | 'workspace_edit' | 'full_access';
 
@@ -87,6 +89,13 @@ export interface SessionConfig {
   model: string;
   reasoning_effort: ReasoningEffort | null;
   revision: number;
+}
+
+export interface ContextCompactionStatus {
+  phase: 'started' | 'completed' | 'failed';
+  history_index: number;
+  after_message_count?: number;
+  message?: string;
 }
 
 export interface AgentProfileRef {
@@ -129,8 +138,11 @@ export interface ToolCallDraft {
 }
 
 export interface AssistantDraft {
+  reasoning?: string;
   text: string;
   tool_calls: ToolCallDraft[];
+  /** Durable assistant index available once its tool-call journal is saved. */
+  fork_message_index?: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -279,30 +291,12 @@ export interface AskUserAnswer {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Plan mode                                                                  */
-/* -------------------------------------------------------------------------- */
-
-export interface PlanArtifact {
-  session_id: string;
-  revision: number;
-  content: string;
-}
-
-export interface PlanApprovalRequest {
-  approval_id: string;
-  plan: PlanArtifact;
-}
-
-export type PlanApprovalDecision =
-  | { type: 'approve'; revision: number }
-  | { type: 'reject'; revision: number; feedback?: string | null };
-
-/* -------------------------------------------------------------------------- */
 /* Session snapshot DTO                                                       */
 /* -------------------------------------------------------------------------- */
 
 export interface SessionDto {
   session_id: string;
+  title: string | null;
   profile_id: string;
   agent_profile: AgentProfileRef;
   workspace?: string | null;
@@ -310,13 +304,14 @@ export interface SessionDto {
   status: SessionStatus;
   active_run_id: string | null;
   queued_runs: number;
-  mode: AgentMode;
   capability_mode: CapabilityMode;
   config: SessionConfig;
   history: PublicMessage[];
+  context_compactions?: ContextCompactionStatus[];
+  context_compaction?: ContextCompactionStatus;
   draft: AssistantDraft | null;
   pending_asks: AskUserRequest[];
-  pending_plan_approvals: PlanApprovalRequest[];
+  skills?: readonly SkillSummary[];
   subagents: SubagentSummary[];
   usage: Usage;
   last_sequence: number;
@@ -358,6 +353,7 @@ export type RetryReason =
 
 /** A streaming delta from `message_update`. */
 export type AssistantDelta =
+  | { type: 'reasoning'; delta: string }
   | { type: 'text'; delta: string }
   | {
       type: 'tool_call';
@@ -374,13 +370,13 @@ export type AssistantDelta =
 export type EventDto =
   | { type: 'state_changed'; status: SessionStatus }
   | { type: 'session_initialized' }
+  | { type: 'title_changed'; title: string }
   | { type: 'run_queued'; run_id: string }
   | { type: 'run_started'; run_id: string }
   | { type: 'run_completed'; run_id: string }
   | { type: 'run_stopped'; run_id: string }
   | { type: 'run_failed'; run_id: string; message: string }
   | { type: 'config_changed'; config: SessionConfig }
-  | { type: 'mode_changed'; mode: AgentMode }
   | {
       type: 'capability_mode_changed';
       capability_mode: CapabilityMode;
@@ -388,13 +384,6 @@ export type EventDto =
   | { type: 'askuser_requested'; request: AskUserRequest }
   | { type: 'askuser_answered'; ask_id: string }
   | { type: 'askuser_cancelled'; ask_id: string }
-  | { type: 'plan_approval_requested'; request: PlanApprovalRequest }
-  | {
-      type: 'plan_approval_decided';
-      approval_id: string;
-      decision: PlanApprovalDecision;
-    }
-  | { type: 'plan_approval_cancelled'; approval_id: string }
   | { type: 'operation_failed'; operation: string; message: string }
   | { type: 'actor_crashed'; message: string }
   | {
@@ -482,7 +471,6 @@ export type EventDto =
       type: 'context_compaction_started';
       trigger: ContextCompactionTrigger;
       compactor: string;
-      prompt: string;
     }
   | {
       type: 'context_compaction_completed';
@@ -490,9 +478,6 @@ export type EventDto =
       compactor: string;
       before_message_count: number;
       after_message_count: number;
-      changed_from: number;
-      replacement: PublicMessage[];
-      summary: string;
       usage: TokenUsage | null;
       estimated_context_tokens: number;
     }
@@ -529,10 +514,10 @@ export type ServerMessage =
   | {
       type: 'ready';
       config: SessionConfig;
-      mode: AgentMode;
       capability_mode: CapabilityMode;
       agent_profile: AgentProfileRef;
       workspace?: string | null;
+      skills?: readonly SkillSummary[];
     }
   | { type: 'session_created'; session_id: string }
   | { type: 'snapshot'; session: SessionDto }
@@ -596,7 +581,6 @@ export type ClientCommand =
       request_id: string;
       effort: ReasoningEffort | null;
     }
-  | { type: 'set_mode'; request_id: string; mode: AgentMode }
   | {
       type: 'set_capability_mode';
       request_id: string;
@@ -608,17 +592,13 @@ export type ClientCommand =
       ask_id: string;
       answers: AskUserAnswer[];
     }
-  | {
-      type: 'decide_plan_approval';
-      request_id: string;
-      approval_id: string;
-      decision: PlanApprovalDecision;
-    }
   | { type: 'ping'; request_id: string };
 
 /* -------------------------------------------------------------------------- */
 /* HTTP response shapes                                                       */
 /* -------------------------------------------------------------------------- */
+
+export type ForkPosition = 'after' | 'before_tool_calls';
 
 export type ProviderKind = 'openai_chat' | 'openai_responses' | 'anthropic';
 
@@ -664,7 +644,6 @@ export interface PutAgentProfileRequest {
   prompt?: PromptDefinitionDto;
   tools?: NamePolicyDto;
   skills?: NamePolicyDto;
-  initial_agent_mode?: AgentMode;
   initial_capability_mode?: CapabilityMode;
   model?: string | null;
   reasoning_effort?: ReasoningEffort | null;
@@ -676,7 +655,6 @@ export interface PublicAgentProfile {
   prompt: Required<PromptDefinitionDto>;
   tools: NamePolicyDto;
   skills: NamePolicyDto;
-  initial_agent_mode: AgentMode;
   initial_capability_mode: CapabilityMode;
   model: string | null;
   reasoning_effort: ReasoningEffort | null;
@@ -708,21 +686,118 @@ export interface PutProviderRequest {
 
 export interface SessionSummary {
   session_id: string;
+  title: string | null;
+  pinned: boolean;
   profile_id: string;
   agent_profile: AgentProfileRef;
   workspace?: string | null;
   status: SessionStatus;
   active_run_id: string | null;
   queued_runs: number;
-  mode: AgentMode | null;
   capability_mode: CapabilityMode | null;
   config: SessionConfig;
   message_count: number | null;
   subagents: SubagentSummary[];
 }
 
+export interface WorkspaceSessionGroup {
+  workspace: string | null;
+  sessions: SessionSummary[];
+}
+
 export interface SessionsResponse {
   sessions: SessionSummary[];
+  /** Backend-projected workspace tree. Absent only when using an older daemon. */
+  workspaces?: WorkspaceSessionGroup[];
+}
+
+export type ScheduledWeekday =
+  | 'monday'
+  | 'tuesday'
+  | 'wednesday'
+  | 'thursday'
+  | 'friday'
+  | 'saturday'
+  | 'sunday';
+
+export type ScheduledIntervalUnit = 'minutes' | 'hours' | 'days';
+
+export type ScheduledTaskSchedule =
+  | {
+      type: 'daily';
+      time: string;
+      weekdays: ScheduledWeekday[];
+      timezone: string;
+    }
+  | {
+      type: 'interval';
+      every: number;
+      unit: ScheduledIntervalUnit;
+    };
+
+export type ScheduledRunOutcome =
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'stopped'
+  | 'interrupted';
+
+export interface ScheduledTaskRun {
+  scheduled_for: string;
+  started_at: string;
+  finished_at: string | null;
+  outcome: ScheduledRunOutcome;
+  session_id: string | null;
+  error: string | null;
+}
+
+export interface ScheduledTask {
+  task_id: string;
+  name: string;
+  prompt: string;
+  workspace: string;
+  profile_id: string;
+  agent_profile_id: string;
+  capability_mode: CapabilityMode | null;
+  schedule: ScheduledTaskSchedule;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  next_run_at: string | null;
+  last_run: ScheduledTaskRun | null;
+  skipped_runs: number;
+  revision: number;
+}
+
+export interface ScheduledTasksResponse {
+  tasks: ScheduledTask[];
+}
+
+export interface CreateScheduledTaskRequest {
+  name: string;
+  prompt: string;
+  workspace?: string;
+  profile_id?: string;
+  agent_profile_id?: string;
+  capability_mode?: CapabilityMode;
+  schedule: ScheduledTaskSchedule;
+}
+
+export interface UpdateScheduledTaskRequest {
+  enabled: boolean;
+  expected_revision?: number;
+}
+
+export interface WorkspaceDirectory {
+  name: string;
+  path: string;
+}
+
+export interface WorkspaceBrowseResponse {
+  path: string;
+  parent: string | null;
+  directories: WorkspaceDirectory[];
+  truncated: boolean;
 }
 
 export interface SkillSummary {

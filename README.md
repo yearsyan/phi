@@ -25,13 +25,12 @@
 - 可修改请求、响应和 turn 数据的异步生命周期 Hooks
 - `agent_start`、turn、message、tool progress 和 error 生命周期事件
 - 可协作停止的 run control，以及协议安全的停止检查点
-- 可持久化的 Default/Plan 模式，以及独立的 `ReadOnly` / `WorkspaceEdit` / `FullAccess`
-  capability 边界、工具名称策略和版本化计划文件
+- 可持久化的 `ReadOnly` / `WorkspaceEdit` / `FullAccess` capability 边界和工具名称策略
 - 可显式启用的异步 subagent runtime，支持 `general` / `explore` / `plan` 类型、模型与
   reasoning override、输出契约、host-owned workspace isolation、双向通知和永久关闭
 - 持续工具轮次与可复用对话历史
 - 独立 `phi-daemon` 二进制：版本化 Agent Profile、session registry、HTTP 列表、
-  new/attach WebSocket、可重连的 `askuser` 与 Plan Exit 审批
+  new/attach WebSocket、可重连的 `askuser` 与持久化定时任务调度
 
 ## 快速运行
 
@@ -153,45 +152,23 @@ let prompt = catalog.apply_to_prompt(
 
 支持 Claude 常用的 `description`、`when_to_use`、`argument-hint`、`arguments`、`version`、`disable-model-invocation` 和 `user-invocable` frontmatter，以及 `$ARGUMENTS`、索引/命名参数和 `${CLAUDE_SKILL_DIR}` 替换。Skills 不执行 markdown 内嵌 shell、hooks，也不把 `allowed-tools` 等 frontmatter 当作授权；这些字段只产生诊断。live catalog 不自动监听文件变化，需要重新构建 Agent 才会更新。
 
-## Plan 模式与计划文件
-
-`AgentMode::Plan` 是执行权限边界，不只是额外提示词。Agent 会在 lifecycle hook 之后再次过滤 Provider 可见的工具，并在真正执行 tool call 时再次校验；因此 hook 重新加入工具或模型伪造调用都不能绕过限制。模式保存在 session snapshot 中，恢复会话后仍然生效：
-
-```rust
-use phi::{Agent, AgentMode, OpenAiChatProvider};
-
-# let provider = OpenAiChatProvider::new("key", "https://example.com/v1", "model")?;
-let mut agent = Agent::builder(provider)
-    .mode(AgentMode::Plan)
-    .build();
-
-// 对已 attach session 的 Agent，这个异步入口会立即持久化模式。
-agent.set_mode(AgentMode::Default).await?;
-# Ok::<(), phi::AgentError>(())
-```
-
-每个 `Tool` 通过 `effect()` 声明最大副作用。Plan 只允许 `ReadOnly`、`Internal` 和 `PlanOnly`；`edit`/`write`、`bash` 分别被归类为 workspace write 和 external side effect。自定义与 MCP 工具默认是 `ExternalSideEffect`，需要实现者审计后显式降权，才会在 Plan 中可用。`PlanOnly` 工具只在 Plan 中可见。
-
-`InMemoryPlanStore` 和 `DiskPlanStore` 提供独立于 transcript 的 session-scoped Markdown 计划文件。更新使用 `expected_revision` 做乐观并发控制，revision `0` 表示计划尚不存在；磁盘实现按 session 分文件并原子替换。daemon 在此基础上注入 `read_plan`、`write_plan`、`exit_plan_mode`：退出请求绑定计划的完整 revision/content，只有客户端显式批准同一版本才会切回 Default，拒绝或计划已变化都会留在 Plan。协议示例见 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。
-
 ## Capability 模式与工具策略
 
-`CapabilityMode` 与 Default/Plan 正交，并在 Provider 请求、hook 修改之后和工具真正执行前
-重复校验。最终权限是 Agent mode、capability mode、`ToolPolicy` 和工具自身
-`ToolEffect` 的交集：
+`CapabilityMode` 会在 Provider 请求、hook 修改之后和工具真正执行前重复校验。最终
+权限是 capability mode、`ToolPolicy` 和工具自身 `ToolEffect` 的交集：
 
-- `ReadOnly`：只允许只读、Agent 内部协调及 Plan-only 工具。
+- `ReadOnly`：只允许只读和 Agent 内部协调工具。
 - `WorkspaceEdit`：在 `ReadOnly` 基础上允许 `WorkspaceWrite`，但不允许 shell、网络等
   `ExternalSideEffect`。
-- `FullAccess`：不额外屏蔽 effect；Plan Mode 仍然保持更严格的只读/计划边界。
+- `FullAccess`：不额外屏蔽 effect。
 
 `ToolPolicy` 可用精确工具名配置 allow-list 和 deny-list；deny 对普通工具优先。daemon
-的 `askuser`、计划读取/写入/审批和关闭 child 等 harness 工具可以标记为 mandatory，
-从而绕过名称筛选，但仍然受 Agent mode 与 capability mode 限制。capability 存入
-session snapshot；持久化失败时运行时只会保留更窄的模式，不会意外升权。
+的 `askuser` 和关闭 child 等 harness 工具可以标记为 mandatory，从而绕过名称筛选，
+但仍然受 capability mode 限制。capability 存入 session snapshot；持久化失败时运行时
+只会保留更窄的能力，不会意外升权。
 
-模式切换约束之后的工具暴露/执行，并会收紧或关闭权限过宽的 child；它不会回滚已经完成
-的外部副作用。先前已获准启动的 background Bash 也不是 OS sandbox 中的进程，
+capability 切换约束之后的工具暴露/执行，并会收紧或关闭权限过宽的 child；它不会回滚
+已经完成的外部副作用。先前已获准启动的 background Bash 也不是 OS sandbox 中的进程，
 需要通过 `bash_task_stop` 或 session shutdown 显式终止。
 
 这是应用层 capability sandbox，不是操作系统沙盒。`ReadOnly`/`WorkspaceEdit` 下，
@@ -293,6 +270,9 @@ parent.add_tool(close_agent);
 `send_agent_message` 在 provider/tool 协议安全边界注入消息，idle child 会被唤醒。
 runtime 自动只给 child 注入 `notify_parent`：`progress` 可观察但不唤醒父 Agent，
 `blocker`/`result` 会唤醒；失败、输出校验和资源 finalization 也会产生结构化事件。
+用于唤醒父 Agent 的运行时输入以 `MessageVisibility::Internal` 保留在 provider-safe
+transcript 中，模型仍会收到它，但应用可以将其排除在用户对话 UI 之外；普通消息默认
+为 `Public`，因此旧 transcript 仍可直接读取。
 `close_agent` 可关闭 Starting、Running 或 Idle child，永久拒绝后续消息且幂等。child
 默认不会得到 `spawn_agent`，因此不能递归创建下一级 Agent。
 
@@ -399,14 +379,18 @@ let claude = AnthropicMessagesProvider::new("anthropic-key", "model-name")?;
 - Responses：typed `message`、`function_call`、`function_call_output` Items
 - Claude Messages：`tool_use` 与 `tool_result` content blocks，system message 转顶层 `system`
 
-响应中的思考数据会作为 opaque `ProviderState` 随 assistant `Message` 保留，并在后续请求中按原协议回放：
+Adapter 会把可显示的思考文本规范化到 assistant `Message.reasoning`，并通过
+`AssistantDelta::Reasoning` 实时发布；同时完整思考数据仍作为 opaque `ProviderState`
+随消息保留，并在后续请求中按原协议回放：
 
 - Chat Completions：`reasoning_content`、`reasoning` 与完整 `reasoning_details`
 - Responses：原始 output Items，包括 `type: "reasoning"` Items
 - Anthropic Messages：原始 `thinking`/`redacted_thinking` content blocks，包括 `signature`
 
 工具续轮与普通下一轮都会保留这些数据。业务代码复制或重建 `Message` 时也应保留
-`provider_state`；其 `Debug` 输出只展示类型和数量，不打印思考正文。
+`provider_state`；其 `Debug` 输出只展示类型和数量，不打印思考正文。规范化 reasoning
+只包含文本，不包含 Anthropic signature、redacted thinking、Responses encrypted
+content 或其他协议回放字段。
 
 ## 扩展请求体
 
@@ -586,7 +570,7 @@ pub trait SessionStorage: Send + Sync {
 }
 ```
 
-两个增量方法都有回退到 `save` 的默认实现，因此已有自定义 storage 不需要改动；追加型实现可以利用消息游标避免反复加载完整快照。
+两个增量方法都有回退到 `save` 的默认实现，因此已有自定义 storage 不需要改动；追加型实现可以利用消息游标避免反复加载完整快照。`SessionSnapshot::messages` 是下一次 Provider 请求使用的 active transcript，`SessionSnapshot::history` 则是压缩后仍供宿主回看的完整会话投影；后者绝不会作为模型输入。
 
 内存 storage 适合测试或单进程临时会话；clone 后共享同一份状态：
 
@@ -616,9 +600,9 @@ agent
 # }
 ```
 
-每个同步点只向 JSONL 尾部写入一条记录。正常增长使用 `append`，只包含新增消息和最新 usage；工具 journal 或清空历史需要更新尾部时使用 `replace_tail`，只包含变化起点及新尾部；完整 `replace` 保留给通用 snapshot 保存。`DiskSessionStorage` 会缓存每个已加载 session 的文件游标，正常 Agent checkpoint 不再重新读取和重建整个 JSONL；检测到文件被外部修改或有残缺尾行时才重新校验。加载时仍按行回放，未完成的最后一行会被忽略并在下次保存前截断。
+每个同步点只向 JSONL 尾部写入一条记录。正常增长使用 `append`，只包含新增消息和最新 usage；工具 journal 或清空历史需要更新尾部时使用 `replace_tail`，只包含变化起点及新尾部；完整 `replace` 保留给通用 snapshot 保存。`DiskSessionStorage` 会缓存每个已加载 session 的文件游标，正常 Agent checkpoint 不再重新读取和重建整个 JSONL；检测到文件被外部修改或有残缺尾行时才重新校验。加载时仍按行回放，未完成的最后一行会被忽略并在下次保存前截断。回放同时从压缩前的旧记录重建 `history` 与全部压缩边界，因此升级前已经压缩过的 append-only session 也能恢复可见历史，只要原 JSONL 记录仍在。
 
-`attach_session` 会恢复已有的 `messages`、最后一次 usage、累计 usage、执行模式和
+`attach_session` 会恢复已有的 active `messages`、完整 `history`、最后一次 usage、累计 usage、执行模式和
 workspace；session 不存在时则把当前 Agent 状态关联到这个新 ID。workspace 一旦写入
 session snapshot 就不可重绑定：使用不同 workspace 构建的 Agent 恢复该 session 会
 返回 `StorageError::WorkspaceMismatch`。旧 snapshot 没有 workspace 字段时可由首次
@@ -644,7 +628,13 @@ let mut agent = Agent::builder(provider)
 
 流式 delta 不写 storage。工具执行前的 journal 保存失败时不会启动工具；如果工具可能已经产生副作用但结果未能确认，恢复后会保留 `unknown` 结果且不会自动重放该调用。这样避免 transcript 回滚导致重复执行，但并不声称外部副作用具备 exactly-once 语义；支付、消息发送等工具仍应使用 `tool_call.id` 作为幂等键。保存失败会返回 `AgentError::Storage`，不会静默继续后续 LLM 或工具。
 
-Session 持久化消息、usage 以及 assistant 消息携带的 opaque `ProviderState`，因此恢复后仍能无损续接推理/工具上下文。API key、model、base URL、system prompt 与工具实现不会写入 session 文件。Provider state 可能包含明文思考内容或可回放的加密块，应按敏感数据保护 session 文件。`examples/agent.rs` 可通过 `LLM_SESSION_ID` 开启磁盘 session，并用 `LLM_SESSION_DIR` 指定目录。
+Session 持久化消息、消息的 `visibility`、usage 以及 assistant 消息携带的 opaque
+`ProviderState`，因此恢复后仍能无损续接推理/工具上下文。`visibility=internal` 只控制
+应用展示，不会从 Provider 请求中删除该消息；旧记录缺少该字段时按 `public` 读取。
+API key、model、base URL、system prompt 与工具实现不会写入 session 文件。Provider
+state 可能包含明文思考内容或可回放的加密块，应按敏感数据保护 session 文件。
+`examples/agent.rs` 可通过 `LLM_SESSION_ID` 开启磁盘 session，并用 `LLM_SESSION_DIR`
+指定目录。
 
 ## 思考强度
 
@@ -745,7 +735,7 @@ println!("Agent 累计 API 用量：{}", agent.cumulative_usage().total_tokens);
 # }
 ```
 
-`run_usage` 是本次 Agent loop 内所有模型请求的 token 总和，适合用量/成本统计；`context_usage` 只采用最后一次模型响应的 `total_tokens`，用于衡量当前对话实际占用，二者不能混用。
+`run_usage` 是本次 Agent loop 内所有模型请求的 Provider accounting 总和，适合用量/成本统计；`context_usage` 则使用最后一次正常模型响应的规范化 `input_tokens + output_tokens` 衡量窗口占用。Provider 返回的 `total_tokens` 可能包含供应商特有的计费单位，因此不会反向覆盖上下文容量；二者不能混用。
 
 ### 上下文压缩
 
@@ -764,7 +754,7 @@ let agent = Agent::builder(provider)
 # }
 ```
 
-`DefaultContextCompactor` 是内置的默认方案实现：使用当前 Agent 的同一模型生成纯文本摘要，禁用工具和 reasoning，summary 最多输出 20k tokens；图片和文档在摘要请求中替换为标记，opaque provider state 不参与摘要。成功前不会修改 live transcript；成功后用 `Conversation compacted` boundary 和 synthetic user summary 原子替换 active history，并通过 `save_replacing_from` 持久化。摘要请求自身超出窗口时会按协议安全的完整消息组从头裁剪，最多重试 3 次。
+`DefaultContextCompactor` 是内置的默认方案实现：使用当前 Agent 的同一模型生成纯文本摘要，禁用工具和 reasoning，summary 最多输出 20k tokens；图片和文档在摘要请求中替换为标记，规范化 reasoning 与 opaque provider state 都不参与摘要。成功前不会修改 live transcript；成功后用标记为 `internal` 的 `Conversation compacted` boundary 和 synthetic user summary 原子替换 active transcript，并通过 `save_replacing_from` 持久化。被替换的消息继续保留在独立的 `SessionHistory` 中，供重新 attach 或重启后的 UI 回看，但不会重新进入 Provider 上下文；两条内部压缩消息仍会交给 Provider 续接上下文，daemon public history 不暴露其正文。摘要请求自身超出窗口时会按协议安全的完整消息组从头裁剪，最多重试 3 次。
 
 自动压缩不是固定百分比。默认实现采用固定余量公式：
 
@@ -842,27 +832,47 @@ HTTP/WebSocket 接口：
 - `GET /v1/providers`：列出 daemon 的命名 Provider profiles（密钥不回显）。
 - `GET/PUT /v1/providers/{profile_id}`：查询或原子更新指定 Provider profile。
 - `GET /v1/agent-profiles`、`GET/PUT /v1/agent-profiles/{agent_profile_id}`：管理
-  prompt、工具/skill 筛选、初始模式和生成 override；revision 按 profile 独立递增。
-- `GET /v1/sessions`：列出已经持久化的 session。
+  prompt、工具/skill 筛选、初始 capability 和生成 override；revision 按 profile 独立递增。
+- `GET /v1/sessions`：列出已经持久化的 session；同时返回向后兼容的有序
+  `sessions` 和由 daemon 按工作区投影的 `workspaces` 树。
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
+- `PATCH /v1/sessions/{session_id}`：持久化设置或取消会话置顶。
+- `DELETE /v1/sessions/{session_id}`：关闭 live actor，并删除会话 metadata 与 transcript。
+- `POST /v1/sessions/{session_id}/fork`：从指定 public assistant 消息之后，或从其
+  `before_tool_calls` 持久化检查点，克隆一个新的离线 session；运行中的工具阶段也可用。
+- `GET/POST /v1/scheduled-tasks`：列出或创建持久化的每日/间隔定时任务。
+- `GET/PATCH/DELETE /v1/scheduled-tasks/{task_id}`：查询、暂停/恢复或删除任务；
+  `POST .../{task_id}/run` 可立即执行一次。
+- `GET /v1/workspaces/browse?path=...`：从 daemon 默认 workspace 或指定绝对路径浏览
+  可读取子目录，供新 session 选择工作目录。
 - `POST /v1/auth/token`：使用长期 bearer key 换取 60 秒有效、单次使用的 WebSocket subprotocol token。
-- `GET /v1/ws/new?profile_id=...&agent_profile_id=...&capability_mode=...`：选择
-  Provider、Agent Profile 和可选 capability override；首 prompt 才初始化并持久化。
+- `GET /v1/ws/new?profile_id=...&agent_profile_id=...&capability_mode=...&workspace=...`：选择
+  Provider、Agent Profile、可选 capability override 和工作目录；首 prompt 才初始化并持久化。
 - `GET /v1/ws/attach/{session_id}`：返回历史与当前快照，并持续订阅流式事件；可发送 `compact` 主动触发默认上下文压缩。
 - `GET /v1/ws/attach/{session_id}/subagents/{agent_id}`：只读观察 child Agent；任何 text/binary 输入都以 `1008` 拒绝。
 
 同一 session 可以被多个 WebSocket 同时 attach；运行期间的新 prompt 会进入有界
 FIFO，stop、状态、模型和 capability 变化会同步广播。每个 session 由单独 actor 串行拥有
 `Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会自动获得
-`askuser`、subagent 工具以及三个 Plan 工具；父 Agent 创建 child 时会向 session
-调用方广播结构化事件，child 的流式过程可通过独立只读 WebSocket 观察。问题和 Exit
-审批通过广播发送，任一 attach 客户端可处理，断线重连可从 snapshot 的 pending 状态恢复。
+`askuser` 和 subagent 工具；父 Agent 创建 child 时会向 session 调用方广播结构化事件，
+child 的流式过程可通过独立只读 WebSocket 观察。问题通过广播发送，任一 attach 客户端
+可回答，断线重连可从 snapshot 的 pending 状态恢复。
+
+定时任务由 daemon 进程调度，每次执行都创建独立 session，并把任务名作为
+session 标题。同一任务不重叠执行；下一次计划在开始 Agent 前持久化，避免进程
+崩溃后自动重放可能已发生的外部副作用。daemon 必须持续运行才能准时触发。
+
+首个 prompt 入队后，daemon 会异步生成并持久化 session 标题，再向所有 attach 客户端
+广播 `title_changed`。可通过 `PHI_DAEMON_SESSION_TITLE_PROFILE_ID` 指定独立的
+Provider profile；未设置时复用当前 session 的 profile，并采用该 session 的有效
+model。标题请求始终禁用 reasoning，并且不阻塞主 run；生成后会在主 run 仍进行时立即
+持久化和广播。失败时 session 继续保持可用且标题为 `null`。
 
 ```bash
 PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key cargo run -p phi-daemon
 ```
 
-daemon 要求 key 文件至少包含 32 个可打印非空白 ASCII 字节，建议权限为 `0600`。所有 HTTP API 通过 `Authorization: Bearer <key>` 鉴权；WebSocket 客户端同时 offer `phi.v1` 与 `phi.auth.<temporary-token>`，服务端只选择固定的 `phi.v1`。默认监听 `127.0.0.1:8787`，可以通过环境变量修改：
+daemon 要求 key 文件至少包含 32 个可打印非空白 ASCII 字节，建议权限为 `0600`。所有 HTTP API 通过 `Authorization: Bearer <key>` 鉴权；WebSocket 客户端同时 offer `phi.v1` 与 `phi.auth.<temporary-token>`，服务端只选择固定的 `phi.v1`。默认监听 `127.0.0.1:8787`，可以通过环境变量修改。默认 transport 是 HTTP/WS；同时配置 `PHI_DAEMON_TLS_CERT_FILE` 和 `PHI_DAEMON_TLS_KEY_FILE` 后，同一监听地址改为 HTTPS/WSS，两个变量只设置一个会拒绝启动：
 
 ```bash
 PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
@@ -874,21 +884,51 @@ PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
 ### Web client
 
 `web/` 提供 React/Vite 客户端。开发服务器会把 `/v1` HTTP 与 WebSocket 请求代理到
-默认的 `http://127.0.0.1:8787` daemon：
+默认的 `http://127.0.0.1:8787` daemon。可用 `PHI_WEB_DAEMON_PROXY_TARGET` 覆盖目标；
+连接使用自签名证书的 TLS daemon 时，应通过 `NODE_EXTRA_CA_CERTS` 显式信任证书：
 
 ```bash
 cd web
 pnpm install
 pnpm dev
+
+# TLS daemon 示例；路径相对于 web/。
+NODE_EXTRA_CA_CERTS=../.phi/daemon/tls/localhost.crt \
+  PHI_WEB_DAEMON_PROXY_TARGET=https://localhost:8787 \
+  pnpm dev
 ```
 
-首次使用需在设置中保存 daemon 长期 key 和 Provider profile。已有本地配置时，页面会
-自动连接一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
+首次使用需在设置中保存 daemon 长期 key 和至少一个 Provider profile。设置页会列出
+daemon 中的全部命名 Provider profiles，可在同一界面新增配置、切换编辑并选择新对话的
+默认 profile；daemon 已保存的 API key 不会返回浏览器。已有本地配置时，页面会自动连接
+一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
 客户端在 `session_created` 后继续复用原 WebSocket，不会在首条消息开始时强制重连；
 连接中断后，已激活 session 会通过 attach 自动退避恢复。prompt 使用 `request_id`
-维护本地发送/接纳/排队状态，可连续加入 daemon FIFO；压缩 replacement patch、
-usage、AskUser 多选和多 turn 工具轨迹都会实时投影。界面提供 Plan/Build 模式切换、
-主动压缩、独立 Stop/Queue 操作、响应式会话导航和移动端布局。
+维护本地发送/接纳/排队状态，可连续加入 daemon FIFO；压缩状态、usage、AskUser
+多选和多 turn 工具轨迹都会实时投影。同一次 assistant 响应包含多个工具调用时，前端会
+默认把它们归纳为一行动作摘要；展开后仍使用逐工具行，每行可再次展开参数与输出，单个
+工具调用保持原有展示。压缩期间时间线显示不确定进度，完成后保留完整可见
+对话并插入“上下文已压缩”分隔线；重新 attach 或 daemon 重启后也会从 durable history
+恢复压缩前内容和全部分隔线，摘要 prompt、结果和 transcript replacement 不进入
+浏览器。输入框底栏提供 capability、Provider/model、reasoning 与上下文容量明细；
+Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt 前，选择不同 profile
+会保留当前 workspace 并重建 `/new` 连接；session 激活后，列表中的 profile 只作为模型
+预设，通过 `set_model` 修改下一次用户请求使用的 model，并保留输入草稿。已激活 session
+继续使用创建时固定的 Provider adapter、base URL 和凭据，不会热替换连接或混用协议特有
+历史；如需切换完整 Provider 连接，应新建对话。输入 `/` 会显示 `/compact` 和当前 session 中允许
+用户显式调用的 skills，skill 正文仍只在 daemon/library 展开后进入模型上下文。界面
+同时提供独立 Stop/Queue 操作、自动生成的会话标题、默认折叠的流式思考块、响应式会话
+导航和移动端布局。侧栏直接消费 daemon 返回的工作区树，并以默认展开的分支展示；
+工作区顺序取该组在“置顶优先、最新优先”会话序列中的首次出现位置，组内保持该序列
+顺序，前端不再自行聚类或排序。右键会话仍可置顶、取消置顶或确认后删除。新会话的
+工作区按钮先展开限制高度、内部滚动的最近工作区列表；选择“添加工作区”后再打开独立
+的目录浏览弹窗。用户消息支持复制；assistant 文本下方提供复制和“从此回复分叉”操作；当工具调用 journal
+已经持久化时，运行中的回复也会显示“从这批工具调用前分叉”，且不会把未完成 draft 或
+工具结果带入新 session。分叉成功后直接切换到新 session。时间线尾部会额外保留 composer
+之外的安全区，避免最后一行操作贴住浮动输入框。
+侧栏的“定时任务”页面可创建每日（IANA 时区与工作日）或间隔调度，并展示
+运行中/已暂停分组、下次时间与最近结果；可暂停、恢复、立即运行、删除或打开最近
+执行产生的 session。
 
 完整 Provider/Agent Profile、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon factory 按
@@ -916,4 +956,4 @@ workspace 继承该目录，worktree isolation 则使用独立 detached checkout
 - `crates/phi-daemon`：daemon 进程、HTTP/WS transport、session actor 与持久化编排
 
 这是精简的 agent-core 与单进程 daemon，而不是 Pi coding-agent CLI 的完整复刻；
-TUI、partial/micro compaction、TLS/origin 校验、多租户和分布式 actor 协调尚未包含。
+TUI、partial/micro compaction、WebSocket origin 校验、多租户和分布式 actor 协调尚未包含。

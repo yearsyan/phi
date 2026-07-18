@@ -7,11 +7,11 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, header},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use phi::CapabilityMode;
+use phi::{CapabilityMode, Content, SkillInvocation, Workspace};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -20,8 +20,9 @@ use super::{
     auth::{self, WS_AUTH_PROTOCOL_PREFIX, WS_PROTOCOL},
     dto::{
         AgentProfileRefDto, ClientCommand, ServerMessage, SessionConfigDto, SessionDto,
-        SubagentEventDto, SubagentSnapshotDto,
+        SkillSummaryDto, SubagentEventDto, SubagentSnapshotDto,
     },
+    workspace::resolve_workspace_path,
 };
 use crate::{
     runtime::DEFAULT_AGENT_PROFILE_ID,
@@ -50,6 +51,7 @@ struct NewSessionQuery {
     profile_id: Option<String>,
     agent_profile_id: Option<String>,
     capability_mode: Option<CapabilityMode>,
+    workspace: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -69,6 +71,13 @@ async fn new_session(
     if !authenticate_websocket(&headers, &state) {
         return auth::unauthorized_response();
     }
+    let workspace = match query.workspace {
+        Some(path) => match resolve_workspace_path(path.as_ref()).await {
+            Ok(workspace) => Some(workspace),
+            Err(error) => return error.into_response(),
+        },
+        None => None,
+    };
     let service = Arc::clone(state.service());
     let profile_id = query
         .profile_id
@@ -88,6 +97,7 @@ async fn new_session(
                 profile_id,
                 agent_profile_id,
                 capability_mode,
+                workspace,
             )
         })
 }
@@ -164,6 +174,7 @@ async fn handle_new(
     profile_id: String,
     agent_profile_id: String,
     capability_mode: Option<CapabilityMode>,
+    workspace: Option<Workspace>,
 ) {
     let (mut sender, receiver) = socket.split();
     if send_json(&mut sender, &ServerMessage::Building)
@@ -173,10 +184,24 @@ async fn handle_new(
         return;
     }
 
-    let prepared = match service
-        .prepare_session_configured(profile_id, agent_profile_id, capability_mode)
-        .await
-    {
+    let prepared = match workspace {
+        Some(workspace) => {
+            service
+                .prepare_session_configured_in_workspace(
+                    profile_id,
+                    agent_profile_id,
+                    capability_mode,
+                    workspace,
+                )
+                .await
+        }
+        None => {
+            service
+                .prepare_session_configured(profile_id, agent_profile_id, capability_mode)
+                .await
+        }
+    };
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = send_json(
@@ -197,13 +222,13 @@ async fn handle_new(
         &mut sender,
         &ServerMessage::Ready {
             config: SessionConfigDto::from_summary(&summary),
-            mode: summary.mode,
             capability_mode: summary.capability_mode,
             agent_profile: AgentProfileRefDto {
                 agent_profile_id: summary.agent_profile_id,
                 revision: summary.agent_profile_revision,
             },
             workspace: summary.workspace.as_ref().map(ToString::to_string),
+            skills: handle.skills().iter().map(SkillSummaryDto::from).collect(),
         },
     )
     .await
@@ -258,7 +283,7 @@ async fn handle_attach(socket: WebSocket, service: Arc<ApplicationService>, sess
     if send_json(
         &mut sender,
         &ServerMessage::Snapshot {
-            session: SessionDto::from(&snapshot),
+            session: SessionDto::from_view_with_skills(&snapshot, handle.skills()),
         },
     )
     .await
@@ -552,7 +577,10 @@ async fn socket_loop(
                         skip_through = snapshot.last_event_sequence;
                         if send_json(&mut sender, &ServerMessage::ResyncRequired {
                             skipped,
-                            session: SessionDto::from(&snapshot),
+                            session: SessionDto::from_view_with_skills(
+                                &snapshot,
+                                handle.skills(),
+                            ),
                         }).await.is_err() {
                             break;
                         }
@@ -579,6 +607,7 @@ async fn handle_command(
     let request_id = command.request_id().to_owned();
     match command {
         ClientCommand::Prompt { content, skill, .. } => {
+            let title_content = prompt_title_content(&content, skill.as_ref());
             let content = match handle.prepare_prompt(content, skill.as_ref()) {
                 Ok(content) => content,
                 Err(error) => return reject_handle(sender, request_id, error).await,
@@ -588,7 +617,11 @@ async fn handle_command(
             {
                 match pending
                     .service
-                    .activate_and_enqueue(&pending.prepared, content)
+                    .activate_and_enqueue_with_title_content(
+                        &pending.prepared,
+                        content,
+                        title_content,
+                    )
                     .await
                 {
                     Ok((_, queued)) => {
@@ -706,21 +739,6 @@ async fn handle_command(
                 Err(error) => reject_handle(sender, request_id, error).await,
             }
         }
-        ClientCommand::SetMode { mode, .. } => match handle.set_mode(mode).await {
-            Ok(()) => {
-                send_json(
-                    sender,
-                    &ServerMessage::CommandAccepted {
-                        request_id,
-                        command: "set_mode",
-                        run_id: None,
-                        queue_position: None,
-                    },
-                )
-                .await
-            }
-            Err(error) => reject_handle(sender, request_id, error).await,
-        },
         ClientCommand::SetCapabilityMode {
             capability_mode, ..
         } => match handle.set_capability_mode(capability_mode).await {
@@ -755,27 +773,31 @@ async fn handle_command(
             }
             Err(error) => reject_handle(sender, request_id, error).await,
         },
-        ClientCommand::DecidePlanApproval {
-            approval_id,
-            decision,
-            ..
-        } => match handle.decide_plan_approval(approval_id, decision).await {
-            Ok(()) => {
-                send_json(
-                    sender,
-                    &ServerMessage::CommandAccepted {
-                        request_id,
-                        command: "decide_plan_approval",
-                        run_id: None,
-                        queue_position: None,
-                    },
-                )
-                .await
-            }
-            Err(error) => reject_handle(sender, request_id, error).await,
-        },
         ClientCommand::Ping { .. } => send_json(sender, &ServerMessage::Pong { request_id }).await,
     }
+}
+
+fn prompt_title_content(content: &Content, skill: Option<&SkillInvocation>) -> Content {
+    let Some(skill) = skill else {
+        return content.clone();
+    };
+    let name = skill.name.trim().trim_start_matches('/');
+    let arguments = skill
+        .arguments
+        .as_deref()
+        .map(str::trim)
+        .filter(|arguments| !arguments.is_empty())
+        .or_else(|| match content {
+            Content::Text(text) => {
+                let text = text.trim();
+                (!text.is_empty()).then_some(text)
+            }
+            Content::Parts(_) => None,
+        });
+    Content::text(match arguments {
+        Some(arguments) => format!("/{name} {arguments}"),
+        None => format!("/{name}"),
+    })
 }
 
 async fn reject_handle(
@@ -791,9 +813,6 @@ async fn reject_handle(
         AgentHandleError::InvalidCommand { .. } => "invalid_command",
         AgentHandleError::AskUserNotPending { .. } => "askuser_not_pending",
         AgentHandleError::InvalidAskUserAnswer { .. } => "invalid_askuser_answer",
-        AgentHandleError::PlanApprovalNotPending { .. } => "plan_approval_not_pending",
-        AgentHandleError::InvalidPlanApprovalDecision { .. } => "invalid_plan_approval_decision",
-        AgentHandleError::StalePlanApproval { .. } => "stale_plan_approval",
         AgentHandleError::ActorStopped { .. } | AgentHandleError::ResponseDropped { .. } => {
             "actor_stopped"
         }
@@ -828,4 +847,25 @@ async fn send_json(
         .await
         .map_err(|_| ())?
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_skill_titles_keep_the_user_facing_invocation() {
+        let title = prompt_title_content(
+            &Content::text("security"),
+            Some(&SkillInvocation::new("review")),
+        );
+        assert_eq!(title.as_text(), Some("/review security"));
+    }
+
+    #[test]
+    fn argument_free_skill_titles_are_not_empty() {
+        let title =
+            prompt_title_content(&Content::text(""), Some(&SkillInvocation::new("/review")));
+        assert_eq!(title.as_text(), Some("/review"));
+    }
 }

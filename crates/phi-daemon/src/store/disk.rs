@@ -369,6 +369,8 @@ mod tests {
         );
 
         first.model = "model-2".to_owned();
+        first.title = Some("Disk-backed session".to_owned());
+        first.pinned = true;
         first.reasoning_effort = Some(ReasoningEffort::High);
         first.config_revision = 1;
         store.update_session(first.clone()).await.unwrap();
@@ -443,6 +445,8 @@ mod tests {
         let record = store.get_session(session_id).await.unwrap().unwrap();
         assert_eq!(record.workspace, None);
         assert_eq!(record.agent_profile, None);
+        assert_eq!(record.title, None);
+        assert!(!record.pinned);
 
         fs::remove_dir_all(root).await.unwrap();
     }

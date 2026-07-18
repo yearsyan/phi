@@ -148,17 +148,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::tool::{AgentMode, CapabilityMode, ToolExecutionContext};
+    use crate::tool::{CapabilityMode, ToolExecutionContext};
 
     fn restricted_context(
         workspace: &Path,
         capability_mode: CapabilityMode,
     ) -> ToolExecutionContext {
-        ToolExecutionContext::detached("test").with_workspace_policy(
-            Some(Workspace::new(workspace)),
-            AgentMode::Default,
-            capability_mode,
-        )
+        ToolExecutionContext::detached("test")
+            .with_workspace_policy(Some(Workspace::new(workspace)), capability_mode)
     }
 
     #[test]

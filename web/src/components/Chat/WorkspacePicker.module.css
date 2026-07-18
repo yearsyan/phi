@@ -1,0 +1,479 @@
+.picker {
+  position: relative;
+  z-index: 8;
+  min-width: 0;
+}
+
+.trigger,
+.workspaceOption,
+.addWorkspace,
+.header,
+.pathForm,
+.directory,
+.footer,
+.footerActions {
+  display: flex;
+  align-items: center;
+}
+
+.trigger {
+  max-width: 100%;
+  height: 38px;
+  gap: 8px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--phi-text-muted);
+  cursor: pointer;
+}
+
+.trigger:hover:not(:disabled),
+.trigger[aria-expanded="true"] {
+  background: var(--phi-surface-hover);
+  color: var(--phi-text-strong);
+}
+
+.trigger:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.trigger > svg:first-child {
+  flex: 0 0 auto;
+  font-size: 17px;
+}
+
+.trigger > svg:last-child {
+  flex: 0 0 auto;
+  font-size: 12px;
+  transition: transform 140ms ease;
+}
+
+.trigger[aria-expanded="true"] > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.trigger span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--phi-text);
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspaceMenu {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 8px;
+  z-index: 30;
+  width: min(320px, calc(100vw - 48px));
+  overflow: hidden;
+  border: 1px solid var(--phi-border-strong);
+  border-radius: 12px;
+  background: var(--phi-bg-elevated);
+  box-shadow: var(--phi-shadow-panel);
+}
+
+.workspaceList {
+  max-height: min(30vh, 220px);
+  padding: 7px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.workspaceOption {
+  width: 100%;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--phi-text-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.workspaceOption:hover,
+.workspaceOption:focus-visible,
+.workspaceOptionSelected {
+  background: var(--phi-surface-2);
+  color: var(--phi-text-strong);
+}
+
+.workspaceOption > svg {
+  flex: 0 0 auto;
+  font-size: 17px;
+}
+
+.workspaceOption > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.workspaceOption strong,
+.workspaceOption small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspaceOption strong {
+  color: var(--phi-text-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.workspaceOption small {
+  margin-top: 3px;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+}
+
+.workspaceMenuFooter {
+  padding: 6px;
+  border-top: 1px solid var(--phi-border);
+}
+
+.addWorkspace {
+  width: 100%;
+  gap: 10px;
+  padding: 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--phi-text);
+  font-size: 12px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+
+.addWorkspace:hover,
+.addWorkspace:focus-visible {
+  background: var(--phi-surface-hover);
+}
+
+.addWorkspace svg {
+  flex: 0 0 auto;
+  font-size: 17px;
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--phi-overlay);
+}
+
+.browserModal {
+  display: flex;
+  width: min(720px, 100%);
+  height: min(620px, calc(100dvh - 48px));
+  min-height: min(460px, calc(100dvh - 48px));
+  overflow: hidden;
+  flex-direction: column;
+  border: 1px solid var(--phi-border-strong);
+  border-radius: 16px;
+  background: var(--phi-bg-elevated);
+  box-shadow: var(--phi-shadow-panel);
+}
+
+.header {
+  flex: 0 0 auto;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--phi-border);
+}
+
+.header strong,
+.header span {
+  display: block;
+}
+
+.header strong {
+  color: var(--phi-text-strong);
+  font-size: 17px;
+}
+
+.header span {
+  margin-top: 4px;
+  color: var(--phi-text-dim);
+  font-size: 11px;
+}
+
+.closeButton {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--phi-text-muted);
+  cursor: pointer;
+}
+
+.closeButton:hover {
+  background: var(--phi-surface-hover);
+  color: var(--phi-text);
+}
+
+.pathForm {
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--phi-border);
+  background: var(--phi-surface-2);
+}
+
+.pathForm label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+
+.pathForm input {
+  min-width: 0;
+  height: 36px;
+  flex: 1;
+  padding: 0 11px;
+  border: 1px solid var(--phi-border);
+  border-radius: 8px;
+  outline: 0;
+  background: var(--phi-bg-elevated);
+  color: var(--phi-text);
+  font-family: var(--phi-mono);
+  font-size: 11px;
+}
+
+.pathForm input:focus {
+  border-color: var(--phi-accent-border);
+}
+
+.pathForm input:disabled {
+  color: var(--phi-text-dim);
+  cursor: wait;
+}
+
+.pathForm button,
+.useButton,
+.cancelButton {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pathForm button,
+.useButton {
+  border: 1px solid var(--phi-accent);
+  background: var(--phi-accent);
+  color: var(--phi-accent-contrast);
+}
+
+.cancelButton {
+  border: 1px solid var(--phi-border-strong);
+  background: var(--phi-surface);
+  color: var(--phi-text);
+}
+
+.pathForm button:disabled,
+.useButton:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.directoryList {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 8px 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.directory {
+  width: 100%;
+  gap: 10px;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--phi-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.directory:hover {
+  background: var(--phi-surface-hover);
+}
+
+.directoryIcon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--phi-border);
+  border-radius: 7px;
+  background: var(--phi-surface);
+  color: var(--phi-text-muted);
+  font-size: 15px;
+}
+
+.directoryText {
+  min-width: 0;
+  flex: 1;
+}
+
+.directoryText strong,
+.directoryText small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.directoryText strong {
+  color: var(--phi-text-strong);
+  font-size: 12px;
+}
+
+.directoryText small {
+  margin-top: 3px;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+}
+
+.directoryChevron {
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-size: 12px;
+  transform: rotate(-90deg);
+}
+
+.state,
+.error {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  padding: 24px;
+  color: var(--phi-text-dim);
+  font-size: 11px;
+  text-align: center;
+}
+
+.error {
+  color: var(--phi-danger);
+}
+
+.truncated {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  border-top: 1px solid var(--phi-border);
+  background: var(--phi-warning-soft);
+  color: var(--phi-warning);
+  font-size: 9px;
+}
+
+.footer {
+  flex: 0 0 auto;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 16px;
+  border-top: 1px solid var(--phi-border);
+  background: var(--phi-surface-2);
+}
+
+.currentWorkspace {
+  min-width: 0;
+  flex: 1;
+}
+
+.currentWorkspace span,
+.currentWorkspace strong {
+  display: block;
+}
+
+.currentWorkspace span {
+  color: var(--phi-text-dim);
+  font-size: 9px;
+}
+
+.currentWorkspace strong {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--phi-text);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.footerActions {
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+@media (max-width: 680px) {
+  .workspaceMenu {
+    right: 8px;
+    left: 8px;
+    width: auto;
+  }
+
+  .workspaceList {
+    max-height: min(34vh, 200px);
+  }
+
+  .modalBackdrop {
+    padding: 10px;
+  }
+
+  .browserModal {
+    height: calc(100dvh - 20px);
+    min-height: 0;
+    border-radius: 12px;
+  }
+
+  .header {
+    padding: 15px;
+  }
+
+  .pathForm {
+    padding: 10px;
+  }
+
+  .footer {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .footerActions {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trigger > svg:last-child {
+    transition: none;
+  }
+}

@@ -5,7 +5,6 @@ pub mod context;
 pub mod error;
 pub mod hook;
 pub mod mcp;
-pub mod plan;
 pub mod provider;
 pub mod skills;
 pub mod storage;
@@ -22,9 +21,9 @@ pub use agent::{
 pub use context::{
     ContextCompactionOutcome, ContextCompactionPlan, ContextCompactionRequest,
     ContextCompactionRunOutcome, ContextCompactionTrigger, ContextCompactor,
-    DEFAULT_CONTEXT_COMPACTION_BUFFER_TOKENS, DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES,
-    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS, DefaultContextCompactor,
-    default_context_compaction_threshold,
+    DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE, DEFAULT_CONTEXT_COMPACTION_BUFFER_TOKENS,
+    DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES, DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS,
+    DefaultContextCompactor, default_context_compaction_threshold,
 };
 pub use error::{
     AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError,
@@ -37,10 +36,6 @@ pub use mcp::{
     DEFAULT_MCP_CONNECT_TIMEOUT, DEFAULT_MCP_REQUEST_TIMEOUT, McpClient, McpClientOptions,
     McpHttpConfig, McpServerInfo, McpStdioConfig,
 };
-pub use plan::{
-    DiskPlanStore, EMPTY_PLAN_REVISION, InMemoryPlanStore, LockedPlan, MAX_PLAN_BYTES,
-    PlanArtifact, PlanStore, PlanStoreError,
-};
 pub use provider::{
     AnthropicMessagesProvider, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_STREAM_IDLE_TIMEOUT, LlmProvider, OpenAiChatProvider, OpenAiResponsesProvider,
@@ -52,7 +47,8 @@ pub use skills::{
     SkillInvocation, SkillMetadata, SkillTool, SkillsConfig,
 };
 pub use storage::{
-    DiskSessionStorage, InMemorySessionStorage, SessionSnapshot, SessionStorage, StorageError,
+    DiskSessionStorage, InMemorySessionStorage, SessionCompaction, SessionHistory, SessionSnapshot,
+    SessionStorage, StorageError,
 };
 pub use subagent::{
     ActiveSubagentRun, BuiltSubagent, CloseSubagentResult, ConfiguredSpawnAgentRequest,
@@ -76,12 +72,12 @@ pub use tool::subagent::{
     SubagentTools,
 };
 pub use tool::{
-    AgentMode, AgentModeControl, CapabilityMode, Tool, ToolCancellation, ToolConcurrency,
-    ToolEffect, ToolExecutionContext, ToolOutput, ToolPolicy, ToolProgress,
+    CapabilityMode, Tool, ToolCancellation, ToolConcurrency, ToolEffect, ToolExecutionContext,
+    ToolOutput, ToolPolicy, ToolProgress,
 };
 pub use types::{
     AgentEvent, AgentRun, AgentRunOutcome, AssistantDelta, AssistantMessage, Content, ContentPart,
-    ContextUsage, Document, GenerationConfig, ImageDetail, ImageUrl, Message,
+    ContextUsage, Document, GenerationConfig, ImageDetail, ImageUrl, Message, MessageVisibility,
     ParseReasoningEffortError, ProviderEvent, ProviderRequest, ProviderResponse,
     ProviderRetryEvent, ProviderRetryReason, ProviderState, ReasoningEffort, Role, TokenUsage,
     ToolCall, ToolDefinition, ToolExecutionMode,

@@ -1,0 +1,74 @@
+.viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.scroller {
+  height: 100%;
+}
+
+.list {
+  width: min(
+    100%,
+    calc(
+      var(--chat-content-width) +
+      var(--chat-horizontal-gutter) +
+      var(--chat-horizontal-gutter)
+    )
+  );
+  margin: 0 auto;
+  padding-right: var(--chat-horizontal-gutter);
+  padding-left: var(--chat-horizontal-gutter);
+}
+
+.bottomSpacer {
+  height: calc(var(--interaction-dock-height, 0px) + 64px);
+  pointer-events: none;
+}
+
+.row {
+  margin-top: 12px;
+}
+
+.rowFirst {
+  margin-top: 0;
+  padding-top: 16px;
+}
+
+.rowAfterUser {
+  margin-top: 16px;
+}
+
+.rowCompaction {
+  margin-top: 18px;
+  margin-bottom: 18px;
+}
+
+.rowDense {
+  margin-top: 5px;
+}
+
+.jumpButton {
+  position: absolute;
+  bottom: calc(var(--interaction-dock-height, 0px) + 14px);
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  transform: translateX(-50%);
+  border: 1px solid var(--phi-border-strong);
+  border-radius: 999px;
+  background: var(--phi-bg-elevated);
+  box-shadow: var(--phi-shadow-composer);
+  color: var(--phi-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.jumpButton:hover {
+  color: var(--phi-text-strong);
+  border-color: var(--phi-accent-border);
+}

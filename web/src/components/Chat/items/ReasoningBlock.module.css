@@ -1,0 +1,126 @@
+.root {
+  margin: 0 0 7px;
+  color: var(--phi-text-muted);
+}
+
+.trigger {
+  display: flex;
+  width: max-content;
+  max-width: 100%;
+  min-height: 22px;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  color: var(--phi-text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.5;
+  list-style: none;
+  user-select: none;
+}
+
+.trigger::-webkit-details-marker {
+  display: none;
+}
+
+.trigger:hover {
+  color: var(--phi-text-strong);
+}
+
+.trigger:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--phi-accent);
+  outline-offset: 3px;
+}
+
+.spark {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  transition: color 160ms ease;
+}
+
+.sparkLive {
+  color: var(--phi-warning);
+  animation: reasoningPulse 1.4s ease-in-out infinite;
+}
+
+.label {
+  display: inline-block;
+  padding: 1px 2px;
+  overflow: visible;
+  font-style: italic;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.chevron {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  opacity: 0.5;
+  transform: rotate(-90deg);
+  transition:
+    opacity 160ms ease,
+    transform 180ms ease;
+}
+
+.root[open] .chevron {
+  opacity: 0.75;
+  transform: rotate(0deg);
+}
+
+.content {
+  --phi-markdown-color: var(--phi-text-dim);
+
+  margin-top: 6px;
+  padding-left: 16px;
+  border-left: 2px solid var(--phi-border);
+  color: var(--phi-text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  animation: reasoningReveal 150ms ease-out;
+}
+
+.content :global(p:first-child) {
+  margin-top: 0;
+}
+
+.content :global(p:last-child) {
+  margin-bottom: 0;
+}
+
+@keyframes reasoningPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+    filter: drop-shadow(0 0 4px var(--phi-warning-soft));
+  }
+}
+
+@keyframes reasoningReveal {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sparkLive,
+  .content {
+    animation: none;
+  }
+
+  .chevron {
+    transition: none;
+  }
+}

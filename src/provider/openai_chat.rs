@@ -246,6 +246,7 @@ impl LlmProvider for OpenAiChatProvider {
 
 #[derive(Default)]
 struct ChatStreamState {
+    reasoning: String,
     text: String,
     tools: BTreeMap<usize, PendingToolCall>,
     reasoning_fields: BTreeMap<String, Value>,
@@ -279,7 +280,9 @@ impl ChatStreamState {
                 self.saw_normal_finish_reason = true;
             }
             let delta = &choice["delta"];
-            self.capture_reasoning(delta);
+            if let Some(reasoning) = self.capture_reasoning(delta) {
+                deltas.push(AssistantDelta::Reasoning { delta: reasoning });
+            }
             if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
                 self.text.push_str(text);
                 deltas.push(AssistantDelta::Text {
@@ -313,7 +316,15 @@ impl ChatStreamState {
         Ok(deltas)
     }
 
-    fn capture_reasoning(&mut self, delta: &Value) {
+    fn capture_reasoning(&mut self, delta: &Value) -> Option<String> {
+        let display_fragment = ["reasoning_content", "reasoning"]
+            .into_iter()
+            .find_map(|field| {
+                delta[field]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
         for field in ["reasoning", "reasoning_content"] {
             let Some(fragment) = delta[field].as_str().filter(|value| !value.is_empty()) else {
                 continue;
@@ -327,16 +338,19 @@ impl ChatStreamState {
             }
         }
 
-        let Some(details) = delta["reasoning_details"].as_array() else {
-            return;
-        };
-        let value = self
-            .reasoning_fields
-            .entry("reasoning_details".to_owned())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(captured) = value.as_array_mut() {
-            captured.extend(details.iter().cloned());
+        if let Some(details) = delta["reasoning_details"].as_array() {
+            let value = self
+                .reasoning_fields
+                .entry("reasoning_details".to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(captured) = value.as_array_mut() {
+                captured.extend(details.iter().cloned());
+            }
         }
+        if let Some(fragment) = &display_fragment {
+            self.reasoning.push_str(fragment);
+        }
+        display_fragment
     }
 
     fn finish(self) -> Result<ProviderResponse, ProviderError> {
@@ -363,6 +377,7 @@ impl ChatStreamState {
         Ok(ProviderResponse {
             message: AssistantMessage {
                 content,
+                reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 tool_calls,
                 provider_state: (!self.reasoning_fields.is_empty()).then_some(
                     ProviderState::OpenAiChat {
@@ -642,13 +657,18 @@ fn parse_response(response: ChatResponse) -> Result<ProviderResponse, ProviderEr
             "assistant message contains neither content nor tool calls".to_owned(),
         ));
     }
+    let provider_state = (!reasoning_fields.is_empty()).then_some(ProviderState::OpenAiChat {
+        fields: reasoning_fields,
+    });
+    let reasoning = provider_state
+        .as_ref()
+        .and_then(ProviderState::reasoning_text);
     Ok(ProviderResponse {
         message: AssistantMessage {
             content,
+            reasoning,
             tool_calls,
-            provider_state: (!reasoning_fields.is_empty()).then_some(ProviderState::OpenAiChat {
-                fields: reasoning_fields,
-            }),
+            provider_state,
         },
         usage,
     })
@@ -1064,9 +1084,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             deltas,
-            vec![AssistantDelta::Text {
-                delta: "hello".to_owned()
-            }]
+            vec![
+                AssistantDelta::Reasoning {
+                    delta: "think ".to_owned()
+                },
+                AssistantDelta::Text {
+                    delta: "hello".to_owned()
+                }
+            ]
         );
         state
             .apply(&json!({
@@ -1100,6 +1125,10 @@ mod tests {
             .unwrap();
 
         let response = state.finish().unwrap();
+        assert_eq!(
+            response.message.reasoning.as_deref(),
+            Some("think before tool")
+        );
         assert_eq!(response.message.content.unwrap().as_text(), Some("hello"));
         assert_eq!(
             response.message.tool_calls[0].arguments,

@@ -3,8 +3,8 @@ use std::{fs, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use futures_util::stream;
 use phi::{
-    Agent, Content, InMemoryPlanStore, InMemorySessionStorage, LlmProvider, ProviderEventStream,
-    ProviderRequest, SkillCatalog, SkillInvocation, SkillsConfig, Workspace,
+    Agent, Content, InMemorySessionStorage, LlmProvider, ProviderEventStream, ProviderRequest,
+    SkillCatalog, SkillInvocation, SkillsConfig, Workspace,
 };
 use phi_daemon::{
     api::AppState,
@@ -92,7 +92,7 @@ async fn test_catalog() -> (TestSkillsDir, SkillCatalog) {
 async fn handle_exposes_snapshot_and_expands_selected_skill() {
     let (_root, catalog) = test_catalog().await;
     let session_id = SessionId::new();
-    let handle = AgentHandle::spawn_with_plan_store_and_skills(
+    let handle = AgentHandle::spawn_with_skills(
         session_id,
         Agent::builder(NeverProvider)
             .skills(catalog.clone())
@@ -100,7 +100,6 @@ async fn handle_exposes_snapshot_and_expands_selected_skill() {
         "default",
         "test-model",
         None,
-        Arc::new(InMemoryPlanStore::new()),
         catalog,
     );
 

@@ -2,9 +2,10 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use phi::{
-    Agent, AgentMode, AnthropicMessagesProvider, BuiltinTools, CapabilityMode, ContextCompactor,
-    DefaultContextCompactor, OpenAiChatProvider, OpenAiResponsesProvider, ProviderError,
-    ReasoningEffort, RetryConfig, SkillCatalog, SkillError, SkillsConfig, Workspace,
+    Agent, AnthropicMessagesProvider, BuiltinTools, CapabilityMode, ContextCompactor,
+    DefaultContextCompactor, HookRegistry, LlmProvider, OpenAiChatProvider,
+    OpenAiResponsesProvider, ProviderError, ProviderEventStream, ProviderRequest, ReasoningEffort,
+    RetryConfig, SkillCatalog, SkillError, SkillsConfig, Workspace,
 };
 use thiserror::Error;
 
@@ -33,7 +34,6 @@ pub struct AgentBuildRequest {
     pub reasoning_effort_is_override: bool,
     pub workspace: Option<Workspace>,
     pub capability_mode: Option<CapabilityMode>,
-    pub agent_mode: Option<AgentMode>,
     pub prompt_overlay: Option<String>,
 }
 
@@ -50,7 +50,6 @@ impl AgentBuildRequest {
             reasoning_effort_is_override: false,
             workspace: None,
             capability_mode: None,
-            agent_mode: None,
             prompt_overlay: None,
         }
     }
@@ -103,11 +102,6 @@ impl AgentBuildRequest {
         self
     }
 
-    pub fn with_agent_mode(mut self, agent_mode: AgentMode) -> Self {
-        self.agent_mode = Some(agent_mode);
-        self
-    }
-
     pub fn with_prompt_overlay(mut self, prompt_overlay: impl Into<String>) -> Self {
         self.prompt_overlay = Some(prompt_overlay.into());
         self
@@ -140,6 +134,30 @@ pub trait AgentFactory: Send + Sync {
 /// restart-restored actors do not require process environment variables.
 type ContextCompactorFactory =
     dyn Fn(&AgentBuildRequest) -> Arc<dyn ContextCompactor> + Send + Sync + 'static;
+
+pub(crate) enum ConfiguredProvider {
+    OpenAiChat(OpenAiChatProvider),
+    OpenAiResponses(OpenAiResponsesProvider),
+    Anthropic(AnthropicMessagesProvider),
+}
+
+impl LlmProvider for ConfiguredProvider {
+    fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
+        match self {
+            Self::OpenAiChat(provider) => provider.stream(request),
+            Self::OpenAiResponses(provider) => provider.stream(request),
+            Self::Anthropic(provider) => provider.stream(request),
+        }
+    }
+
+    fn extend_hooks(&mut self, hooks: HookRegistry) {
+        match self {
+            Self::OpenAiChat(provider) => provider.extend_hooks(hooks),
+            Self::OpenAiResponses(provider) => provider.extend_hooks(hooks),
+            Self::Anthropic(provider) => provider.extend_hooks(hooks),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ConfiguredAgentFactory {
@@ -251,10 +269,6 @@ impl AgentFactory for ConfiguredAgentFactory {
                 profile_id: request.profile_id.clone(),
             })?;
         let config = normalize_provider_config(config)?;
-        let retry_config = RetryConfig::default()
-            .with_max_retries(config.max_retries)
-            .with_request_timeout(Duration::from_secs(config.request_timeout_secs))
-            .with_stream_idle_timeout(Duration::from_secs(config.stream_idle_timeout_secs));
         let workspace = request
             .workspace
             .clone()
@@ -306,47 +320,16 @@ impl AgentFactory for ConfiguredAgentFactory {
                 .or(config.reasoning_effort)
         };
 
-        let mut builder = match config.provider {
-            ProviderKind::OpenAiChat => Agent::builder(
-                OpenAiChatProvider::new_with_client(
-                    self.http_client.clone(),
-                    config.api_key.clone(),
-                    config.base_url.clone(),
-                    model.clone(),
-                )?
-                .retry_config(retry_config),
-            ),
-            ProviderKind::OpenAiResponses => Agent::builder(
-                OpenAiResponsesProvider::new_with_client(
-                    self.http_client.clone(),
-                    config.api_key.clone(),
-                    config.base_url.clone(),
-                    model.clone(),
-                )?
-                .retry_config(retry_config),
-            ),
-            ProviderKind::Anthropic => Agent::builder(
-                AnthropicMessagesProvider::with_base_url_and_client(
-                    self.http_client.clone(),
-                    config.api_key.clone(),
-                    config.base_url.clone(),
-                    model.clone(),
-                )?
-                .retry_config(retry_config),
-            ),
-        };
+        let provider = build_configured_provider(&config, &model, self.http_client.clone())?;
+        let mut builder = Agent::builder(provider);
         let capability_mode = request
             .capability_mode
             .unwrap_or(agent_profile.definition.initial_capability_mode);
-        let agent_mode = request
-            .agent_mode
-            .unwrap_or(agent_profile.definition.initial_agent_mode);
         let tool_policy = agent_profile.definition.tools.to_tool_policy();
         builder = builder
             .model(model.clone())
             .workspace(workspace.clone())
             .system_prompt(agent_profile.compiled_system_prompt.clone())
-            .mode(agent_mode)
             .capability_mode(capability_mode)
             .tool_policy(tool_policy);
 
@@ -381,6 +364,46 @@ impl AgentFactory for ConfiguredAgentFactory {
             model,
             reasoning_effort,
         })
+    }
+}
+
+pub(crate) fn build_configured_provider(
+    config: &ProviderConfig,
+    model: &str,
+    http_client: reqwest::Client,
+) -> Result<ConfiguredProvider, ProviderError> {
+    let retry_config = RetryConfig::default()
+        .with_max_retries(config.max_retries)
+        .with_request_timeout(Duration::from_secs(config.request_timeout_secs))
+        .with_stream_idle_timeout(Duration::from_secs(config.stream_idle_timeout_secs));
+    match config.provider {
+        ProviderKind::OpenAiChat => Ok(ConfiguredProvider::OpenAiChat(
+            OpenAiChatProvider::new_with_client(
+                http_client,
+                config.api_key.clone(),
+                config.base_url.clone(),
+                model.to_owned(),
+            )?
+            .retry_config(retry_config),
+        )),
+        ProviderKind::OpenAiResponses => Ok(ConfiguredProvider::OpenAiResponses(
+            OpenAiResponsesProvider::new_with_client(
+                http_client,
+                config.api_key.clone(),
+                config.base_url.clone(),
+                model.to_owned(),
+            )?
+            .retry_config(retry_config),
+        )),
+        ProviderKind::Anthropic => Ok(ConfiguredProvider::Anthropic(
+            AnthropicMessagesProvider::with_base_url_and_client(
+                http_client,
+                config.api_key.clone(),
+                config.base_url.clone(),
+                model.to_owned(),
+            )?
+            .retry_config(retry_config),
+        )),
     }
 }
 

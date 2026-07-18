@@ -107,6 +107,8 @@ mod tests {
         ));
 
         store.create_session(record.clone()).await.unwrap();
+        record.title = Some("Storage session".to_owned());
+        record.pinned = true;
         record.model = "model-2".to_owned();
         record.reasoning_effort = Some(ReasoningEffort::High);
         record.config_revision = 1;

@@ -1,9 +1,10 @@
 use std::{
     io,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -11,18 +12,17 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use phi::{
-    Agent, AgentEvent, AgentMode, AssistantDelta, AssistantMessage, CapabilityMode, Content,
+    Agent, AgentEvent, AssistantDelta, AssistantMessage, CapabilityMode, Content,
     ContextCompactionError, ContextCompactionPlan, ContextCompactionRequest, ContextCompactor,
-    InMemoryPlanStore, InMemorySessionStorage, LlmProvider, Message, PlanStore, ProviderError,
-    ProviderEvent, ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot,
-    SessionStorage, SkillCatalog, StorageError, TokenUsage, Tool, ToolCall, ToolDefinition,
-    ToolError, ToolOutput, Workspace,
+    InMemorySessionStorage, LlmProvider, Message, ProviderError, ProviderEvent,
+    ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot, SessionStorage,
+    SkillCatalog, TokenUsage, Tool, ToolCall, ToolDefinition, ToolError, ToolOutput, Workspace,
 };
 use phi_daemon::{
     api::AppState,
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandleError, AgentRegistry,
-        AgentStatus, BuiltAgent, PlanApprovalDecision, RunId, RuntimeEvent, RuntimeEventKind,
+        AgentStatus, BuiltAgent, RunId, RuntimeEvent, RuntimeEventKind, SessionId,
         compile_agent_profile, default_agent_profile,
     },
     serve,
@@ -49,6 +49,45 @@ const AUTH_KEY: &str = "a-secure-test-key-with-at-least-32-bytes";
 const WS_PROTOCOL: &str = "phi.v1";
 const WS_AUTH_PROTOCOL_PREFIX: &str = "phi.auth.";
 
+#[derive(Clone, Default)]
+struct DeleteFailingSessionStorage {
+    inner: InMemorySessionStorage,
+}
+
+#[async_trait]
+impl SessionStorage for DeleteFailingSessionStorage {
+    async fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, phi::StorageError> {
+        self.inner.load(session_id).await
+    }
+
+    async fn save(&self, session: &SessionSnapshot) -> Result<(), phi::StorageError> {
+        self.inner.save(session).await
+    }
+
+    async fn delete(&self, _session_id: &str) -> Result<(), phi::StorageError> {
+        Err(phi::StorageError::Io {
+            path: "/injected/delete-failure".into(),
+            source: std::io::Error::other("injected transcript deletion failure"),
+        })
+    }
+}
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", SessionId::new()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[derive(Clone)]
 enum ProviderScript {
     Immediate,
@@ -65,14 +104,6 @@ enum ProviderScript {
         started: Arc<Notify>,
     },
     AskUser,
-    ExitPlanMode,
-    ExitPlanModeStale,
-    ExitPlanModeTimeoutThenRetry {
-        retry_ready: Arc<Notify>,
-        release_retry: Arc<Notify>,
-    },
-    PlanBatchWriteThenExit,
-    PlanBatchExitThenWrite,
     ToolCall,
     PanickingToolCall,
     Subagent,
@@ -186,213 +217,14 @@ impl LlmProvider for ScriptedProvider {
                 );
                 immediate_stream(call)
             }
-            ProviderScript::ExitPlanMode
-            | ProviderScript::ExitPlanModeStale
-            | ProviderScript::ExitPlanModeTimeoutThenRetry { .. }
-                if call == 0 =>
-            {
-                let tool_names = request
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>();
-                assert!(tool_names.contains(&"read_plan"));
-                assert!(tool_names.contains(&"write_plan"));
-                assert!(tool_names.contains(&"exit_plan_mode"));
-                Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
-                        "exit-plan-call-1",
-                        "exit_plan_mode",
-                        json!({}),
-                    )]),
-                    usage: None,
-                }))]))
-            }
-            ProviderScript::ExitPlanMode => {
-                assert!(
-                    request.tools.iter().all(|tool| !matches!(
-                        tool.name.as_str(),
-                        "read_plan" | "write_plan" | "exit_plan_mode"
-                    )),
-                    "plan-only tools must disappear immediately after approval"
-                );
-                let result = request
-                    .messages
-                    .iter()
-                    .find(|message| {
-                        message.role == Role::Tool
-                            && message.tool_call_id.as_deref() == Some("exit-plan-call-1")
-                    })
-                    .expect("the exit approval result must be sent back to the provider");
-                assert!(!result.tool_result_is_error);
-                let decision: serde_json::Value =
-                    serde_json::from_str(result.text_content().unwrap()).unwrap();
-                assert_eq!(decision["type"], "approve");
-                assert_eq!(decision["revision"], 1);
-                immediate_stream(call)
-            }
-            ProviderScript::ExitPlanModeStale => {
-                assert!(
-                    request
-                        .tools
-                        .iter()
-                        .any(|tool| tool.name == "exit_plan_mode"),
-                    "a rejected stale approval must leave the agent in plan mode"
-                );
-                let result = request
-                    .messages
-                    .iter()
-                    .find(|message| {
-                        message.role == Role::Tool
-                            && message.tool_call_id.as_deref() == Some("exit-plan-call-1")
-                    })
-                    .expect("the stale exit result must be sent back to the provider");
-                assert!(result.tool_result_is_error);
-                assert!(result.text_content().is_some_and(|content| {
-                    content.contains("plan changed while approval was pending")
-                }));
-                immediate_stream(call)
-            }
-            ProviderScript::ExitPlanModeTimeoutThenRetry {
-                retry_ready,
-                release_retry,
-            } if call == 1 => {
-                assert!(
-                    request
-                        .tools
-                        .iter()
-                        .any(|tool| tool.name == "exit_plan_mode"),
-                    "timing out an exit must leave the agent in plan mode"
-                );
-                let first = request
-                    .messages
-                    .iter()
-                    .find(|message| {
-                        message.role == Role::Tool
-                            && message.tool_call_id.as_deref() == Some("exit-plan-call-1")
-                    })
-                    .expect("the timed-out exit result must be sent back to the provider");
-                assert!(first.tool_result_is_error);
-                assert!(
-                    first
-                        .text_content()
-                        .is_some_and(|content| content.contains("tool call timed out"))
-                );
-                let retry_ready = Arc::clone(retry_ready);
-                let release_retry = Arc::clone(release_retry);
-                Box::pin(stream::once(async move {
-                    retry_ready.notify_one();
-                    release_retry.notified().await;
-                    Ok(ProviderEvent::Done(ProviderResponse {
-                        message: AssistantMessage::tool_calls(vec![ToolCall::new(
-                            "exit-plan-call-2",
-                            "exit_plan_mode",
-                            json!({}),
-                        )]),
-                        usage: None,
-                    }))
-                }))
-            }
-            ProviderScript::ExitPlanModeTimeoutThenRetry { .. } => {
-                assert!(request.tools.iter().all(|tool| !matches!(
-                    tool.name.as_str(),
-                    "read_plan" | "write_plan" | "exit_plan_mode"
-                )));
-                let second = request
-                    .messages
-                    .iter()
-                    .find(|message| {
-                        message.role == Role::Tool
-                            && message.tool_call_id.as_deref() == Some("exit-plan-call-2")
-                    })
-                    .expect("the retried exit approval result must reach the provider");
-                assert!(!second.tool_result_is_error);
-                immediate_stream(call)
-            }
-            ProviderScript::PlanBatchWriteThenExit if call == 0 => {
-                Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![
-                        ToolCall::new(
-                            "batch-write",
-                            "write_plan",
-                            json!({
-                                "expected_revision": 1,
-                                "content": "Updated batch plan"
-                            }),
-                        ),
-                        ToolCall::new("batch-exit", "exit_plan_mode", json!({})),
-                    ]),
-                    usage: None,
-                }))]))
-            }
-            ProviderScript::PlanBatchExitThenWrite if call == 0 => {
-                Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![
-                        ToolCall::new("batch-exit", "exit_plan_mode", json!({})),
-                        ToolCall::new(
-                            "batch-write",
-                            "write_plan",
-                            json!({
-                                "expected_revision": 1,
-                                "content": "This write must be rejected"
-                            }),
-                        ),
-                    ]),
-                    usage: None,
-                }))]))
-            }
-            ProviderScript::PlanBatchWriteThenExit => {
-                assert!(request.tools.iter().all(|tool| !matches!(
-                    tool.name.as_str(),
-                    "read_plan" | "write_plan" | "exit_plan_mode"
-                )));
-                let write = request
-                    .messages
-                    .iter()
-                    .find(|message| message.tool_call_id.as_deref() == Some("batch-write"))
-                    .expect("write_plan must return before the approved exit");
-                assert!(!write.tool_result_is_error);
-                let artifact: serde_json::Value =
-                    serde_json::from_str(write.text_content().unwrap()).unwrap();
-                assert_eq!(artifact["revision"], 2);
-                assert_eq!(artifact["content"], "Updated batch plan");
-                let exit = request
-                    .messages
-                    .iter()
-                    .find(|message| message.tool_call_id.as_deref() == Some("batch-exit"))
-                    .expect("exit_plan_mode must return its approval result");
-                assert!(!exit.tool_result_is_error);
-                immediate_stream(call)
-            }
-            ProviderScript::PlanBatchExitThenWrite => {
-                assert!(request.tools.iter().all(|tool| !matches!(
-                    tool.name.as_str(),
-                    "read_plan" | "write_plan" | "exit_plan_mode"
-                )));
-                let exit = request
-                    .messages
-                    .iter()
-                    .find(|message| message.tool_call_id.as_deref() == Some("batch-exit"))
-                    .expect("exit_plan_mode must return its approval result");
-                assert!(!exit.tool_result_is_error);
-                let write = request
-                    .messages
-                    .iter()
-                    .find(|message| message.tool_call_id.as_deref() == Some("batch-write"))
-                    .expect("the post-exit write must receive a result");
-                assert!(
-                    write.tool_result_is_error,
-                    "write_plan after an approved exit must be rejected"
-                );
-                immediate_stream(call)
-            }
             ProviderScript::ToolCall if call == 0 => {
                 Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
-                        "call-1",
-                        "blocking_tool",
-                        json!({}),
-                    )]),
+                    message: AssistantMessage {
+                        content: Some(Content::text("I will inspect with a tool.")),
+                        reasoning: None,
+                        tool_calls: vec![ToolCall::new("call-1", "blocking_tool", json!({}))],
+                        provider_state: None,
+                    },
                     usage: None,
                 }))]))
             }
@@ -575,66 +407,6 @@ impl ContextCompactor for BlockingCompactor {
     }
 }
 
-#[derive(Clone, Default)]
-struct FailNextSaveStorage {
-    inner: InMemorySessionStorage,
-    fail_next_save: Arc<AtomicBool>,
-}
-
-impl FailNextSaveStorage {
-    fn fail_next_save(&self) {
-        self.fail_next_save.store(true, Ordering::SeqCst);
-    }
-
-    fn maybe_fail(&self) -> Result<(), StorageError> {
-        if self.fail_next_save.swap(false, Ordering::SeqCst) {
-            return Err(StorageError::Io {
-                path: "injected-session-save".into(),
-                source: io::Error::other("injected session save failure"),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl SessionStorage for FailNextSaveStorage {
-    async fn load(&self, session_id: &str) -> Result<Option<SessionSnapshot>, StorageError> {
-        self.inner.load(session_id).await
-    }
-
-    async fn save(&self, session: &SessionSnapshot) -> Result<(), StorageError> {
-        self.maybe_fail()?;
-        self.inner.save(session).await
-    }
-
-    async fn save_incremental(
-        &self,
-        session: &SessionSnapshot,
-        previous_message_count: usize,
-    ) -> Result<(), StorageError> {
-        self.maybe_fail()?;
-        self.inner
-            .save_incremental(session, previous_message_count)
-            .await
-    }
-
-    async fn save_replacing_from(
-        &self,
-        session: &SessionSnapshot,
-        unchanged_message_count: usize,
-    ) -> Result<(), StorageError> {
-        self.maybe_fail()?;
-        self.inner
-            .save_replacing_from(session, unchanged_message_count)
-            .await
-    }
-
-    async fn delete(&self, session_id: &str) -> Result<(), StorageError> {
-        self.inner.delete(session_id).await
-    }
-}
-
 #[derive(Clone)]
 struct TestFactory {
     script: ProviderScript,
@@ -698,9 +470,6 @@ impl AgentFactory for TestFactory {
         let capability_mode = request
             .capability_mode
             .unwrap_or(agent_profile.definition.initial_capability_mode);
-        let agent_mode = request
-            .agent_mode
-            .unwrap_or(agent_profile.definition.initial_agent_mode);
         let reasoning_effort = if request.reasoning_effort_is_override {
             request.reasoning_effort
         } else {
@@ -712,7 +481,6 @@ impl AgentFactory for TestFactory {
         })
         .model(model.clone())
         .system_prompt(agent_profile.compiled_system_prompt.clone())
-        .mode(agent_mode)
         .capability_mode(capability_mode);
         if let Some(workspace) = request
             .workspace
@@ -730,13 +498,6 @@ impl AgentFactory for TestFactory {
         if matches!(&self.script, ProviderScript::PanickingToolCall) {
             builder = builder.tool(PanickingTool);
         }
-        if matches!(
-            &self.script,
-            ProviderScript::ExitPlanModeTimeoutThenRetry { .. }
-        ) {
-            builder = builder.tool_call_timeout(Duration::from_millis(500));
-        }
-
         let mut agent = builder.build();
         if let ProviderScript::PauseAtAgentEnd { entered, release } = &self.script {
             let entered = Arc::clone(entered);
@@ -834,7 +595,12 @@ async fn http_json_with_auth(
         .unwrap()
         .parse()
         .unwrap();
-    let payload = serde_json::from_slice(&response[separator + 4..]).unwrap();
+    let body = &response[separator + 4..];
+    let payload = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(body).unwrap()
+    };
     (status, payload)
 }
 
@@ -1174,6 +940,70 @@ async fn session_workspace_is_persisted_and_used_for_restore() {
 }
 
 #[tokio::test]
+async fn workspace_browser_and_new_websocket_select_an_explicit_directory() {
+    let root = TemporaryDirectory::new("phi-daemon-workspace-api-test");
+    let selected = root.0.join("selected-project");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::create_dir(root.0.join("another-project")).unwrap();
+    std::fs::write(root.0.join("not-a-directory.txt"), "file").unwrap();
+    let canonical_root = std::fs::canonicalize(&root.0).unwrap();
+    let canonical_selected = std::fs::canonicalize(&selected).unwrap();
+
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        AppState::new(Arc::clone(&service), AUTH_KEY)
+            .with_default_workspace(Workspace::new(&canonical_root)),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+
+    let (status, response) = http_json(address, "GET", "/v1/workspaces/browse", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["path"], canonical_root.to_string_lossy().as_ref());
+    assert_eq!(
+        response["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["another-project", "selected-project"]
+    );
+    assert_eq!(response["truncated"], false);
+    assert_eq!(
+        http_json_with_auth(address, "GET", "/v1/workspaces/browse", None, None,)
+            .await
+            .0,
+        401
+    );
+
+    let path = format!("/v1/ws/new?workspace={}", canonical_selected.display());
+    let mut socket = RawWebSocket::connect(address, &path).await;
+    assert_eq!(socket.receive_json().await["type"], "building");
+    let ready = socket.receive_json().await;
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(
+        ready["workspace"],
+        canonical_selected.to_string_lossy().as_ref()
+    );
+
+    drop(socket);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
 async fn legacy_session_workspace_is_bound_on_first_restore() {
     let session_id = phi_daemon::runtime::SessionId::new();
     let store = Arc::new(MemoryControlStore::new());
@@ -1337,17 +1167,15 @@ async fn activated_session_restores_its_pinned_agent_profile_revision() {
         .unwrap();
     assert_eq!(first_profile.revision, 1);
 
-    let first_service =
-        ApplicationService::managed_with_plan_store_profiles_skills_and_builtin_tools(
-            AgentRegistry::new(),
-            control.clone(),
-            storage.clone(),
-            Arc::new(InMemoryPlanStore::new()),
-            providers.clone(),
-            profiles.clone(),
-            phi::SkillsConfig::disabled(),
-            phi::BuiltinTools::none("."),
-        );
+    let first_service = ApplicationService::managed_with_profiles_skills_and_builtin_tools(
+        AgentRegistry::new(),
+        control.clone(),
+        storage.clone(),
+        providers.clone(),
+        profiles.clone(),
+        phi::SkillsConfig::disabled(),
+        phi::BuiltinTools::none("."),
+    );
     let prepared = first_service
         .prepare_session_configured(PROFILE, "reviewer", None)
         .await
@@ -1381,11 +1209,10 @@ async fn activated_session_restores_its_pinned_agent_profile_revision() {
     assert_eq!(second_profile.revision, 2);
     assert!(first_service.shutdown().await.is_empty());
 
-    let restarted = ApplicationService::managed_with_plan_store_profiles_skills_and_builtin_tools(
+    let restarted = ApplicationService::managed_with_profiles_skills_and_builtin_tools(
         AgentRegistry::new(),
         control.clone(),
         storage,
-        Arc::new(InMemoryPlanStore::new()),
         providers,
         profiles,
         phi::SkillsConfig::disabled(),
@@ -1807,9 +1634,10 @@ async fn two_attach_websockets_get_history_and_the_same_live_updates() {
 }
 
 #[tokio::test]
-async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_patch() {
+async fn attached_websocket_compaction_broadcasts_status_without_summary_content() {
     let compaction_started = Arc::new(Notify::new());
     let release_compaction = Arc::new(Notify::new());
+    let control_store = Arc::new(MemoryControlStore::new());
     let storage = Arc::new(InMemorySessionStorage::new());
     let factory = Arc::new(
         TestFactory::new(ProviderScript::Immediate).with_context_compactor(BlockingCompactor {
@@ -1819,9 +1647,9 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
     );
     let service = Arc::new(test_service(
         AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
+        Arc::clone(&control_store),
         Arc::clone(&storage),
-        factory,
+        Arc::clone(&factory),
     ));
     let prepared = service.prepare_session(PROFILE).await.unwrap();
     let handle = service.activate_session(&prepared).await.unwrap();
@@ -1866,9 +1694,11 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
         started_a["event"]["trigger"]["instructions"],
         "Preserve deployment decisions"
     );
-    assert_eq!(
-        started_a["event"]["prompt"],
-        "test compaction prompt: Preserve deployment decisions"
+    assert!(started_a["event"].get("prompt").is_none());
+    assert!(
+        !started_a
+            .to_string()
+            .contains("test compaction prompt: Preserve deployment decisions")
     );
 
     client_b
@@ -1881,6 +1711,17 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
     assert_eq!(rejected["type"], "command_rejected");
     assert_eq!(rejected["code"], "session_busy");
 
+    let fork_path = format!("/v1/sessions/{}/fork", handle.session_id());
+    let (fork_status, fork_error) = http_json(
+        address,
+        "POST",
+        &fork_path,
+        Some(json!({ "message_index": 1 })),
+    )
+    .await;
+    assert_eq!(fork_status, 409);
+    assert_eq!(fork_error["code"], "session_busy");
+
     release_compaction.notify_one();
     let (completed_a, completed_b) = tokio::join!(
         receive_wire_event(&mut client_a, "context_compaction_completed"),
@@ -1890,12 +1731,10 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
     let event = &completed_a["event"];
     assert_eq!(event["before_message_count"], 2);
     assert_eq!(event["after_message_count"], 1);
-    assert_eq!(event["changed_from"], 0);
-    assert_eq!(event["replacement"][0]["role"], "user");
-    assert_eq!(
-        event["replacement"][0]["content"]["value"],
-        "compacted summary"
-    );
+    assert!(event.get("changed_from").is_none());
+    assert!(event.get("replacement").is_none());
+    assert!(event.get("summary").is_none());
+    assert!(!completed_a.to_string().contains("compacted summary"));
     assert_eq!(event["usage"]["total_tokens"], 8);
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1907,6 +1746,17 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
     .expect("the actor did not return to idle after compaction");
     let snapshot = handle.snapshot();
     assert_eq!(snapshot.messages, [Message::user("compacted summary")]);
+    assert_eq!(snapshot.display_messages.len(), 2);
+    assert_eq!(
+        snapshot.display_messages[0].text_content(),
+        Some("history to compact")
+    );
+    assert_eq!(
+        snapshot.display_messages[1].text_content(),
+        Some("answer-1")
+    );
+    assert_eq!(snapshot.context_compactions.len(), 1);
+    assert_eq!(snapshot.context_compactions[0].history_index, 2);
     assert_eq!(snapshot.last_usage, None);
     assert_eq!(snapshot.context_usage, None);
     assert_eq!(snapshot.cumulative_usage, TokenUsage::new(6, 2, 0));
@@ -1916,7 +1766,45 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
         .unwrap()
         .unwrap();
     assert_eq!(persisted.messages, snapshot.messages);
+    assert_eq!(persisted.history.messages, snapshot.display_messages);
+    assert_eq!(persisted.history.compactions.len(), 1);
+    assert_eq!(persisted.history.compactions[0].history_index, 2);
     assert_eq!(persisted.cumulative_usage, snapshot.cumulative_usage);
+
+    let mut client_c = RawWebSocket::connect(address, &path).await;
+    let compacted_snapshot = client_c.receive_json().await;
+    assert_eq!(compacted_snapshot["type"], "snapshot");
+    assert_eq!(
+        compacted_snapshot["session"]["context_compaction"]["phase"],
+        "completed"
+    );
+    assert_eq!(
+        compacted_snapshot["session"]["context_compaction"]["history_index"],
+        2
+    );
+    assert_eq!(
+        compacted_snapshot["session"]["context_compactions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        compacted_snapshot["session"]["context_compactions"][0]["history_index"],
+        2
+    );
+    assert_eq!(
+        compacted_snapshot["session"]["history"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        compacted_snapshot
+            .to_string()
+            .contains("history to compact")
+    );
+    assert!(compacted_snapshot.to_string().contains("answer-1"));
+    assert!(!compacted_snapshot.to_string().contains("compacted summary"));
 
     let mut new_socket = RawWebSocket::connect(address, "/v1/ws/new").await;
     assert_eq!(new_socket.receive_json().await["type"], "building");
@@ -1934,9 +1822,42 @@ async fn attached_websocket_compaction_is_admitted_and_broadcasts_the_history_pa
     drop(new_socket);
     drop(client_a);
     drop(client_b);
+    drop(client_c);
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
     assert!(service.shutdown().await.is_empty());
+
+    let restarted_service = Arc::new(test_service(
+        AgentRegistry::new(),
+        control_store,
+        storage,
+        factory,
+    ));
+    let (restarted_address, restarted_stop, restarted_server) =
+        spawn_server(Arc::clone(&restarted_service)).await;
+    let mut reattached = RawWebSocket::connect(restarted_address, &path).await;
+    let restored_snapshot = reattached.receive_json().await;
+    assert_eq!(restored_snapshot["type"], "snapshot");
+    assert_eq!(
+        restored_snapshot["session"]["history"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        restored_snapshot["session"]["context_compactions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(restored_snapshot.to_string().contains("history to compact"));
+    assert!(restored_snapshot.to_string().contains("answer-1"));
+    assert!(!restored_snapshot.to_string().contains("compacted summary"));
+
+    drop(reattached);
+    restarted_stop.send(()).unwrap();
+    restarted_server.await.unwrap().unwrap();
+    assert!(restarted_service.shutdown().await.is_empty());
 }
 
 #[tokio::test]
@@ -2303,596 +2224,6 @@ async fn askuser_round_trips_custom_answers_and_survives_websocket_reconnect() {
 }
 
 #[tokio::test]
-async fn plan_exit_requires_exact_revision_approval_and_survives_websocket_reconnect() {
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let service = Arc::new(ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        Arc::new(InMemorySessionStorage::new()),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(ProviderScript::ExitPlanMode)),
-    ));
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    let path = format!("/v1/ws/attach/{}", handle.session_id());
-    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
-    let mut client_a = RawWebSocket::connect(address, &path).await;
-    let initial = client_a.receive_json().await;
-    assert_eq!(initial["type"], "snapshot");
-    assert_eq!(initial["session"]["mode"], "default");
-    assert_eq!(initial["session"]["pending_plan_approvals"], json!([]));
-
-    client_a
-        .send_json(json!({
-            "type": "set_mode",
-            "request_id": "enter-plan",
-            "mode": "plan"
-        }))
-        .await;
-    let entered = client_a.receive_json().await;
-    assert_eq!(entered["type"], "command_accepted");
-    assert_eq!(entered["command"], "set_mode");
-    let mode_changed = receive_wire_event(&mut client_a, "mode_changed").await;
-    assert_eq!(mode_changed["event"]["mode"], "plan");
-    assert_eq!(handle.snapshot().mode, AgentMode::Plan);
-
-    let plan = plan_store
-        .update(
-            &handle.session_id().to_string(),
-            0,
-            "# Plan\n\n1. Make the change.\n2. Run tests.".to_owned(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(plan.revision, 1);
-
-    client_a
-        .send_json(json!({
-            "type": "prompt",
-            "request_id": "plan-prompt",
-            "content": { "type": "text", "value": "Finish the plan" }
-        }))
-        .await;
-    let accepted = client_a.receive_json().await;
-    assert_eq!(accepted["type"], "command_accepted");
-    assert_eq!(accepted["command"], "prompt");
-
-    let requested = receive_wire_event(&mut client_a, "plan_approval_requested").await;
-    let request = &requested["event"]["request"];
-    let approval_id = request["approval_id"].as_str().unwrap().to_owned();
-    assert_eq!(request["plan"]["revision"], 1);
-    assert_eq!(request["plan"]["content"], plan.content);
-    assert_eq!(handle.snapshot().pending_plan_approvals.len(), 1);
-
-    // Reconnect receives the exact immutable revision without relying on old
-    // broadcast events.
-    let mut client_b = RawWebSocket::connect(address, &path).await;
-    let reconnected = client_b.receive_json().await;
-    assert_eq!(reconnected["type"], "snapshot");
-    assert_eq!(reconnected["session"]["mode"], "plan");
-    assert_eq!(
-        reconnected["session"]["pending_plan_approvals"][0],
-        *request
-    );
-
-    client_b
-        .send_json(json!({
-            "type": "decide_plan_approval",
-            "request_id": "wrong-revision",
-            "approval_id": approval_id,
-            "decision": { "type": "approve", "revision": 2 }
-        }))
-        .await;
-    let rejected = client_b.receive_json().await;
-    assert_eq!(rejected["type"], "command_rejected");
-    assert_eq!(rejected["code"], "invalid_plan_approval_decision");
-    assert_eq!(handle.snapshot().mode, AgentMode::Plan);
-    assert_eq!(handle.snapshot().pending_plan_approvals.len(), 1);
-
-    client_b
-        .send_json(json!({
-            "type": "decide_plan_approval",
-            "request_id": "approve-plan",
-            "approval_id": approval_id,
-            "decision": { "type": "approve", "revision": 1 }
-        }))
-        .await;
-    let accepted = client_b.receive_json().await;
-    assert_eq!(accepted["type"], "command_accepted");
-    assert_eq!(accepted["command"], "decide_plan_approval");
-    let decided = receive_wire_event(&mut client_b, "plan_approval_decided").await;
-    assert_eq!(decided["event"]["decision"]["type"], "approve");
-    let mode_changed = receive_wire_event(&mut client_b, "mode_changed").await;
-    assert_eq!(mode_changed["event"]["mode"], "default");
-    receive_wire_event(&mut client_b, "run_completed").await;
-
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.mode, AgentMode::Default);
-    assert!(snapshot.pending_plan_approvals.is_empty());
-    let tool_result = snapshot
-        .messages
-        .iter()
-        .find(|message| {
-            message.role == Role::Tool
-                && message.tool_call_id.as_deref() == Some("exit-plan-call-1")
-        })
-        .expect("the transcript must contain the plan approval result");
-    assert!(!tool_result.tool_result_is_error);
-
-    drop(client_a);
-    drop(client_b);
-    stop.send(()).unwrap();
-    server.await.unwrap().unwrap();
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
-async fn timed_out_plan_exit_is_cancelled_and_a_retry_can_be_approved() {
-    let retry_ready = Arc::new(Notify::new());
-    let release_retry = Arc::new(Notify::new());
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let service = ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        Arc::new(InMemorySessionStorage::new()),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(
-            ProviderScript::ExitPlanModeTimeoutThenRetry {
-                retry_ready: Arc::clone(&retry_ready),
-                release_retry: Arc::clone(&release_retry),
-            },
-        )),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    handle.set_mode(AgentMode::Plan).await.unwrap();
-    let plan = plan_store
-        .update(
-            &handle.session_id().to_string(),
-            0,
-            "Plan that will be retried".to_owned(),
-        )
-        .await
-        .unwrap();
-    let mut events = handle.subscribe();
-    let run = handle
-        .enqueue_prompt(Content::text("submit, time out, then retry"))
-        .await
-        .unwrap();
-
-    let first_requested = wait_for_event(&mut events, |event| {
-        matches!(event.kind, RuntimeEventKind::PlanApprovalRequested { .. })
-    })
-    .await;
-    let first_approval_id = match first_requested.kind {
-        RuntimeEventKind::PlanApprovalRequested { request } => request.approval_id,
-        _ => unreachable!(),
-    };
-    wait_for_event(&mut events, |event| {
-        matches!(
-            event.kind,
-            RuntimeEventKind::PlanApprovalCancelled { approval_id }
-                if approval_id == first_approval_id
-        )
-    })
-    .await;
-    let mut first_cancellation_count = 1;
-    tokio::time::timeout(Duration::from_secs(2), retry_ready.notified())
-        .await
-        .expect("provider did not receive the timed-out tool result");
-
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.mode, AgentMode::Plan);
-    assert!(snapshot.pending_plan_approvals.is_empty());
-    let error = handle
-        .decide_plan_approval(
-            first_approval_id,
-            PlanApprovalDecision::Approve {
-                revision: plan.revision,
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        AgentHandleError::PlanApprovalNotPending { approval_id, .. }
-            if approval_id == first_approval_id
-    ));
-
-    release_retry.notify_one();
-    let second_request = loop {
-        let event = events.recv().await.expect("runtime event channel closed");
-        match event.kind {
-            RuntimeEventKind::PlanApprovalCancelled { approval_id }
-                if approval_id == first_approval_id =>
-            {
-                first_cancellation_count += 1;
-            }
-            RuntimeEventKind::PlanApprovalRequested { request } => break request,
-            RuntimeEventKind::RunFailed { message, .. } => {
-                panic!("run failed before the retry approval: {message}");
-            }
-            _ => {}
-        }
-    };
-    assert_ne!(second_request.approval_id, first_approval_id);
-    assert_eq!(second_request.plan, plan);
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.pending_plan_approvals.len(), 1);
-    assert_eq!(
-        snapshot.pending_plan_approvals[0].approval_id,
-        second_request.approval_id
-    );
-
-    handle
-        .decide_plan_approval(
-            second_request.approval_id,
-            PlanApprovalDecision::Approve {
-                revision: plan.revision,
-            },
-        )
-        .await
-        .unwrap();
-    loop {
-        let event = events.recv().await.expect("runtime event channel closed");
-        match event.kind {
-            RuntimeEventKind::PlanApprovalCancelled { approval_id }
-                if approval_id == first_approval_id =>
-            {
-                first_cancellation_count += 1;
-            }
-            RuntimeEventKind::RunCompleted { run_id } if run_id == run.run_id => break,
-            RuntimeEventKind::RunFailed { message, .. } => {
-                panic!("run failed after the retry approval: {message}");
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(first_cancellation_count, 1);
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.mode, AgentMode::Default);
-    assert!(snapshot.pending_plan_approvals.is_empty());
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
-async fn plan_exit_refuses_an_approval_after_the_persisted_plan_changes() {
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let service = ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        Arc::new(InMemorySessionStorage::new()),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(ProviderScript::ExitPlanModeStale)),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    handle.set_mode(AgentMode::Plan).await.unwrap();
-    let first = plan_store
-        .update(&handle.session_id().to_string(), 0, "First plan".to_owned())
-        .await
-        .unwrap();
-    let mut events = handle.subscribe();
-    let run = handle
-        .enqueue_prompt(Content::text("submit the plan"))
-        .await
-        .unwrap();
-    let requested = wait_for_event(&mut events, |event| {
-        matches!(event.kind, RuntimeEventKind::PlanApprovalRequested { .. })
-    })
-    .await;
-    let approval_id = match requested.kind {
-        RuntimeEventKind::PlanApprovalRequested { request } => request.approval_id,
-        _ => unreachable!(),
-    };
-
-    let second = plan_store
-        .update(
-            &handle.session_id().to_string(),
-            first.revision,
-            "A newer plan".to_owned(),
-        )
-        .await
-        .unwrap();
-    let error = handle
-        .decide_plan_approval(
-            approval_id,
-            PlanApprovalDecision::Approve {
-                revision: first.revision,
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        AgentHandleError::StalePlanApproval {
-            expected_revision,
-            current_revision,
-            ..
-        } if expected_revision == first.revision && current_revision == second.revision
-    ));
-    wait_for_event(&mut events, |event| {
-        matches!(
-            event.kind,
-            RuntimeEventKind::PlanApprovalCancelled { approval_id: current }
-                if current == approval_id
-        )
-    })
-    .await;
-    wait_for_run_completed(&mut events, run.run_id).await;
-
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.mode, AgentMode::Plan);
-    assert!(snapshot.pending_plan_approvals.is_empty());
-    assert!(service.shutdown().await.is_empty());
-}
-
-async fn assert_plan_batch_order(
-    script: ProviderScript,
-    expected_approval_revision: u64,
-    expected_approval_content: &str,
-) {
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let service = ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        Arc::new(InMemorySessionStorage::new()),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(script)),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    handle.set_mode(AgentMode::Plan).await.unwrap();
-    plan_store
-        .update(
-            &handle.session_id().to_string(),
-            0,
-            "Initial batch plan".to_owned(),
-        )
-        .await
-        .unwrap();
-    let mut events = handle.subscribe();
-    let run = handle
-        .enqueue_prompt(Content::text("submit a two-tool plan batch"))
-        .await
-        .unwrap();
-    let requested = wait_for_event(&mut events, |event| {
-        matches!(event.kind, RuntimeEventKind::PlanApprovalRequested { .. })
-    })
-    .await;
-    let request = match requested.kind {
-        RuntimeEventKind::PlanApprovalRequested { request } => request,
-        _ => unreachable!(),
-    };
-    assert_eq!(request.plan.revision, expected_approval_revision);
-    assert_eq!(request.plan.content, expected_approval_content);
-
-    handle
-        .decide_plan_approval(
-            request.approval_id,
-            PlanApprovalDecision::Approve {
-                revision: expected_approval_revision,
-            },
-        )
-        .await
-        .unwrap();
-    wait_for_run_completed(&mut events, run.run_id).await;
-
-    let current = plan_store
-        .current(&handle.session_id().to_string())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.revision, expected_approval_revision);
-    assert_eq!(current.content, expected_approval_content);
-    assert_eq!(handle.snapshot().mode, AgentMode::Default);
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
-async fn plan_batch_write_then_exit_approves_the_written_revision() {
-    assert_plan_batch_order(
-        ProviderScript::PlanBatchWriteThenExit,
-        2,
-        "Updated batch plan",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn plan_batch_exit_then_write_rejects_the_post_approval_write() {
-    assert_plan_batch_order(
-        ProviderScript::PlanBatchExitThenWrite,
-        1,
-        "Initial batch plan",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn failed_tool_result_save_restores_plan_mode_in_the_runtime_projection() {
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let storage = Arc::new(FailNextSaveStorage::default());
-    let service = ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        storage.clone(),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(ProviderScript::ExitPlanMode)),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    handle.set_mode(AgentMode::Plan).await.unwrap();
-    plan_store
-        .update(&handle.session_id().to_string(), 0, "Plan".to_owned())
-        .await
-        .unwrap();
-    let mut events = handle.subscribe();
-    let run = handle
-        .enqueue_prompt(Content::text("submit the plan"))
-        .await
-        .unwrap();
-    let requested = wait_for_event(&mut events, |event| {
-        matches!(event.kind, RuntimeEventKind::PlanApprovalRequested { .. })
-    })
-    .await;
-    let (approval_id, revision) = match requested.kind {
-        RuntimeEventKind::PlanApprovalRequested { request } => {
-            (request.approval_id, request.plan.revision)
-        }
-        _ => unreachable!(),
-    };
-
-    // The unknown-result journal is durable by the time approval is exposed;
-    // fail the next save, which is the completed exit tool result carrying the
-    // optimistic Default transition.
-    storage.fail_next_save();
-    handle
-        .decide_plan_approval(approval_id, PlanApprovalDecision::Approve { revision })
-        .await
-        .unwrap();
-
-    let mut mode_changes = Vec::new();
-    loop {
-        let event = events.recv().await.expect("runtime event channel closed");
-        match event.kind {
-            RuntimeEventKind::ModeChanged { mode } => mode_changes.push(mode),
-            RuntimeEventKind::RunFailed { run_id, message } if run_id == run.run_id => {
-                assert!(message.contains("injected session save failure"));
-                break;
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(mode_changes, [AgentMode::Default, AgentMode::Plan]);
-    assert_eq!(handle.snapshot().mode, AgentMode::Plan);
-    let persisted = storage
-        .load(&handle.session_id().to_string())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(persisted.mode, AgentMode::Plan);
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
-async fn failed_idle_plan_mode_save_still_projects_the_fail_safe_mode() {
-    let storage = Arc::new(FailNextSaveStorage::default());
-    let service = ApplicationService::new(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        storage.clone(),
-        Arc::new(TestFactory::new(ProviderScript::Immediate)),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    let mut events = handle.subscribe();
-    storage.fail_next_save();
-
-    let error = handle.set_mode(AgentMode::Plan).await.unwrap_err();
-    assert!(matches!(error, AgentHandleError::Operation { .. }));
-    let mode_changed = wait_for_event(&mut events, |event| {
-        matches!(
-            event.kind,
-            RuntimeEventKind::ModeChanged {
-                mode: AgentMode::Plan
-            }
-        )
-    })
-    .await;
-    let operation_failed = wait_for_event(&mut events, |event| {
-        matches!(
-            &event.kind,
-            RuntimeEventKind::OperationFailed { operation, .. } if operation == "set_mode"
-        )
-    })
-    .await;
-    assert!(mode_changed.sequence < operation_failed.sequence);
-    assert_eq!(handle.snapshot().mode, AgentMode::Plan);
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
-async fn stopping_a_run_cancels_its_pending_plan_approval() {
-    let plan_store = Arc::new(InMemoryPlanStore::new());
-    let service = ApplicationService::new_with_plan_store(
-        AgentRegistry::new(),
-        Arc::new(MemoryControlStore::new()),
-        Arc::new(InMemorySessionStorage::new()),
-        plan_store.clone(),
-        Arc::new(TestFactory::new(ProviderScript::ExitPlanMode)),
-    );
-    let prepared = service.prepare_session(PROFILE).await.unwrap();
-    let handle = service.activate_session(&prepared).await.unwrap();
-    handle.set_mode(AgentMode::Plan).await.unwrap();
-    plan_store
-        .update(&handle.session_id().to_string(), 0, "Plan".to_owned())
-        .await
-        .unwrap();
-    let mut events = handle.subscribe();
-    let run = handle
-        .enqueue_prompt(Content::text("submit then stop"))
-        .await
-        .unwrap();
-    let requested = wait_for_event(&mut events, |event| {
-        matches!(event.kind, RuntimeEventKind::PlanApprovalRequested { .. })
-    })
-    .await;
-    let (approval_id, revision) = match requested.kind {
-        RuntimeEventKind::PlanApprovalRequested { request } => {
-            (request.approval_id, request.plan.revision)
-        }
-        _ => unreachable!(),
-    };
-
-    handle.stop(run.run_id).unwrap();
-    let error = handle
-        .decide_plan_approval(approval_id, PlanApprovalDecision::Approve { revision })
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        AgentHandleError::PlanApprovalNotPending {
-            approval_id: current,
-            ..
-        } if current == approval_id
-    ));
-
-    let mut cancellation_count = 0;
-    let mut cancellation_sequence = None;
-    let stopped = loop {
-        let event = events.recv().await.expect("runtime event channel closed");
-        match event.kind {
-            RuntimeEventKind::PlanApprovalCancelled {
-                approval_id: current,
-            } if current == approval_id => {
-                cancellation_count += 1;
-                cancellation_sequence.get_or_insert(event.sequence);
-            }
-            RuntimeEventKind::RunStopped { run_id } if run_id == run.run_id => break event,
-            _ => {}
-        }
-    };
-    tokio::task::yield_now().await;
-    while let Ok(event) = events.try_recv() {
-        if matches!(
-            event.kind,
-            RuntimeEventKind::PlanApprovalCancelled {
-                approval_id: current
-            } if current == approval_id
-        ) {
-            cancellation_count += 1;
-        }
-    }
-    assert_eq!(cancellation_count, 1);
-    assert!(cancellation_sequence.unwrap() < stopped.sequence);
-    let snapshot = handle.snapshot();
-    assert_eq!(snapshot.mode, AgentMode::Plan);
-    assert!(snapshot.pending_plan_approvals.is_empty());
-    assert!(service.shutdown().await.is_empty());
-}
-
-#[tokio::test]
 async fn stopping_a_run_cancels_its_pending_askuser_request() {
     let service = test_service(
         AgentRegistry::new(),
@@ -3019,9 +2350,329 @@ async fn http_session_list_exposes_the_activated_live_session() {
         workspace.root().to_string_lossy().as_ref()
     );
     assert_eq!(payload["sessions"][0]["message_count"], 2);
+    assert_eq!(payload["workspaces"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        payload["workspaces"][0]["workspace"],
+        workspace.root().to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        payload["workspaces"][0]["sessions"][0]["session_id"],
+        handle.session_id().to_string()
+    );
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn http_session_management_orders_pins_and_deletes_live_sessions() {
+    let registry = AgentRegistry::new();
+    let control = Arc::new(MemoryControlStore::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let service = Arc::new(test_service(
+        registry.clone(),
+        Arc::clone(&control),
+        storage.clone(),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    ));
+    let mut handles = Vec::new();
+    for index in 0..3 {
+        let workspace = if index == 1 {
+            Workspace::new("/workspace/group-b")
+        } else {
+            Workspace::new("/workspace/group-a")
+        };
+        let prepared = service
+            .prepare_session_in_workspace(PROFILE, workspace)
+            .await
+            .unwrap();
+        handles.push(service.activate_session(&prepared).await.unwrap());
+    }
+    let oldest = handles[0].clone();
+    let deleted = handles[1].clone();
+    let newest = handles[2].clone();
+    let mut events = deleted.subscribe();
+    let run = deleted
+        .enqueue_prompt(Content::text("persist before deletion"))
+        .await
+        .unwrap();
+    wait_for_run_completed(&mut events, run.run_id).await;
+    assert!(
+        storage
+            .load(&deleted.session_id().to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let oldest_path = format!("/v1/sessions/{}", oldest.session_id());
+    let (status, pinned) = http_json(
+        address,
+        "PATCH",
+        &oldest_path,
+        Some(json!({ "pinned": true })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(pinned["pinned"], true);
+    assert!(
+        control
+            .get_session(oldest.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .pinned
+    );
+
+    let (status, sessions) = http_json(address, "GET", "/v1/sessions", None).await;
+    assert_eq!(status, 200);
+    let flat_sessions = sessions["sessions"].as_array().unwrap();
+    assert_eq!(
+        flat_sessions[0]["session_id"],
+        oldest.session_id().to_string()
+    );
+    assert_eq!(flat_sessions[0]["pinned"], true);
+    assert_eq!(
+        flat_sessions[1]["session_id"],
+        newest.session_id().to_string()
+    );
+    assert_eq!(
+        flat_sessions[2]["session_id"],
+        deleted.session_id().to_string()
+    );
+    let workspace_groups = sessions["workspaces"].as_array().unwrap();
+    assert_eq!(workspace_groups.len(), 2);
+    assert_eq!(workspace_groups[0]["workspace"], "/workspace/group-a");
+    assert_eq!(
+        workspace_groups[0]["sessions"][0]["session_id"],
+        oldest.session_id().to_string()
+    );
+    assert_eq!(
+        workspace_groups[0]["sessions"][1]["session_id"],
+        newest.session_id().to_string()
+    );
+    assert_eq!(workspace_groups[1]["workspace"], "/workspace/group-b");
+    assert_eq!(
+        workspace_groups[1]["sessions"][0]["session_id"],
+        deleted.session_id().to_string()
+    );
+
+    let (status, error) = http_json(
+        address,
+        "PATCH",
+        &oldest_path,
+        Some(json!({ "unexpected": true })),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(error["code"], "invalid_session_update");
+
+    let deleted_path = format!("/v1/sessions/{}", deleted.session_id());
+    let (status, body) = http_json(address, "DELETE", &deleted_path, None).await;
+    assert_eq!(status, 204);
+    assert_eq!(body, serde_json::Value::Null);
+    assert_eq!(deleted.status(), AgentStatus::Closed);
+    assert!(registry.get(deleted.session_id()).await.is_none());
+    assert!(
+        control
+            .get_session(deleted.session_id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .load(&deleted.session_id().to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(http_json(address, "GET", &deleted_path, None).await.0, 404);
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn http_forks_a_session_from_a_public_assistant_boundary() {
+    let registry = AgentRegistry::new();
+    let control = Arc::new(MemoryControlStore::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let service = Arc::new(test_service(
+        registry,
+        Arc::clone(&control),
+        storage.clone(),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    ));
+    let workspace = Workspace::new("/workspace/fork-source");
+    let prepared = service
+        .prepare_session_in_workspace(PROFILE, workspace.clone())
+        .await
+        .unwrap();
+    let source = service.activate_session(&prepared).await.unwrap();
+    source.set_title("Fork source".to_owned()).await.unwrap();
+    source
+        .set_capability_mode(CapabilityMode::WorkspaceEdit)
+        .await
+        .unwrap();
+    let mut events = source.subscribe();
+    for prompt in ["first", "second"] {
+        let run = source.enqueue_prompt(Content::text(prompt)).await.unwrap();
+        wait_for_run_completed(&mut events, run.run_id).await;
+    }
+    assert_eq!(source.snapshot().messages.len(), 4);
+
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let path = format!("/v1/sessions/{}/fork", source.session_id());
+    let (status, forked) =
+        http_json(address, "POST", &path, Some(json!({ "message_index": 1 }))).await;
+    assert_eq!(status, 201);
+    assert_eq!(forked["title"], "Fork source");
+    assert_eq!(forked["pinned"], false);
+    assert_eq!(forked["status"], "offline");
+    assert_eq!(forked["workspace"], "/workspace/fork-source");
+    let fork_id: SessionId = forked["session_id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(fork_id, source.session_id());
+
+    let snapshot = storage.load(&fork_id.to_string()).await.unwrap().unwrap();
+    assert_eq!(snapshot.messages, source.snapshot().messages[..2]);
+    assert_eq!(snapshot.workspace, Some(workspace));
+    assert_eq!(snapshot.capability_mode, CapabilityMode::WorkspaceEdit);
+    assert_eq!(snapshot.last_usage, None);
+    assert_eq!(snapshot.cumulative_usage, TokenUsage::default());
+    let record = control.get_session(fork_id).await.unwrap().unwrap();
+    assert_eq!(record.title.as_deref(), Some("Fork source"));
+    assert!(!record.pinned);
+    assert_eq!(record.profile_id, PROFILE);
+
+    let attached = service.attach_session(fork_id).await.unwrap();
+    assert_eq!(attached.snapshot().messages.len(), 2);
+
+    let (status, error) =
+        http_json(address, "POST", &path, Some(json!({ "message_index": 0 }))).await;
+    assert_eq!(status, 400);
+    assert_eq!(error["code"], "invalid_fork_point");
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn http_forks_before_tool_calls_while_the_source_actor_is_running() {
+    let tool_started = Arc::new(Notify::new());
+    let tool_release = Arc::new(Notify::new());
+    let storage = Arc::new(InMemorySessionStorage::new());
+    let factory = TestFactory::new(ProviderScript::ToolCall).with_tool(BlockingTool {
+        started: Arc::clone(&tool_started),
+        release: Arc::clone(&tool_release),
+    });
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::clone(&storage),
+        Arc::new(factory),
+    ));
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let source = service.activate_session(&prepared).await.unwrap();
+    let mut events = source.subscribe();
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let attach_path = format!("/v1/ws/attach/{}", source.session_id());
+    let mut live_client = RawWebSocket::connect(address, &attach_path).await;
+    assert_eq!(live_client.receive_json().await["type"], "snapshot");
+
+    let run = source
+        .enqueue_prompt(Content::text("keep running"))
+        .await
+        .unwrap();
+    tool_started.notified().await;
+    receive_wire_event(&mut live_client, "tool_execution_start").await;
+    assert_eq!(
+        source
+            .snapshot()
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.fork_message_index),
+        Some(1)
+    );
+
+    let mut reconnected_client = RawWebSocket::connect(address, &attach_path).await;
+    let live_snapshot = reconnected_client.receive_json().await;
+    assert_eq!(live_snapshot["type"], "snapshot");
+    assert_eq!(live_snapshot["session"]["draft"]["fork_message_index"], 1);
+
+    let path = format!("/v1/sessions/{}/fork", source.session_id());
+    let (status, forked) = http_json(
+        address,
+        "POST",
+        &path,
+        Some(json!({
+            "message_index": 1,
+            "position": "before_tool_calls"
+        })),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let fork_id: SessionId = forked["session_id"].as_str().unwrap().parse().unwrap();
+    let snapshot = storage.load(&fork_id.to_string()).await.unwrap().unwrap();
+    assert_eq!(snapshot.messages.len(), 2);
+    assert_eq!(snapshot.messages[0].text_content(), Some("keep running"));
+    assert_eq!(
+        snapshot.messages[1].text_content(),
+        Some("I will inspect with a tool.")
+    );
+    assert!(snapshot.messages[1].tool_calls.is_empty());
+    assert_eq!(snapshot.messages[1].provider_state, None);
+    assert_eq!(source.status(), AgentStatus::Running);
+
+    tool_release.notify_one();
+    wait_for_run_completed(&mut events, run.run_id).await;
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_transcript_deletion_restores_session_metadata_for_retry() {
+    let registry = AgentRegistry::new();
+    let control = Arc::new(MemoryControlStore::new());
+    let storage = Arc::new(DeleteFailingSessionStorage::default());
+    let service = ApplicationService::new(
+        registry.clone(),
+        control.clone(),
+        storage.clone(),
+        Arc::new(TestFactory::new(ProviderScript::Immediate)),
+    );
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let session_id = handle.session_id();
+    let mut events = handle.subscribe();
+    let run = handle
+        .enqueue_prompt(Content::text("keep this transcript"))
+        .await
+        .unwrap();
+    wait_for_run_completed(&mut events, run.run_id).await;
+
+    assert!(matches!(
+        service.delete_session(session_id).await,
+        Err(ServiceError::Storage(phi::StorageError::Io { .. }))
+    ));
+    assert_eq!(handle.status(), AgentStatus::Closed);
+    assert!(registry.get(session_id).await.is_none());
+    assert!(control.get_session(session_id).await.unwrap().is_some());
+    assert!(
+        storage
+            .load(&session_id.to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let restored = service.attach_session(session_id).await.unwrap();
+    assert_eq!(restored.snapshot().messages.len(), 2);
     assert!(service.shutdown().await.is_empty());
 }
 
@@ -3212,7 +2863,6 @@ async fn agent_profile_http_manages_revisions_and_configures_new_websockets() {
             "allow": null,
             "deny": ["dangerous-skill"]
         },
-        "initial_agent_mode": "default",
         "initial_capability_mode": "workspace_edit",
         "model": "profile-model",
         "reasoning_effort": "high"

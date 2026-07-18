@@ -6,12 +6,12 @@ import {
   sessionReducer,
 } from '../state/sessionReducer.ts';
 import type {
-  AgentMode,
   AskUserAnswer,
   CapabilityMode,
   ClientCommand,
-  PlanApprovalDecision,
+  ReasoningEffort,
   ServerMessage,
+  SkillInvocation,
 } from '../types/wire.ts';
 import type { SessionSocket } from '../ws/connection.ts';
 import { attachSession, openNewSession } from '../ws/sessionConnection.ts';
@@ -22,6 +22,7 @@ export type SessionTarget =
       profileId: string;
       agentProfileId?: string;
       capabilityMode?: CapabilityMode;
+      workspace?: string;
       instanceId: number;
     }
   | { kind: 'attach'; sessionId: string };
@@ -41,16 +42,15 @@ export interface DaemonSessionControls {
   state: SessionState;
   connectionPhase: ConnectionPhase;
   connectionError: string | null;
-  createdSessionRevision: number;
+  sessionListRevision: number;
   retry: () => void;
-  sendPrompt: (text: string) => boolean;
+  sendPrompt: (text: string, skill?: SkillInvocation) => boolean;
   stop: () => void;
   answerAsk: (askId: string, answers: AskUserAnswer[]) => boolean;
-  decidePlan: (approvalId: string, decision: PlanApprovalDecision) => boolean;
   setModel: (model: string) => void;
-  setMode: (mode: AgentMode) => void;
+  setReasoningEffort: (effort: ReasoningEffort | null) => void;
   setCapabilityMode: (mode: CapabilityMode) => void;
-  compact: (instructions?: string) => void;
+  compact: (instructions?: string) => boolean;
   clearNotice: (index: number) => void;
 }
 
@@ -76,7 +76,7 @@ export function useDaemonSession(
     useState<ConnectionPhase>('idle');
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
-  const [createdSessionRevision, setCreatedSessionRevision] = useState(0);
+  const [sessionListRevision, setSessionListRevision] = useState(0);
 
   const socketRef = useRef<SessionSocket | null>(null);
   const promotedSessionIdRef = useRef<string | null>(null);
@@ -124,7 +124,7 @@ export function useDaemonSession(
       target === null
         ? null
         : target.kind === 'new'
-          ? `new:${target.instanceId}:${target.profileId}:${target.agentProfileId ?? ''}:${target.capabilityMode ?? ''}`
+          ? `new:${target.instanceId}:${target.profileId}:${target.agentProfileId ?? ''}:${target.capabilityMode ?? ''}:${target.workspace ?? ''}`
           : `attach:${target.sessionId}`;
     if (targetIdentityRef.current !== targetIdentity) {
       targetIdentityRef.current = targetIdentity;
@@ -246,7 +246,7 @@ export function useDaemonSession(
           case 'session_created':
             promotedSessionIdRef.current = message.session_id;
             preparedPromptRequestIdRef.current = null;
-            setCreatedSessionRevision((revision) => revision + 1);
+            setSessionListRevision((revision) => revision + 1);
             break;
           case 'ready':
           case 'snapshot':
@@ -262,6 +262,12 @@ export function useDaemonSession(
             setConnectionPhase('error');
             setConnectionError(message.message);
             break;
+        }
+        if (
+          message.type === 'event' &&
+          message.event.type === 'title_changed'
+        ) {
+          setSessionListRevision((revision) => revision + 1);
         }
         const action = serverMessageToAction(message);
         if (
@@ -299,6 +305,7 @@ export function useDaemonSession(
                   signal: controller.signal,
                   agentProfileId: target.agentProfileId,
                   capabilityMode: target.capabilityMode,
+                  workspace: target.workspace,
                 })
               : await attachSession(authKey, target.sessionId, handlers, {
                   signal: controller.signal,
@@ -335,21 +342,41 @@ export function useDaemonSession(
   }, [authKey, target, teardown, cancelReconnect, connectionAttempt]);
 
   const sendPrompt = useCallback(
-    (text: string): boolean => {
+    (text: string, skill?: SkillInvocation): boolean => {
       const trimmed = text.trim();
-      if (!trimmed) return false;
+      const skillName = skill?.name.trim() ?? '';
+      if (!trimmed && !skillName) return false;
       const requestId = nextRequestId('prompt');
       const content = { type: 'text' as const, value: trimmed };
       const sent = send({
         type: 'prompt',
         request_id: requestId,
         content,
+        ...(skillName
+          ? {
+              skill: {
+                name: skillName,
+                arguments: skill?.arguments?.trim() || undefined,
+              },
+            }
+          : {}),
       });
       if (sent) {
         if (target?.kind === 'new' && promotedSessionIdRef.current === null) {
           preparedPromptRequestIdRef.current = requestId;
         }
-        dispatch({ type: 'local_send_prompt', requestId, content });
+        const displayContent = skillName
+          ? {
+              type: 'text' as const,
+              value: `/${skillName}${trimmed ? ` ${trimmed}` : ''}`,
+            }
+          : content;
+        dispatch({
+          type: 'local_send_prompt',
+          requestId,
+          content: displayContent,
+          matchAnyEcho: Boolean(skillName),
+        });
       }
       return sent;
     },
@@ -373,17 +400,6 @@ export function useDaemonSession(
     [send],
   );
 
-  const decidePlan = useCallback(
-    (approvalId: string, decision: PlanApprovalDecision): boolean =>
-      send({
-        type: 'decide_plan_approval',
-        request_id: nextRequestId('plan'),
-        approval_id: approvalId,
-        decision,
-      }),
-    [send],
-  );
-
   const setModel = useCallback(
     (model: string) => {
       const value = model.trim();
@@ -393,13 +409,6 @@ export function useDaemonSession(
         request_id: nextRequestId('model'),
         model: value,
       });
-    },
-    [send],
-  );
-
-  const setMode = useCallback(
-    (mode: AgentMode) => {
-      send({ type: 'set_mode', request_id: nextRequestId('mode'), mode });
     },
     [send],
   );
@@ -415,14 +424,24 @@ export function useDaemonSession(
     [send],
   );
 
+  const setReasoningEffort = useCallback(
+    (effort: ReasoningEffort | null) => {
+      send({
+        type: 'set_reasoning_effort',
+        request_id: nextRequestId('reasoning'),
+        effort,
+      });
+    },
+    [send],
+  );
+
   const compact = useCallback(
-    (instructions?: string) => {
+    (instructions?: string): boolean =>
       send({
         type: 'compact',
         request_id: nextRequestId('compact'),
         instructions: instructions?.trim() || null,
-      });
-    },
+      }),
     [send],
   );
 
@@ -440,14 +459,13 @@ export function useDaemonSession(
     state,
     connectionPhase,
     connectionError,
-    createdSessionRevision,
+    sessionListRevision,
     retry,
     sendPrompt,
     stop,
     answerAsk,
-    decidePlan,
     setModel,
-    setMode,
+    setReasoningEffort,
     setCapabilityMode,
     compact,
     clearNotice,
@@ -460,9 +478,10 @@ function serverMessageToAction(message: ServerMessage): SessionAction | null {
       return {
         type: 'ready',
         config: message.config,
-        mode: message.mode,
         capabilityMode: message.capability_mode,
         agentProfile: message.agent_profile,
+        workspace: message.workspace ?? null,
+        skills: [...(message.skills ?? [])],
       };
     case 'session_created':
       return { type: 'session_created', sessionId: message.session_id };

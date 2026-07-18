@@ -14,6 +14,27 @@ pub enum Role {
     Tool,
 }
 
+/// Controls whether an application should present a transcript message as
+/// user-visible conversation content.
+///
+/// Internal messages remain part of the provider-safe transcript and are
+/// persisted normally, but hosts can suppress them from chat timelines. This
+/// is intended for runtime coordination inputs rather than user-authored
+/// prompts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageVisibility {
+    #[default]
+    Public,
+    Internal,
+}
+
+impl MessageVisibility {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
 /// Provider-neutral text or multimodal message content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -188,7 +209,19 @@ impl ImageDetail {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
+    /// Presentation visibility; providers still receive both variants.
+    ///
+    /// The default preserves compatibility with transcripts written before
+    /// internal runtime messages were distinguished.
+    #[serde(default, skip_serializing_if = "MessageVisibility::is_public")]
+    pub visibility: MessageVisibility,
     pub content: Option<Content>,
+    /// Provider-normalized reasoning text made available to application UIs.
+    ///
+    /// Protocol-specific signatures, encrypted payloads and replay metadata
+    /// remain confined to `provider_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
     pub tool_result_is_error: bool,
@@ -198,7 +231,8 @@ pub struct Message {
     pub tool_result_metadata: Option<Value>,
     /// Provider response state used to preserve opaque reasoning data on
     /// replay. Applications should retain it when copying messages; normalized
-    /// `content` and `tool_calls` remain authoritative.
+    /// `content` and `tool_calls` remain authoritative, while `reasoning` is
+    /// the provider-neutral display projection of the replay payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<ProviderState>,
 }
@@ -215,7 +249,9 @@ impl Message {
     pub fn user_content(content: Content) -> Self {
         Self {
             role: Role::User,
+            visibility: MessageVisibility::Public,
             content: Some(content),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_result_is_error: false,
@@ -231,7 +267,9 @@ impl Message {
     pub fn assistant(content: Option<Content>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: Role::Assistant,
+            visibility: MessageVisibility::Public,
             content,
+            reasoning: None,
             tool_calls,
             tool_call_id: None,
             tool_result_is_error: false,
@@ -260,7 +298,9 @@ impl Message {
     ) -> Self {
         Self {
             role: Role::Tool,
+            visibility: MessageVisibility::Public,
             content: Some(content),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             tool_result_is_error: is_error,
@@ -273,10 +313,17 @@ impl Message {
         self.content.as_ref().and_then(Content::as_text)
     }
 
+    pub fn with_visibility(mut self, visibility: MessageVisibility) -> Self {
+        self.visibility = visibility;
+        self
+    }
+
     fn text(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
+            visibility: MessageVisibility::Public,
             content: Some(Content::text(content)),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_result_is_error: false,
@@ -318,6 +365,50 @@ impl fmt::Debug for ProviderState {
     }
 }
 
+impl ProviderState {
+    /// Returns only provider-supplied textual reasoning that is safe to project
+    /// as normalized application data. Signatures, encrypted reasoning and
+    /// other replay-only fields remain opaque.
+    pub fn reasoning_text(&self) -> Option<String> {
+        let reasoning = match self {
+            Self::OpenAiChat { fields } => ["reasoning_content", "reasoning"]
+                .into_iter()
+                .find_map(|field| {
+                    fields
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_default()
+                .to_owned(),
+            Self::OpenAiResponses { output } => output
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .flat_map(|item| {
+                    ["summary", "content"]
+                        .into_iter()
+                        .filter_map(|field| item[field].as_array())
+                        .flatten()
+                })
+                .filter_map(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("summary_text" | "reasoning_text" | "text")
+                    )
+                    .then(|| part["text"].as_str())
+                    .flatten()
+                })
+                .collect(),
+            Self::AnthropicMessages { content } => content
+                .iter()
+                .filter(|block| block["type"] == "thinking")
+                .filter_map(|block| block["thinking"].as_str())
+                .collect(),
+        };
+        (!reasoning.is_empty()).then_some(reasoning)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -338,6 +429,7 @@ impl ToolCall {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssistantMessage {
     pub content: Option<Content>,
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub provider_state: Option<ProviderState>,
 }
@@ -398,6 +490,9 @@ pub struct ProviderResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssistantDelta {
+    Reasoning {
+        delta: String,
+    },
     Text {
         delta: String,
     },
@@ -442,10 +537,14 @@ pub struct ContextUsage {
 
 impl ContextUsage {
     pub fn from_usage(max_tokens: u64, usage: TokenUsage) -> Self {
+        // `total_tokens` is preserved as the provider's accounting total and
+        // may include provider-specific billable units. Context occupancy is
+        // derived from the normalized input/output token counts instead.
+        let used_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
         Self {
             max_tokens,
-            used_tokens: usage.total_tokens,
-            remaining_tokens: max_tokens.saturating_sub(usage.total_tokens),
+            used_tokens,
+            remaining_tokens: max_tokens.saturating_sub(used_tokens),
         }
     }
 }
@@ -454,6 +553,7 @@ impl AssistantMessage {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: Some(Content::text(content)),
+            reasoning: None,
             tool_calls: Vec::new(),
             provider_state: None,
         }
@@ -462,6 +562,7 @@ impl AssistantMessage {
     pub fn tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self {
             content: None,
+            reasoning: None,
             tool_calls,
             provider_state: None,
         }
@@ -470,7 +571,9 @@ impl AssistantMessage {
     pub fn into_message(self) -> Message {
         Message {
             role: Role::Assistant,
+            visibility: MessageVisibility::Public,
             content: self.content,
+            reasoning: self.reasoning,
             tool_calls: self.tool_calls,
             tool_call_id: None,
             tool_result_is_error: false,
@@ -753,6 +856,28 @@ mod tests {
     }
 
     #[test]
+    fn message_visibility_is_backward_compatible_and_round_trips_internal() {
+        let public = Message::user("visible prompt");
+        let public_json = serde_json::to_value(&public).unwrap();
+        assert!(public_json.get("visibility").is_none());
+        assert_eq!(
+            serde_json::from_value::<Message>(public_json)
+                .unwrap()
+                .visibility,
+            MessageVisibility::Public
+        );
+
+        let internal =
+            Message::user("runtime coordination").with_visibility(MessageVisibility::Internal);
+        let internal_json = serde_json::to_value(&internal).unwrap();
+        assert_eq!(internal_json["visibility"], "internal");
+        assert_eq!(
+            serde_json::from_value::<Message>(internal_json).unwrap(),
+            internal
+        );
+    }
+
+    #[test]
     fn retains_provider_neutral_multimodal_content() {
         let message = Message::user_parts([
             ContentPart::text("Describe this image"),
@@ -782,6 +907,13 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_ignores_provider_specific_accounting_totals() {
+        let context = ContextUsage::from_usage(1_000, TokenUsage::with_total(80, 20, 450, 30));
+        assert_eq!(context.used_tokens, 100);
+        assert_eq!(context.remaining_tokens, 900);
+    }
+
+    #[test]
     fn provider_state_round_trips_without_exposing_reasoning_in_debug_output() {
         let mut message = Message::assistant(
             None,
@@ -801,5 +933,26 @@ mod tests {
         assert_eq!(decoded, message);
         assert!(encoded.contains("private reasoning"));
         assert!(!format!("{message:?}").contains("private reasoning"));
+    }
+
+    #[test]
+    fn provider_state_projects_only_textual_reasoning() {
+        let state = ProviderState::AnthropicMessages {
+            content: vec![
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "inspect inputs",
+                    "signature": "opaque-signature"
+                }),
+                serde_json::json!({
+                    "type": "redacted_thinking",
+                    "data": "opaque-data"
+                }),
+                serde_json::json!({ "type": "text", "text": "done" }),
+            ],
+        };
+
+        assert_eq!(state.reasoning_text().as_deref(), Some("inspect inputs"));
+        assert!(!state.reasoning_text().unwrap().contains("opaque"));
     }
 }

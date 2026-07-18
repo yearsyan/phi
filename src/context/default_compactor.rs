@@ -7,7 +7,8 @@ use crate::{
     error::ContextCompactionError,
     provider::LlmProvider,
     types::{
-        Content, ContentPart, GenerationConfig, Message, ProviderRequest, ReasoningEffort, Role,
+        Content, ContentPart, GenerationConfig, Message, MessageVisibility, ProviderRequest,
+        ReasoningEffort, Role,
     },
 };
 
@@ -20,7 +21,8 @@ pub const DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES: usize = 3;
 
 const SUMMARY_SYSTEM_PROMPT: &str =
     "You are a helpful AI assistant tasked with summarizing conversations.";
-const COMPACT_BOUNDARY_MESSAGE: &str = "Conversation compacted";
+/// Stable internal boundary retained ahead of the synthetic continuation summary.
+pub const DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE: &str = "Conversation compacted";
 const COMPACT_RETRY_MARKER: &str =
     "[earlier conversation truncated while recovering the compaction request]";
 
@@ -224,8 +226,9 @@ impl ContextCompactor for DefaultContextCompactor {
 
         let continuation = continuation_summary(&summary, request.trigger.is_automatic());
         let replacement = vec![
-            Message::system(COMPACT_BOUNDARY_MESSAGE),
-            Message::user(continuation),
+            Message::system(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+                .with_visibility(MessageVisibility::Internal),
+            Message::user(continuation).with_visibility(MessageVisibility::Internal),
         ];
         let estimated_context_tokens = estimate_messages_tokens(&replacement);
         Ok(ContextCompactionPlan {
@@ -265,6 +268,7 @@ fn summary_request(
 
 fn sanitize_message_for_compaction(mut message: Message) -> Message {
     message.provider_state = None;
+    message.reasoning = None;
     message.tool_result_metadata = None;
     message.content = message.content.map(|content| match content {
         Content::Text(text) => Content::Text(text),
@@ -548,6 +552,11 @@ mod tests {
             .unwrap();
 
         assert!(plan.summary.contains("durable summary"));
+        assert!(
+            plan.messages
+                .iter()
+                .all(|message| message.visibility == MessageVisibility::Internal)
+        );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(&requests[0].messages[1..8], source.as_slice());

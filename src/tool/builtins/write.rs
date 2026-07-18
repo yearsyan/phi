@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::{
         Workspace,
-        tool::{AgentMode, CapabilityMode, ToolExecutionContext},
+        tool::{CapabilityMode, ToolExecutionContext},
     };
 
     #[tokio::test]
@@ -153,7 +153,6 @@ mod tests {
         let outside = parent.path().join("outside.txt");
         let context = ToolExecutionContext::detached("write").with_workspace_policy(
             Some(Workspace::new(&workspace)),
-            AgentMode::Default,
             CapabilityMode::WorkspaceEdit,
         );
 

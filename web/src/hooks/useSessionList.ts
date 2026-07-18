@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { listSessions } from '../api/http.ts';
-import type { SessionSummary } from '../types/wire.ts';
+import {
+  deleteSession as deleteSessionRequest,
+  listSessions,
+  setSessionPinned as setSessionPinnedRequest,
+} from '../api/http.ts';
+import type { SessionsResponse, WorkspaceSessionGroup } from '../types/wire.ts';
 
 export interface SessionListState {
-  sessions: SessionSummary[];
+  workspaces: WorkspaceSessionGroup[];
   loading: boolean;
   error: string | null;
-  refresh: () => void;
+  refresh: () => Promise<void>;
+  setPinned: (sessionId: string, pinned: boolean) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<void>;
 }
 
 /**
@@ -17,7 +23,7 @@ export function useSessionList(
   authKey: string,
   enabled: boolean,
 ): SessionListState {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSessionGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const authKeyRef = useRef(authKey);
@@ -28,7 +34,7 @@ export function useSessionList(
     const revision = ++requestRevisionRef.current;
     const key = authKeyRef.current;
     if (!key) {
-      setSessions([]);
+      setWorkspaces([]);
       setError(null);
       return;
     }
@@ -36,7 +42,7 @@ export function useSessionList(
     try {
       const response = await listSessions(key);
       if (revision !== requestRevisionRef.current) return;
-      setSessions(response.sessions);
+      setWorkspaces(workspaceTree(response));
       setError(null);
     } catch (err) {
       if (revision !== requestRevisionRef.current) return;
@@ -49,7 +55,7 @@ export function useSessionList(
   useEffect(() => {
     if (!enabled) {
       requestRevisionRef.current += 1;
-      setSessions([]);
+      setWorkspaces([]);
       setError(null);
       setLoading(false);
       return;
@@ -60,5 +66,56 @@ export function useSessionList(
     };
   }, [enabled, refresh]);
 
-  return { sessions, loading, error, refresh };
+  const setPinned = useCallback(async (sessionId: string, pinned: boolean) => {
+    const revision = ++requestRevisionRef.current;
+    const key = authKeyRef.current;
+    setLoading(true);
+    try {
+      await setSessionPinnedRequest(key, sessionId, pinned);
+      if (revision !== requestRevisionRef.current) return;
+      const response = await listSessions(key);
+      if (revision !== requestRevisionRef.current) return;
+      setWorkspaces(workspaceTree(response));
+      setError(null);
+    } catch (err) {
+      if (revision === requestRevisionRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
+    } finally {
+      if (revision === requestRevisionRef.current) setLoading(false);
+    }
+  }, []);
+
+  const deleteSession = useCallback(async (sessionId: string) => {
+    const revision = ++requestRevisionRef.current;
+    const key = authKeyRef.current;
+    setLoading(true);
+    try {
+      await deleteSessionRequest(key, sessionId);
+      if (revision !== requestRevisionRef.current) return;
+      const response = await listSessions(key);
+      if (revision !== requestRevisionRef.current) return;
+      setWorkspaces(workspaceTree(response));
+      setError(null);
+    } catch (err) {
+      if (revision === requestRevisionRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+      throw err;
+    } finally {
+      if (revision === requestRevisionRef.current) setLoading(false);
+    }
+  }, []);
+
+  return { workspaces, loading, error, refresh, setPinned, deleteSession };
+}
+
+function workspaceTree(response: SessionsResponse): WorkspaceSessionGroup[] {
+  if (response.workspaces) return response.workspaces;
+  // Compatibility with older daemons: retain their flat order without doing
+  // workspace clustering in the client.
+  return response.sessions.length === 0
+    ? []
+    : [{ workspace: null, sessions: response.sessions }];
 }

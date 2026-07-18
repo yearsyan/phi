@@ -2,6 +2,7 @@ mod agent_profile;
 mod disk;
 mod memory;
 mod provider;
+mod scheduled_task;
 
 use std::{fmt, io, path::PathBuf, time::Duration};
 
@@ -18,6 +19,9 @@ pub use agent_profile::{
 pub use disk::DiskControlStore;
 pub use memory::MemoryControlStore;
 pub use provider::{DiskProviderStore, MemoryProviderStore};
+pub use scheduled_task::{
+    DiskScheduledTaskStore, MemoryScheduledTaskStore, ScheduledTaskStore, ScheduledTaskStoreError,
+};
 
 pub const DEFAULT_PROFILE_ID: &str = "default";
 pub const DEFAULT_MAX_RETRIES: usize = 10;
@@ -155,6 +159,10 @@ fn default_stream_idle_timeout_secs() -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
     pub profile_id: String,
     /// Complete Agent Profile snapshot selected before this session was
     /// activated. Old metadata omits it and resumes with the built-in
@@ -179,6 +187,8 @@ impl SessionRecord {
     ) -> Self {
         Self {
             id,
+            title: None,
+            pinned: false,
             profile_id: profile_id.into(),
             agent_profile: None,
             model: model.into(),

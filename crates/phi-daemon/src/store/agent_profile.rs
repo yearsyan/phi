@@ -363,7 +363,7 @@ pub enum AgentProfileStoreError {
 
 #[cfg(test)]
 mod tests {
-    use phi::{AgentMode, ReasoningEffort, tool::CapabilityMode};
+    use phi::{ReasoningEffort, tool::CapabilityMode};
 
     use super::*;
     use crate::runtime::{NamePolicy, PromptDefinition, PromptMode};
@@ -379,7 +379,6 @@ mod tests {
                 deny: vec!["bash".to_owned()],
             },
             skills: NamePolicy::default(),
-            initial_agent_mode: AgentMode::Plan,
             initial_capability_mode: CapabilityMode::ReadOnly,
             model: Some(" profile-model ".to_owned()),
             reasoning_effort: Some(ReasoningEffort::High),

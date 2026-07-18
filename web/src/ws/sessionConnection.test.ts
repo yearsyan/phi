@@ -22,10 +22,11 @@ describe('openNewSession', () => {
       signal,
       agentProfileId: 'review only',
       capabilityMode: 'read_only',
+      workspace: '/workspace/Project A',
     });
 
     expect(open).toHaveBeenCalledWith(
-      '/v1/ws/new?profile_id=provider+profile&agent_profile_id=review+only&capability_mode=read_only',
+      '/v1/ws/new?profile_id=provider+profile&agent_profile_id=review+only&capability_mode=read_only&workspace=%2Fworkspace%2FProject+A',
       'daemon-key',
       handlers,
       { signal },

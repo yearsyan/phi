@@ -21,43 +21,7 @@ use crate::{
 pub mod builtins;
 pub mod subagent;
 
-/// The agent's execution mode.
-///
-/// Plan mode is a capability boundary, not just a prompting convention: only
-/// read-only, internal, and plan-only tools are exposed to the provider or
-/// allowed to execute.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentMode {
-    #[default]
-    Default,
-    Plan,
-}
-
-impl AgentMode {
-    pub fn allows(self, effect: ToolEffect) -> bool {
-        match self {
-            Self::Default => effect != ToolEffect::PlanOnly,
-            Self::Plan => matches!(
-                effect,
-                ToolEffect::ReadOnly | ToolEffect::Internal | ToolEffect::PlanOnly
-            ),
-        }
-    }
-
-    pub(crate) fn safest(self, other: Self) -> Self {
-        if self == Self::Plan || other == Self::Plan {
-            Self::Plan
-        } else {
-            Self::Default
-        }
-    }
-}
-
 /// The maximum tool capability granted to an agent.
-///
-/// This boundary is independent from [`AgentMode`]. In particular, Plan mode
-/// remains more restrictive than every capability mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityMode {
@@ -65,7 +29,7 @@ pub enum CapabilityMode {
     ReadOnly,
     /// Read-only, coordination, and workspace-scoped file mutation tools.
     WorkspaceEdit,
-    /// Every registered tool allowed by the current [`AgentMode`].
+    /// Every registered tool.
     #[default]
     FullAccess,
 }
@@ -73,16 +37,10 @@ pub enum CapabilityMode {
 impl CapabilityMode {
     pub fn allows(self, effect: ToolEffect) -> bool {
         match self {
-            Self::ReadOnly => matches!(
-                effect,
-                ToolEffect::ReadOnly | ToolEffect::Internal | ToolEffect::PlanOnly
-            ),
+            Self::ReadOnly => matches!(effect, ToolEffect::ReadOnly | ToolEffect::Internal),
             Self::WorkspaceEdit => matches!(
                 effect,
-                ToolEffect::ReadOnly
-                    | ToolEffect::Internal
-                    | ToolEffect::PlanOnly
-                    | ToolEffect::WorkspaceWrite
+                ToolEffect::ReadOnly | ToolEffect::Internal | ToolEffect::WorkspaceWrite
             ),
             Self::FullAccess => true,
         }
@@ -113,7 +71,7 @@ impl CapabilityMode {
 ///
 /// A configured deny takes precedence over the allow-list. Mandatory harness
 /// tools bypass only this name policy; their effects remain subject to
-/// [`AgentMode`] and [`CapabilityMode`].
+/// [`CapabilityMode`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,42 +128,6 @@ impl ToolPolicy {
     }
 }
 
-/// A clonable, in-memory mode switch for mode-transition tools.
-///
-/// Changing this control is intentionally not a persistence operation. Code
-/// that owns an [`crate::Agent`] should use `Agent::set_mode` so idle mode
-/// changes are durable. A tool can use this control during execution; the
-/// agent checkpoints and persists the resulting mode with the tool outcome.
-#[derive(Clone, Debug)]
-pub struct AgentModeControl {
-    mode: watch::Sender<AgentMode>,
-}
-
-impl AgentModeControl {
-    pub fn new(mode: AgentMode) -> Self {
-        let (mode, _) = watch::channel(mode);
-        Self { mode }
-    }
-
-    pub fn mode(&self) -> AgentMode {
-        *self.mode.borrow()
-    }
-
-    pub fn set_mode(&self, mode: AgentMode) {
-        self.mode.send_replace(mode);
-    }
-
-    pub(crate) fn restore_safely(&self, checkpoint: AgentMode) {
-        self.set_mode(self.mode().safest(checkpoint));
-    }
-}
-
-impl Default for AgentModeControl {
-    fn default() -> Self {
-        Self::new(AgentMode::default())
-    }
-}
-
 /// The externally observable effect a tool may have.
 ///
 /// Custom and dynamically discovered tools default to
@@ -218,8 +140,6 @@ pub enum ToolEffect {
     ReadOnly,
     /// Mutates only agent-local coordination state.
     Internal,
-    /// A narrowly scoped tool that is available only while planning.
-    PlanOnly,
     /// Writes to the configured workspace.
     WorkspaceWrite,
     /// May run commands, use the network, or otherwise affect external state.
@@ -355,7 +275,6 @@ pub struct ToolExecutionContext {
     progress: Option<ProgressReporter>,
     progress_active: Arc<AtomicBool>,
     workspace: Option<Workspace>,
-    mode: AgentMode,
     capability_mode: CapabilityMode,
 }
 
@@ -368,7 +287,6 @@ impl ToolExecutionContext {
             progress: None,
             progress_active: Arc::new(AtomicBool::new(true)),
             workspace: None,
-            mode: AgentMode::default(),
             capability_mode: CapabilityMode::default(),
         }
     }
@@ -386,7 +304,6 @@ impl ToolExecutionContext {
             progress,
             progress_active: Arc::new(AtomicBool::new(true)),
             workspace: None,
-            mode: AgentMode::default(),
             capability_mode: CapabilityMode::default(),
         }
     }
@@ -394,11 +311,9 @@ impl ToolExecutionContext {
     pub(crate) fn with_workspace_policy(
         mut self,
         workspace: Option<Workspace>,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     ) -> Self {
         self.workspace = workspace;
-        self.mode = mode;
         self.capability_mode = capability_mode;
         self
     }
@@ -425,10 +340,6 @@ impl ToolExecutionContext {
 
     pub fn workspace(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
-    }
-
-    pub fn mode(&self) -> AgentMode {
-        self.mode
     }
 
     pub fn capability_mode(&self) -> CapabilityMode {
@@ -462,7 +373,6 @@ impl fmt::Debug for ToolExecutionContext {
             .field("visible_tool_results", &self.visible_tool_results.len())
             .field("progress_enabled", &self.progress.is_some())
             .field("workspace", &self.workspace)
-            .field("mode", &self.mode)
             .field("capability_mode", &self.capability_mode)
             .finish()
     }
@@ -567,9 +477,9 @@ pub trait Tool: Send + Sync {
 
     /// Declares the tool's maximum possible side effect.
     ///
-    /// The conservative default keeps unknown, custom, and MCP tools out of
-    /// plan mode unless their implementation explicitly opts into a safer
-    /// classification.
+    /// The conservative default restricts unknown, custom, and MCP tools to
+    /// [`CapabilityMode::FullAccess`] unless their implementation explicitly
+    /// opts into a safer classification.
     fn effect(&self) -> ToolEffect {
         ToolEffect::ExternalSideEffect
     }
@@ -589,10 +499,9 @@ pub trait Tool: Send + Sync {
     fn concurrency(&self, _arguments: &Value) -> ToolConcurrency {
         match self.effect_for(_arguments) {
             ToolEffect::ReadOnly => ToolConcurrency::Safe,
-            ToolEffect::Internal
-            | ToolEffect::PlanOnly
-            | ToolEffect::WorkspaceWrite
-            | ToolEffect::ExternalSideEffect => ToolConcurrency::Exclusive,
+            ToolEffect::Internal | ToolEffect::WorkspaceWrite | ToolEffect::ExternalSideEffect => {
+                ToolConcurrency::Exclusive
+            }
         }
     }
 
@@ -624,7 +533,6 @@ mod tests {
         assert!(CapabilityMode::WorkspaceEdit.allows(ToolEffect::WorkspaceWrite));
         assert!(!CapabilityMode::WorkspaceEdit.allows(ToolEffect::ExternalSideEffect));
         assert!(CapabilityMode::FullAccess.allows(ToolEffect::ExternalSideEffect));
-        assert!(!AgentMode::Plan.allows(ToolEffect::WorkspaceWrite));
     }
 
     #[test]

@@ -1,4 +1,9 @@
 /target
+.pnpm-store/
+*.log
+.DS_Store
+*.swp
+*.swo
 .env
 .key
 .phi/

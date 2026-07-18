@@ -21,6 +21,7 @@
   --phi-surface-2: #1b1b1b;
   --phi-surface-3: #222222;
   --phi-surface-hover: #1d1d1d;
+  --phi-selected: #151515;
   --phi-border: #292929;
   --phi-border-strong: #3b3b3b;
   --phi-text: #d4d4d4;
@@ -29,6 +30,7 @@
   --phi-text-dim: #707070;
   --phi-accent: #f2f2f2;
   --phi-accent-hover: #ffffff;
+  --phi-link: #58a6ff;
   --phi-accent-contrast: #0a0a0a;
   --phi-accent-soft: rgba(255, 255, 255, 0.05);
   --phi-accent-soft-strong: rgba(255, 255, 255, 0.09);
@@ -40,8 +42,8 @@
   --phi-danger: #b97878;
   --phi-danger-soft: rgba(185, 120, 120, 0.1);
   --phi-user-bubble: #1b1b1b;
-  --phi-code-bg: #060606;
-  --phi-code-text: #dedede;
+  --phi-code-bg: #0d1117;
+  --phi-code-text: #e6edf3;
   --phi-overlay: rgba(0, 0, 0, 0.72);
   --phi-shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.46);
   --phi-shadow-composer: 0 8px 24px rgba(0, 0, 0, 0.28);
@@ -49,37 +51,41 @@
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --phi-bg: #f5f5f5;
-  --phi-sidebar: #eeeeee;
+  --phi-bg: #ffffff;
+  --phi-sidebar: #f7f7f8;
   --phi-bg-elevated: #ffffff;
   --phi-surface: #ffffff;
-  --phi-surface-2: #f2f2f2;
-  --phi-surface-3: #e8e8e8;
-  --phi-surface-hover: #eaeaea;
-  --phi-border: #d9d9d9;
-  --phi-border-strong: #bdbdbd;
-  --phi-text: #333333;
-  --phi-text-strong: #111111;
-  --phi-text-muted: #686868;
-  --phi-text-dim: #929292;
-  --phi-accent: #171717;
+  --phi-surface-2: #f7f7f8;
+  --phi-surface-3: #eeeeef;
+  --phi-surface-hover: #eeeeef;
+  --phi-selected: #e9e9eb;
+  --phi-border: #e7e7e8;
+  --phi-border-strong: #d2d2d4;
+  --phi-text: #303030;
+  --phi-text-strong: #181818;
+  --phi-text-muted: #6f6f72;
+  --phi-text-dim: #9a9a9e;
+  --phi-accent: #202020;
   --phi-accent-hover: #000000;
+  --phi-link: #0969da;
   --phi-accent-contrast: #ffffff;
-  --phi-accent-soft: rgba(0, 0, 0, 0.04);
-  --phi-accent-soft-strong: rgba(0, 0, 0, 0.08);
-  --phi-accent-border: rgba(0, 0, 0, 0.18);
+  --phi-accent-soft: rgba(0, 0, 0, 0.035);
+  --phi-accent-soft-strong: rgba(0, 0, 0, 0.065);
+  --phi-accent-border: rgba(0, 0, 0, 0.14);
   --phi-success: #5f6d63;
   --phi-success-soft: rgba(95, 109, 99, 0.08);
   --phi-warning: #816f4c;
   --phi-warning-soft: rgba(129, 111, 76, 0.08);
   --phi-danger: #945b5b;
   --phi-danger-soft: rgba(148, 91, 91, 0.08);
-  --phi-user-bubble: #e8e8e8;
-  --phi-code-bg: #161616;
-  --phi-code-text: #f2f2f2;
-  --phi-overlay: rgba(0, 0, 0, 0.34);
-  --phi-shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.16);
-  --phi-shadow-composer: 0 8px 20px rgba(0, 0, 0, 0.1);
+  --phi-user-bubble: #f3f3f4;
+  --phi-code-bg: #f6f8fa;
+  --phi-code-text: #1f2328;
+  --phi-overlay: rgba(0, 0, 0, 0.28);
+  --phi-shadow-panel:
+    0 12px 32px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --phi-shadow-composer:
+    0 8px 24px rgba(0, 0, 0, 0.07), 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
 * {

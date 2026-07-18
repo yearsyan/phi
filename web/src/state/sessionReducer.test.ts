@@ -53,6 +53,7 @@ function applyEvent(
 function snapshot(overrides: Partial<SessionDto> = {}): SessionDto {
   return {
     session_id: 'session-1',
+    title: null,
     profile_id: 'default',
     agent_profile: {
       agent_profile_id: 'default',
@@ -62,7 +63,6 @@ function snapshot(overrides: Partial<SessionDto> = {}): SessionDto {
     status: 'idle',
     active_run_id: null,
     queued_runs: 0,
-    mode: 'default',
     capability_mode: 'full_access',
     config: {
       model: 'test-model',
@@ -72,7 +72,6 @@ function snapshot(overrides: Partial<SessionDto> = {}): SessionDto {
     history: [],
     draft: null,
     pending_asks: [],
-    pending_plan_approvals: [],
     subagents: [],
     usage: {
       last: null,
@@ -85,6 +84,20 @@ function snapshot(overrides: Partial<SessionDto> = {}): SessionDto {
 }
 
 describe('sessionReducer', () => {
+  it('tracks generated session titles from snapshots and ordered events', () => {
+    let state = sessionReducer(initialSessionState, {
+      type: 'snapshot',
+      session: snapshot({ title: 'Initial title', last_sequence: 2 }),
+    });
+    expect(state.title).toBe('Initial title');
+
+    state = applyEvent(state, 3, {
+      type: 'title_changed',
+      title: 'Generated title',
+    });
+    expect(state.title).toBe('Generated title');
+  });
+
   it('tracks capability mode from ready, snapshot, and ordered events', () => {
     let state = sessionReducer(initialSessionState, {
       type: 'ready',
@@ -93,20 +106,31 @@ describe('sessionReducer', () => {
         reasoning_effort: null,
         revision: 1,
       },
-      mode: 'default',
       capabilityMode: 'read_only',
       agentProfile: {
         agent_profile_id: 'reviewer',
         revision: 3,
       },
+      workspace: '/workspace/review',
+      skills: [
+        {
+          name: 'review',
+          description: 'Review the current change',
+          model_invocable: true,
+          user_invocable: true,
+        },
+      ],
     });
     expect(state.capabilityMode).toBe('read_only');
     expect(state.agentProfile?.agent_profile_id).toBe('reviewer');
+    expect(state.workspace).toBe('/workspace/review');
+    expect(state.skills[0]?.name).toBe('review');
 
     state = sessionReducer(state, {
       type: 'snapshot',
       session: snapshot({
         capability_mode: 'workspace_edit',
+        workspace: '/workspace/snapshot',
         last_sequence: 4,
       }),
     });
@@ -116,6 +140,8 @@ describe('sessionReducer', () => {
     });
 
     expect(state.capabilityMode).toBe('full_access');
+    expect(state.workspace).toBe('/workspace/snapshot');
+    expect(state.skills[0]?.name).toBe('review');
   });
 
   it('keeps a request ledger for multiple FIFO prompts', () => {
@@ -183,6 +209,82 @@ describe('sessionReducer', () => {
     expect(state.pendingPrompts).toHaveLength(0);
   });
 
+  it('accumulates streamed reasoning separately from assistant text', () => {
+    let state = applyEvent(initialSessionState, 1, {
+      type: 'message_start',
+      message: assistant(),
+    });
+    state = applyEvent(state, 2, {
+      type: 'message_update',
+      delta: { type: 'reasoning', delta: 'inspect ' },
+    });
+    state = applyEvent(state, 3, {
+      type: 'message_update',
+      delta: { type: 'reasoning', delta: 'inputs' },
+    });
+    state = applyEvent(state, 4, {
+      type: 'message_update',
+      delta: { type: 'text', delta: 'Done.' },
+    });
+
+    expect(state.draft).toEqual({
+      reasoning: 'inspect inputs',
+      text: 'Done.',
+      tool_calls: [],
+    });
+  });
+
+  it('reconciles an explicitly selected skill with its expanded user echo', () => {
+    let state = sessionReducer(initialSessionState, {
+      type: 'local_send_prompt',
+      requestId: 'skill-1',
+      content: { type: 'text', value: '/review security' },
+      matchAnyEcho: true,
+    });
+
+    state = applyEvent(state, 1, {
+      type: 'message_start',
+      message: user('expanded skill instructions'),
+    });
+
+    expect(state.pendingPrompts).toHaveLength(0);
+    expect(state.history).toEqual([user('expanded skill instructions')]);
+  });
+
+  it('does not consume an optimistic user prompt for an internal runtime echo', () => {
+    let state = sessionReducer(initialSessionState, {
+      type: 'local_send_prompt',
+      requestId: 'skill-1',
+      content: { type: 'text', value: '/review security' },
+      matchAnyEcho: true,
+    });
+    const internal = {
+      ...user('<subagent_notification>{...}</subagent_notification>'),
+      visibility: 'internal' as const,
+      content: null,
+    };
+
+    state = applyEvent(state, 1, {
+      type: 'message_start',
+      message: internal,
+    });
+
+    expect(state.pendingPrompts).toHaveLength(1);
+    expect(state.history).toEqual([internal]);
+
+    state = applyEvent(state, 2, {
+      type: 'message_start',
+      message: internal,
+    });
+    expect(state.history).toEqual([internal, internal]);
+
+    state = applyEvent(state, 3, {
+      type: 'message_start',
+      message: user('expanded skill instructions'),
+    });
+    expect(state.pendingPrompts).toHaveLength(0);
+  });
+
   it('appends a new tool turn instead of overwriting the previous turn', () => {
     let state = applyEvent(initialSessionState, 1, {
       type: 'run_started',
@@ -215,7 +317,34 @@ describe('sessionReducer', () => {
     expect(state.activeRun?.turns[0]?.steps).toHaveLength(1);
   });
 
-  it('applies compaction replacement and usage atomically', () => {
+  it('projects the durable before-tools fork checkpoint onto the live draft', () => {
+    let state = sessionReducer(initialSessionState, {
+      type: 'snapshot',
+      session: snapshot({
+        status: 'running',
+        active_run_id: 'run-1',
+        history: [user('inspect')],
+        draft: {
+          text: 'I will inspect with a tool.',
+          tool_calls: [],
+        },
+      }),
+    });
+
+    state = applyEvent(
+      state,
+      1,
+      {
+        type: 'tool_execution_start',
+        call: { id: 'tool-1', name: 'read', arguments: { path: 'a.ts' } },
+      },
+      'run-1',
+    );
+
+    expect(state.draft?.fork_message_index).toBe(1);
+  });
+
+  it('keeps compaction content out of history and advances its status marker', () => {
     const initial = sessionReducer(initialSessionState, {
       type: 'snapshot',
       session: snapshot({
@@ -237,15 +366,32 @@ describe('sessionReducer', () => {
         last_sequence: 4,
       }),
     });
-    const state = applyEvent(initial, 5, {
+    const started = applyEvent(initial, 5, {
+      type: 'context_compaction_started',
+      trigger: { type: 'manual', instructions: null },
+      compactor: 'default',
+    });
+
+    expect(started.history).toEqual([
+      user('old-1'),
+      assistant('old-2'),
+      user('old-3'),
+    ]);
+    expect(started.compactions).toEqual([
+      {
+        key: 'compaction-5',
+        phase: 'started',
+        historyIndex: 3,
+        afterMessageCount: null,
+      },
+    ]);
+
+    const state = applyEvent(started, 6, {
       type: 'context_compaction_completed',
       trigger: { type: 'manual', instructions: null },
       compactor: 'default',
       before_message_count: 3,
       after_message_count: 2,
-      changed_from: 1,
-      replacement: [user('summary')],
-      summary: 'summary',
       usage: {
         input_tokens: 3,
         output_tokens: 2,
@@ -255,7 +401,20 @@ describe('sessionReducer', () => {
       estimated_context_tokens: 20,
     });
 
-    expect(state.history).toEqual([user('old-1'), user('summary')]);
+    expect(state.history).toEqual([
+      user('old-1'),
+      assistant('old-2'),
+      user('old-3'),
+    ]);
+    expect(state.compactions).toEqual([
+      {
+        key: 'compaction-5',
+        phase: 'completed',
+        historyIndex: 3,
+        afterMessageCount: 2,
+        message: undefined,
+      },
+    ]);
     expect(state.contextUsage).toBeNull();
     expect(state.usage?.context).toBeNull();
     expect(state.usage?.cumulative).toEqual({
@@ -264,6 +423,86 @@ describe('sessionReducer', () => {
       total_tokens: 19,
       cached_input_tokens: 1,
     });
+  });
+
+  it('restores a completed compaction boundary from a redacted snapshot', () => {
+    const internalPlaceholder: PublicMessage = {
+      role: 'user',
+      visibility: 'internal',
+      content: null,
+      tool_calls: [],
+      tool_call_id: null,
+      tool_result_is_error: false,
+    };
+    const state = sessionReducer(initialSessionState, {
+      type: 'snapshot',
+      session: snapshot({
+        history: [internalPlaceholder, user('continue'), assistant('done')],
+        context_compaction: {
+          phase: 'completed',
+          history_index: 1,
+          after_message_count: 1,
+        },
+        last_sequence: 9,
+      }),
+    });
+
+    expect(state.history[0]?.content).toBeNull();
+    expect(state.compactions).toEqual([
+      {
+        key: 'compaction-snapshot-9',
+        phase: 'completed',
+        historyIndex: 1,
+        afterMessageCount: 1,
+        message: undefined,
+      },
+    ]);
+  });
+
+  it('restores retained history with every persisted compaction boundary', () => {
+    const state = sessionReducer(initialSessionState, {
+      type: 'snapshot',
+      session: snapshot({
+        history: [
+          user('before first compaction'),
+          assistant('first answer'),
+          user('between compactions'),
+          assistant('second answer'),
+          user('after second compaction'),
+        ],
+        context_compactions: [
+          {
+            phase: 'completed',
+            history_index: 2,
+            after_message_count: 2,
+          },
+          {
+            phase: 'completed',
+            history_index: 4,
+            after_message_count: 2,
+          },
+        ],
+        last_sequence: 12,
+      }),
+    });
+
+    expect(state.history).toHaveLength(5);
+    expect(state.compactions).toEqual([
+      {
+        key: 'compaction-snapshot-12-0',
+        phase: 'completed',
+        historyIndex: 2,
+        afterMessageCount: 2,
+        message: undefined,
+      },
+      {
+        key: 'compaction-snapshot-12-1',
+        phase: 'completed',
+        historyIndex: 4,
+        afterMessageCount: 2,
+        message: undefined,
+      },
+    ]);
   });
 
   it('does not let a queued run terminal event finish another active run', () => {

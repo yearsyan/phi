@@ -1,135 +1,432 @@
+.root,
+.compact {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .root {
+  color: var(--phi-markdown-color, var(--phi-text));
   font-size: 0.92rem;
-  line-height: 1.6;
-  color: var(--phi-text);
+  line-height: 1.65;
+}
+
+.root > :first-child,
+.compact > :first-child {
+  margin-top: 0;
+}
+
+.root > :last-child,
+.compact > :last-child {
+  margin-bottom: 0;
 }
 
 .root :global(p),
 .compact :global(p) {
-  margin: 0.4rem 0;
-}
-
-.root :global(p:first-child),
-.compact :global(p:first-child) {
-  margin-top: 0;
-}
-
-.root :global(p:last-child),
-.compact :global(p:last-child) {
-  margin-bottom: 0;
+  margin: 0.55em 0;
 }
 
 .root :global(h1),
 .root :global(h2),
 .root :global(h3),
-.root :global(h4) {
-  margin: 1rem 0 0.5rem;
-  line-height: 1.3;
-  font-weight: 600;
+.root :global(h4),
+.root :global(h5),
+.root :global(h6) {
+  margin: 1.35em 0 0.65em;
   color: var(--phi-text-strong);
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.root :global(h1),
+.root :global(h2) {
+  padding-bottom: 0.32em;
+  border-bottom: 1px solid var(--phi-border);
 }
 
 .root :global(h1) {
-  font-size: 1.2rem;
+  font-size: 1.42em;
 }
+
 .root :global(h2) {
-  font-size: 1.08rem;
+  font-size: 1.24em;
 }
+
 .root :global(h3) {
-  font-size: 1rem;
+  font-size: 1.08em;
+}
+
+.root :global(h4),
+.root :global(h5),
+.root :global(h6) {
+  font-size: 1em;
 }
 
 .root :global(ul),
-.root :global(ol) {
-  margin: 0.4rem 0;
-  padding-left: 1.25rem;
+.root :global(ol),
+.compact :global(ul),
+.compact :global(ol) {
+  margin: 0.55em 0;
+  padding-left: 1.6em;
 }
 
-.root :global(li) {
-  margin: 0.15rem 0;
+.root :global(li),
+.compact :global(li) {
+  margin: 0.2em 0;
 }
 
-.root :global(blockquote) {
-  margin: 0.5rem 0;
-  padding: 0.2rem 0.8rem;
-  border-left: 2px solid var(--phi-border);
+.root :global(li > p),
+.compact :global(li > p) {
+  margin: 0.25em 0;
+}
+
+.root :global(.contains-task-list),
+.compact :global(.contains-task-list) {
+  padding-left: 0.25em;
+  list-style: none;
+}
+
+.root :global(.task-list-item),
+.compact :global(.task-list-item) {
+  list-style: none;
+}
+
+.root :global(.task-list-item input),
+.compact :global(.task-list-item input) {
+  width: 1em;
+  height: 1em;
+  margin: 0 0.5em 0.15em -0.05em;
+  accent-color: var(--phi-accent);
+  vertical-align: middle;
+}
+
+.root :global(blockquote),
+.compact :global(blockquote) {
+  margin: 0.75em 0;
+  padding: 0.45em 0.85em;
+  border-left: 3px solid var(--phi-border-strong);
+  border-radius: 0 var(--phi-radius) var(--phi-radius) 0;
+  background: var(--phi-accent-soft);
   color: var(--phi-text-muted);
 }
 
+.root :global(blockquote > :first-child),
+.compact :global(blockquote > :first-child) {
+  margin-top: 0;
+}
+
+.root :global(blockquote > :last-child),
+.compact :global(blockquote > :last-child) {
+  margin-bottom: 0;
+}
+
+.root :global(hr),
+.compact :global(hr) {
+  height: 1px;
+  margin: 1.35em 0;
+  border: 0;
+  background: var(--phi-border);
+}
+
+.root :global(img),
+.compact :global(img) {
+  max-width: 100%;
+  border-radius: var(--phi-radius-lg);
+}
+
+.root :global(strong),
+.compact :global(strong) {
+  color: var(--phi-text-strong);
+  font-weight: 650;
+}
+
 .link {
-  color: var(--phi-accent);
-  text-decoration: none;
+  color: var(--phi-link, var(--phi-accent));
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 0.18em;
+  transition: text-decoration-color 140ms ease;
 }
 
 .link:hover {
-  text-decoration: underline;
+  text-decoration-color: currentColor;
 }
 
 .inlineCode {
-  font-family: var(--phi-mono);
-  font-size: 0.85em;
-  padding: 0.1em 0.35em;
-  border-radius: 4px;
+  padding: 0.12em 0.38em;
+  border: 1px solid color-mix(in srgb, var(--phi-border) 70%, transparent);
+  border-radius: 5px;
   background: var(--phi-surface-2);
   color: var(--phi-text-strong);
+  font-family: var(--phi-mono);
+  font-size: 0.86em;
+  white-space: break-spaces;
 }
 
 .fallbackPre {
-  margin: 0.6rem 0;
+  margin: 0.85em 0;
+  padding: 0.85em 1em;
   overflow-x: auto;
+  border: 1px solid var(--phi-border);
+  border-radius: var(--phi-radius-lg);
+  background: var(--phi-code-bg);
+  color: var(--phi-code-text);
+  font-family: var(--phi-mono);
+  font-size: 0.84em;
+  line-height: 1.55;
 }
 
 .codeBlock {
-  margin: 0.6rem 0;
-  border: 1px solid var(--phi-border);
-  border-radius: 6px;
+  --syntax-comment: #8b949e;
+  --syntax-keyword: #ff7b72;
+  --syntax-title: #d2a8ff;
+  --syntax-literal: #79c0ff;
+  --syntax-string: #a5d6ff;
+  --syntax-symbol: #ffa657;
+  --syntax-name: #7ee787;
+  --syntax-addition-bg: rgba(46, 160, 67, 0.18);
+  --syntax-deletion-bg: rgba(248, 81, 73, 0.18);
+
+  margin: 0.85em 0;
   overflow: hidden;
+  border: 1px solid var(--phi-border-strong);
+  border-radius: 10px;
   background: var(--phi-code-bg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+:global(:root[data-theme="light"]) .codeBlock {
+  --syntax-comment: #6e7781;
+  --syntax-keyword: #cf222e;
+  --syntax-title: #8250df;
+  --syntax-literal: #0550ae;
+  --syntax-string: #0a3069;
+  --syntax-symbol: #953800;
+  --syntax-name: #116329;
+  --syntax-addition-bg: #dafbe1;
+  --syntax-deletion-bg: #ffebe9;
 }
 
 .codeHeader {
   display: flex;
+  min-height: 35px;
   align-items: center;
   justify-content: space-between;
-  padding: 0.3rem 0.6rem;
-  background: var(--phi-surface-2);
+  gap: 12px;
+  padding: 5px 7px 5px 12px;
   border-bottom: 1px solid var(--phi-border);
-  font-size: 0.72rem;
+  background: var(--phi-surface-2);
 }
 
 .codeLang {
-  font-family: var(--phi-mono);
-  color: var(--phi-text-muted);
-  text-transform: lowercase;
-}
-
-.copyBtn {
-  background: transparent;
-  border: 1px solid var(--phi-border);
+  overflow: hidden;
   color: var(--phi-text-muted);
   font-family: var(--phi-mono);
   font-size: 0.7rem;
-  padding: 0.1rem 0.45rem;
-  border-radius: 4px;
+  letter-spacing: 0.025em;
+  text-overflow: ellipsis;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.copyBtn {
+  display: inline-flex;
+  min-height: 25px;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--phi-text-muted);
+  font-family: var(--phi-sans);
+  font-size: 0.7rem;
   cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease;
+}
+
+.copyBtn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .copyBtn:hover {
-  color: var(--phi-text);
-  border-color: var(--phi-text-muted);
+  border-color: var(--phi-border);
+  background: var(--phi-surface-hover);
+  color: var(--phi-text-strong);
 }
 
 .codePre {
   margin: 0;
-  padding: 0.7rem 0.85rem;
-  overflow-x: auto;
+  padding: 0.9em 1em;
+  overflow: auto;
+  background: var(--phi-code-bg);
+  color: var(--phi-code-text);
   font-family: var(--phi-mono);
   font-size: 0.82rem;
-  line-height: 1.5;
-  color: var(--phi-code-text);
+  line-height: 1.58;
+  tab-size: 2;
+}
+
+.highlightedCode {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  color: inherit;
+  font: inherit;
+}
+
+.codePre :global(.hljs-comment),
+.codePre :global(.hljs-code),
+.codePre :global(.hljs-formula),
+.codePre :global(.hljs-quote) {
+  color: var(--syntax-comment);
+}
+
+.codePre :global(.hljs-doctag),
+.codePre :global(.hljs-keyword),
+.codePre :global(.hljs-meta .hljs-keyword),
+.codePre :global(.hljs-template-tag),
+.codePre :global(.hljs-template-variable),
+.codePre :global(.hljs-type),
+.codePre :global(.hljs-variable.language_) {
+  color: var(--syntax-keyword);
+}
+
+.codePre :global(.hljs-title),
+.codePre :global(.hljs-title.class_),
+.codePre :global(.hljs-title.class_.inherited__),
+.codePre :global(.hljs-title.function_) {
+  color: var(--syntax-title);
+}
+
+.codePre :global(.hljs-attr),
+.codePre :global(.hljs-attribute),
+.codePre :global(.hljs-literal),
+.codePre :global(.hljs-meta),
+.codePre :global(.hljs-number),
+.codePre :global(.hljs-operator),
+.codePre :global(.hljs-selector-attr),
+.codePre :global(.hljs-selector-class),
+.codePre :global(.hljs-selector-id),
+.codePre :global(.hljs-variable) {
+  color: var(--syntax-literal);
+}
+
+.codePre :global(.hljs-meta .hljs-string),
+.codePre :global(.hljs-regexp),
+.codePre :global(.hljs-string) {
+  color: var(--syntax-string);
+}
+
+.codePre :global(.hljs-built_in),
+.codePre :global(.hljs-bullet),
+.codePre :global(.hljs-symbol) {
+  color: var(--syntax-symbol);
+}
+
+.codePre :global(.hljs-name),
+.codePre :global(.hljs-selector-pseudo),
+.codePre :global(.hljs-selector-tag) {
+  color: var(--syntax-name);
+}
+
+.codePre :global(.hljs-section) {
+  color: var(--syntax-literal);
+  font-weight: 700;
+}
+
+.codePre :global(.hljs-addition) {
+  color: var(--syntax-name);
+  background: var(--syntax-addition-bg);
+}
+
+.codePre :global(.hljs-deletion) {
+  color: var(--syntax-keyword);
+  background: var(--syntax-deletion-bg);
+}
+
+.codePre :global(.hljs-emphasis) {
+  font-style: italic;
+}
+
+.codePre :global(.hljs-strong) {
+  font-weight: 700;
+}
+
+.table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0.9em 0;
+  overflow: auto;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :global(tr) {
+  border-top: 1px solid var(--phi-border-strong);
+  background: transparent;
+}
+
+.table :global(tr:nth-child(2n)) {
+  background: var(--phi-surface-2);
+}
+
+.table :global(th),
+.table :global(td) {
+  min-width: 7.5rem;
+  padding: 0.48em 0.85em;
+  border: 1px solid var(--phi-border-strong);
+  text-align: left;
+  vertical-align: top;
+}
+
+.table :global(th) {
+  background: var(--phi-surface-2);
+  color: var(--phi-text-strong);
+  font-weight: 650;
+}
+
+.table :global(td) {
+  color: var(--phi-markdown-color, var(--phi-text));
+}
+
+.table :global(th[align="center"]),
+.table :global(td[align="center"]) {
+  text-align: center;
+}
+
+.table :global(th[align="right"]),
+.table :global(td[align="right"]) {
+  text-align: right;
 }
 
 .compact {
-  font-size: 0.85rem;
   color: var(--phi-text-muted);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+@media (max-width: 560px) {
+  .codeBlock,
+  .table {
+    margin-right: -2px;
+    margin-left: -2px;
+  }
+
+  .codePre {
+    padding: 0.8em 0.85em;
+    font-size: 0.78rem;
+  }
+
+  .table :global(th),
+  .table :global(td) {
+    min-width: 6.5rem;
+    padding: 0.42em 0.7em;
+  }
 }

@@ -27,12 +27,19 @@ const READY_MESSAGE = {
     reasoning_effort: null,
     revision: 1,
   },
-  mode: 'default',
   capability_mode: 'full_access',
   agent_profile: {
     agent_profile_id: 'default',
     revision: 0,
   },
+  skills: [
+    {
+      name: 'review',
+      description: 'Review the current change',
+      model_invocable: true,
+      user_invocable: true,
+    },
+  ],
 } as const;
 
 const NEW_TARGET = {
@@ -45,6 +52,7 @@ const RESTRICTED_PROFILE_TARGET = {
   ...NEW_TARGET,
   agentProfileId: 'reviewer',
   capabilityMode: 'read_only',
+  workspace: '/workspace/review',
 } as const;
 
 function fakeSocket() {
@@ -97,7 +105,22 @@ describe('useDaemonSession', () => {
 
     expect(result.current.connectionPhase).toBe('ready');
     expect(result.current.state.sessionId).toBe('activated-session');
-    expect(result.current.createdSessionRevision).toBe(1);
+    expect(result.current.sessionListRevision).toBe(1);
+
+    act(() => {
+      handlers?.onMessage({
+        type: 'event',
+        sequence: 1,
+        session_id: 'activated-session',
+        event: {
+          type: 'title_changed',
+          title: 'Generated title',
+        },
+      });
+    });
+
+    expect(result.current.state.title).toBe('Generated title');
+    expect(result.current.sessionListRevision).toBe(2);
     expect(socket.close).not.toHaveBeenCalled();
     expect(sessionConnectionMocks.attachSession).not.toHaveBeenCalled();
   });
@@ -118,6 +141,7 @@ describe('useDaemonSession', () => {
         expect.objectContaining({
           agentProfileId: 'reviewer',
           capabilityMode: 'read_only',
+          workspace: '/workspace/review',
         }),
       );
     });
@@ -167,6 +191,57 @@ describe('useDaemonSession', () => {
     });
     expect(socket.send).toHaveBeenCalledTimes(2);
     expect(result.current.state.pendingPrompts).toHaveLength(0);
+  });
+
+  it('exposes ready skills and sends explicit skill and reasoning commands', async () => {
+    const socket = fakeSocket();
+    let handlers: SessionSocketHandlers | null = null;
+    sessionConnectionMocks.openNewSession.mockImplementation(
+      async (
+        _authKey: string,
+        _profileId: string,
+        nextHandlers: SessionSocketHandlers,
+      ): Promise<SessionSocket> => {
+        handlers = nextHandlers;
+        return socket as unknown as SessionSocket;
+      },
+    );
+
+    const { result } = renderHook(() =>
+      useDaemonSession('daemon-key', NEW_TARGET),
+    );
+    await waitFor(() => {
+      expect(result.current.connectionPhase).toBe('preparing');
+    });
+    act(() => handlers?.onMessage(READY_MESSAGE));
+
+    expect(result.current.state.skills[0]?.name).toBe('review');
+    act(() => {
+      expect(result.current.sendPrompt('security', { name: 'review' })).toBe(
+        true,
+      );
+      result.current.setReasoningEffort('high');
+    });
+
+    expect(socket.send).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        type: 'prompt',
+        content: { type: 'text', value: 'security' },
+        skill: expect.objectContaining({ name: 'review' }),
+      }),
+    );
+    expect(socket.send).toHaveBeenNthCalledWith(2, {
+      type: 'set_reasoning_effort',
+      request_id: expect.any(String),
+      effort: 'high',
+    });
+    expect(result.current.state.pendingPrompts[0]).toEqual(
+      expect.objectContaining({
+        content: { type: 'text', value: '/review security' },
+        matchAnyEcho: true,
+      }),
+    );
   });
 
   it('reattaches after an activated session disconnects', async () => {

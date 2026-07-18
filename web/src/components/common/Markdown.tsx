@@ -1,13 +1,55 @@
+import hljs from 'highlight.js/lib/core';
+import bash from 'highlight.js/lib/languages/bash';
+import c from 'highlight.js/lib/languages/c';
+import cpp from 'highlight.js/lib/languages/cpp';
+import css from 'highlight.js/lib/languages/css';
+import diff from 'highlight.js/lib/languages/diff';
+import dockerfile from 'highlight.js/lib/languages/dockerfile';
+import go from 'highlight.js/lib/languages/go';
+import ini from 'highlight.js/lib/languages/ini';
+import java from 'highlight.js/lib/languages/java';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import markdown from 'highlight.js/lib/languages/markdown';
+import plaintext from 'highlight.js/lib/languages/plaintext';
+import python from 'highlight.js/lib/languages/python';
+import rust from 'highlight.js/lib/languages/rust';
+import sql from 'highlight.js/lib/languages/sql';
+import typescript from 'highlight.js/lib/languages/typescript';
+import xml from 'highlight.js/lib/languages/xml';
+import yaml from 'highlight.js/lib/languages/yaml';
 import {
   Children,
   isValidElement,
   memo,
   type ReactNode,
+  useMemo,
   useState,
 } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { CheckIcon, CopyIcon } from './Icons.tsx';
 import styles from './Markdown.module.css';
+
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('c', c);
+hljs.registerLanguage('cpp', cpp);
+hljs.registerLanguage('css', css);
+hljs.registerLanguage('diff', diff);
+hljs.registerLanguage('dockerfile', dockerfile);
+hljs.registerLanguage('go', go);
+hljs.registerLanguage('ini', ini);
+hljs.registerLanguage('java', java);
+hljs.registerLanguage('javascript', javascript);
+hljs.registerLanguage('json', json);
+hljs.registerLanguage('markdown', markdown);
+hljs.registerLanguage('plaintext', plaintext);
+hljs.registerLanguage('python', python);
+hljs.registerLanguage('rust', rust);
+hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('typescript', typescript);
+hljs.registerLanguage('xml', xml);
+hljs.registerLanguage('yaml', yaml);
 
 interface MarkdownProps {
   children: string;
@@ -27,6 +69,9 @@ function MarkdownImpl({ children, compact }: MarkdownProps) {
         components={{
           code: InlineCode,
           pre: PreBlock,
+          table({ children }) {
+            return <table className={styles.table}>{children}</table>;
+          },
           a({ children, href }) {
             return (
               <a
@@ -74,6 +119,10 @@ function PreBlock({ children }: { children?: ReactNode }) {
 
 function CodeBlock({ language, text }: { language?: string; text: string }) {
   const [copied, setCopied] = useState(false);
+  const highlighted = useMemo(
+    () => highlightCode(text, language),
+    [language, text],
+  );
   const handleCopy = () => {
     navigator.clipboard?.writeText(text).then(
       () => {
@@ -88,14 +137,62 @@ function CodeBlock({ language, text }: { language?: string; text: string }) {
   return (
     <div className={styles.codeBlock}>
       <div className={styles.codeHeader}>
-        <span className={styles.codeLang}>{language ?? 'text'}</span>
-        <button type="button" className={styles.copyBtn} onClick={handleCopy}>
-          {copied ? 'copied' : 'copy'}
+        <span className={styles.codeLang}>{highlighted.language}</span>
+        <button
+          type="button"
+          className={styles.copyBtn}
+          onClick={handleCopy}
+          aria-label={copied ? 'Code copied' : 'Copy code'}
+        >
+          {copied ? <CheckIcon /> : <CopyIcon />}
+          <span>{copied ? 'copied' : 'copy'}</span>
         </button>
       </div>
       <pre className={styles.codePre}>
-        <code>{text}</code>
+        <code
+          className={styles.highlightedCode}
+          data-highlight-language={highlighted.language}
+        >
+          {highlighted.html === null ? (
+            text
+          ) : (
+            // biome-ignore lint/security/noDangerouslySetInnerHtml: Highlight.js escapes source text before adding its token spans.
+            <span dangerouslySetInnerHTML={{ __html: highlighted.html }} />
+          )}
+        </code>
       </pre>
     </div>
   );
+}
+
+interface HighlightedCode {
+  html: string | null;
+  language: string;
+}
+
+function highlightCode(text: string, language?: string): HighlightedCode {
+  const normalizedLanguage = language?.trim().toLowerCase();
+
+  try {
+    if (normalizedLanguage) {
+      if (!hljs.getLanguage(normalizedLanguage)) {
+        return { html: null, language: normalizedLanguage };
+      }
+      return {
+        html: hljs.highlight(text, {
+          language: normalizedLanguage,
+          ignoreIllegals: true,
+        }).value,
+        language: normalizedLanguage,
+      };
+    }
+
+    const detected = hljs.highlightAuto(text);
+    return {
+      html: detected.value,
+      language: detected.language ?? 'text',
+    };
+  } catch {
+    return { html: null, language: normalizedLanguage ?? 'text' };
+  }
 }

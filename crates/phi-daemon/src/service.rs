@@ -3,14 +3,17 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use phi::{
-    Agent, AgentMode, BuiltSubagent, BuiltinTools, CapabilityMode, ConfiguredSubagentBuildRequest,
-    Content, GenerationConfig, InMemoryPlanStore, InMemorySessionStorage, PlanStore,
-    ReasoningEffort, SessionStorage, SkillCatalog, SkillsConfig, SubagentBuildRequest,
-    SubagentConfig, SubagentFactory, SubagentFactoryError, SubagentIsolation,
-    SubagentOutputContract, SubagentRuntime, SubagentTools, SubagentType, Workspace,
+    Agent, BuiltSubagent, BuiltinTools, CapabilityMode, ConfiguredSubagentBuildRequest, Content,
+    GenerationConfig, InMemorySessionStorage, Message, ReasoningEffort, Role, SessionSnapshot,
+    SessionStorage, SkillCatalog, SkillsConfig, StorageError, SubagentBuildRequest, SubagentConfig,
+    SubagentFactory, SubagentFactoryError, SubagentIsolation, SubagentOutputContract,
+    SubagentRuntime, SubagentTools, SubagentType, Workspace,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
+use tokio::{
+    sync::{Mutex, RwLock, RwLockReadGuard, Semaphore},
+    task::JoinSet,
+};
 
 use crate::{
     runtime::{
@@ -20,6 +23,7 @@ use crate::{
         ShutdownFailure, UnconfiguredAgentFactory, WorktreeManager, compile_agent_profile,
         normalize_provider_config,
     },
+    session_title::{ProviderSessionTitleGenerator, SessionTitleGenerator, SessionTitleRequest},
     store::{
         AgentProfileStore, AgentProfileStoreError, ControlStore, ControlStoreError,
         DEFAULT_PROFILE_ID, MemoryAgentProfileStore, MemoryControlStore, ProviderConfig,
@@ -27,15 +31,19 @@ use crate::{
     },
 };
 
+const MAX_CONCURRENT_SESSION_TITLE_TASKS: usize = 8;
+
 #[derive(Clone)]
 pub struct ApplicationService {
     registry: AgentRegistry,
     store: Arc<dyn ControlStore>,
     session_storage: Arc<dyn SessionStorage>,
-    plan_store: Arc<dyn PlanStore>,
     factory: Arc<dyn AgentFactory>,
     provider_store: Option<Arc<dyn ProviderStore>>,
     agent_profile_store: Option<Arc<dyn AgentProfileStore>>,
+    title_generator: Option<Arc<dyn SessionTitleGenerator>>,
+    title_tasks: Arc<Mutex<JoinSet<()>>>,
+    title_slots: Arc<Semaphore>,
     subagents_enabled: bool,
     subagent_worktrees: Option<WorktreeManager>,
     prepared: Arc<Mutex<HashMap<SessionId, AgentHandle>>>,
@@ -133,17 +141,11 @@ impl SubagentFactory for DaemonSubagentFactory {
                 .map_err(|error| SubagentFactoryError::new(error.to_string()))?,
             None => self.agent_profile.clone(),
         };
-        let agent_mode = if request.effective_config.agent_type == SubagentType::Plan {
-            AgentMode::Plan
-        } else {
-            AgentMode::Default
-        };
         let overlay = subagent_prompt_overlay(&request.effective_config, workspace.as_ref());
         let mut build = AgentBuildRequest::new(SessionId::new(), self.profile_id.clone())
             .with_pinned_agent_profile(child_profile)
             .with_model(model)
             .with_capability_mode(request.effective_config.capability_mode)
-            .with_agent_mode(agent_mode)
             .with_prompt_overlay(overlay);
         if let Some(workspace) = workspace {
             build = build.with_workspace(workspace);
@@ -177,30 +179,16 @@ impl ApplicationService {
         session_storage: Arc<dyn SessionStorage>,
         factory: Arc<dyn AgentFactory>,
     ) -> Self {
-        Self::new_with_plan_store(
-            registry,
-            store,
-            session_storage,
-            Arc::new(InMemoryPlanStore::new()),
-            factory,
-        )
-    }
-
-    pub fn new_with_plan_store(
-        registry: AgentRegistry,
-        store: Arc<dyn ControlStore>,
-        session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
-        factory: Arc<dyn AgentFactory>,
-    ) -> Self {
         Self {
             registry,
             store,
             session_storage,
-            plan_store,
             factory,
             provider_store: None,
             agent_profile_store: None,
+            title_generator: None,
+            title_tasks: Arc::new(Mutex::new(JoinSet::new())),
+            title_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_TITLE_TASKS)),
             // Embedders opt in by installing the daemon integration. The
             // standalone daemon enables it from DaemonConfig by default.
             subagents_enabled: false,
@@ -218,37 +206,19 @@ impl ApplicationService {
         session_storage: Arc<dyn SessionStorage>,
         provider_store: Arc<dyn ProviderStore>,
     ) -> Self {
-        Self::managed_with_plan_store(
+        Self::managed_with_skills(
             registry,
             store,
             session_storage,
-            Arc::new(InMemoryPlanStore::new()),
-            provider_store,
-        )
-    }
-
-    pub fn managed_with_plan_store(
-        registry: AgentRegistry,
-        store: Arc<dyn ControlStore>,
-        session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
-        provider_store: Arc<dyn ProviderStore>,
-    ) -> Self {
-        Self::managed_with_plan_store_and_skills(
-            registry,
-            store,
-            session_storage,
-            plan_store,
             provider_store,
             SkillsConfig::disabled(),
         )
     }
 
-    pub fn managed_with_plan_store_and_skills(
+    pub fn managed_with_skills(
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
         provider_store: Arc<dyn ProviderStore>,
         skills: SkillsConfig,
     ) -> Self {
@@ -261,18 +231,16 @@ impl ApplicationService {
             registry,
             store,
             session_storage,
-            plan_store,
             provider_store,
             agent_profile_store,
             factory,
         )
     }
 
-    pub fn managed_with_plan_store_skills_and_builtin_tools(
+    pub fn managed_with_skills_and_builtin_tools(
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
         provider_store: Arc<dyn ProviderStore>,
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
@@ -287,7 +255,6 @@ impl ApplicationService {
             registry,
             store,
             session_storage,
-            plan_store,
             provider_store,
             agent_profile_store,
             factory,
@@ -295,11 +262,10 @@ impl ApplicationService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn managed_with_plan_store_profiles_skills_and_builtin_tools(
+    pub fn managed_with_profiles_skills_and_builtin_tools(
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
         provider_store: Arc<dyn ProviderStore>,
         agent_profile_store: Arc<dyn AgentProfileStore>,
         skills: SkillsConfig,
@@ -313,7 +279,6 @@ impl ApplicationService {
             registry,
             store,
             session_storage,
-            plan_store,
             provider_store,
             agent_profile_store,
             factory,
@@ -324,14 +289,15 @@ impl ApplicationService {
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
-        plan_store: Arc<dyn PlanStore>,
         provider_store: Arc<dyn ProviderStore>,
         agent_profile_store: Arc<dyn AgentProfileStore>,
         factory: ConfiguredAgentFactory,
     ) -> Self {
         let factory: Arc<dyn AgentFactory> = Arc::new(factory);
-        let mut service =
-            Self::new_with_plan_store(registry, store, session_storage, plan_store, factory);
+        let mut service = Self::new(registry, store, session_storage, factory);
+        service.title_generator = Some(Arc::new(ProviderSessionTitleGenerator::new(Arc::clone(
+            &provider_store,
+        ))));
         service.provider_store = Some(provider_store);
         service.agent_profile_store = Some(agent_profile_store);
         service
@@ -348,6 +314,14 @@ impl ApplicationService {
 
     pub fn with_subagents_enabled(mut self, enabled: bool) -> Self {
         self.subagents_enabled = enabled;
+        self
+    }
+
+    pub fn with_session_title_generator<G>(mut self, generator: G) -> Self
+    where
+        G: SessionTitleGenerator + 'static,
+    {
+        self.title_generator = Some(Arc::new(generator));
         self
     }
 
@@ -390,9 +364,24 @@ impl ApplicationService {
         .await
     }
 
-    /// Prepares a session bound to an explicit library workspace. The
-    /// standalone HTTP API deliberately uses the daemon-configured default;
-    /// embedders may select a different workspace per session.
+    pub async fn prepare_session_configured_in_workspace(
+        &self,
+        profile_id: impl Into<String>,
+        agent_profile_id: impl Into<String>,
+        capability_mode: Option<CapabilityMode>,
+        workspace: Workspace,
+    ) -> Result<PreparedSession, ServiceError> {
+        self.prepare_session_with_options(
+            profile_id.into(),
+            agent_profile_id.into(),
+            capability_mode,
+            Some(workspace),
+        )
+        .await
+    }
+
+    /// Prepares a session bound to an explicit library workspace with the
+    /// default Agent Profile and capability mode.
     pub async fn prepare_session_in_workspace(
         &self,
         profile_id: impl Into<String>,
@@ -472,11 +461,25 @@ impl ApplicationService {
         prepared: &PreparedSession,
         content: Content,
     ) -> Result<(AgentHandle, QueuedRun), ServiceError> {
+        self.activate_and_enqueue_with_title_content(prepared, content.clone(), content)
+            .await
+    }
+
+    /// Variant used by transports that expand an explicitly invoked skill
+    /// before enqueueing. The title remains based on the user's unexpanded
+    /// request rather than the injected skill instructions.
+    pub async fn activate_and_enqueue_with_title_content(
+        &self,
+        prepared: &PreparedSession,
+        content: Content,
+        title_content: Content,
+    ) -> Result<(AgentHandle, QueuedRun), ServiceError> {
         let _lifecycle = self.enter().await?;
         let session_id = prepared.handle.session_id();
         let _activation_guard = self.registry.lock_session(session_id).await;
         let handle = self.activate_session_locked(prepared).await?;
         let queued = handle.enqueue_prompt(content).await?;
+        self.schedule_session_title(&handle, title_content).await;
         Ok((handle, queued))
     }
 
@@ -597,17 +600,33 @@ impl ApplicationService {
             return Err(error.into());
         }
         if (workspace_migrated || agent_profile_migrated)
-            && let Err(error) = self.store.update_session(record).await
+            && let Err(error) = self.store.update_session(record.clone()).await
         {
             let _ = handle.shutdown().await;
             return Err(error.into());
         }
         self.registry.register(handle.clone()).await?;
+        if record.title.is_none()
+            && let Some(content) = handle
+                .snapshot()
+                .messages
+                .iter()
+                .find(|message| message.role == Role::User)
+                .and_then(|message| message.content.clone())
+        {
+            self.schedule_session_title(&handle, content).await;
+        }
         Ok(handle)
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionListing>, ServiceError> {
-        let records = self.store.list_sessions().await?;
+        let mut records = self.store.list_sessions().await?;
+        records.sort_unstable_by(|left, right| {
+            right
+                .pinned
+                .cmp(&left.pinned)
+                .then_with(|| right.id.as_uuid().cmp(&left.id.as_uuid()))
+        });
         let live = self.registry.summaries().await;
         let mut sessions = Vec::with_capacity(records.len());
         for record in records {
@@ -629,6 +648,142 @@ impl ApplicationService {
             .await
             .map(|handle| handle.summary());
         Ok(SessionListing { record, state })
+    }
+
+    /// Creates a durable, offline session at one protocol-safe point in the
+    /// source session.
+    ///
+    /// Forks read the latest durable storage checkpoint, including while the
+    /// source actor is running. Streaming drafts are therefore never copied.
+    /// An after-response fork keeps a selected tool-call batch indivisible;
+    /// a before-tool-calls fork keeps only its visible assistant preamble.
+    pub async fn fork_session(
+        &self,
+        session_id: SessionId,
+        message_index: usize,
+        position: ForkPosition,
+    ) -> Result<SessionListing, ServiceError> {
+        let _lifecycle = self.enter().await?;
+        let _session_guard = self.registry.lock_session(session_id).await;
+        let source_record = self
+            .store
+            .get_session(session_id)
+            .await?
+            .ok_or(ServiceError::SessionNotFound { session_id })?;
+
+        // Manual compaction replaces active transcript indexes. Share its
+        // admission permit while resolving this fork so the client-supplied
+        // index can never race either side of that replacement. Running turns
+        // may continue appending protocol-complete durable checkpoints.
+        let _fork_guard = self
+            .registry
+            .get(session_id)
+            .await
+            .map(|handle| handle.acquire_fork_guard())
+            .transpose()?;
+
+        let source = self
+            .session_storage
+            .load(&session_id.to_string())
+            .await?
+            .ok_or_else(|| StorageError::InvalidTranscript {
+                session_id: session_id.to_string(),
+                message: "session metadata exists without a transcript".to_owned(),
+            })?;
+        let messages = fork_messages_at(&source.messages, session_id, message_index, position)?;
+
+        let fork_id = SessionId::new();
+        let mut snapshot = SessionSnapshot::new(fork_id.to_string(), messages)?;
+        snapshot.workspace = source_record
+            .workspace
+            .clone()
+            .or_else(|| source.workspace.clone());
+        snapshot.capability_mode = source.capability_mode;
+
+        let mut record = source_record;
+        record.id = fork_id;
+        record.pinned = false;
+        record.workspace.clone_from(&snapshot.workspace);
+
+        self.session_storage.save(&snapshot).await?;
+        if let Err(error) = self.store.create_session(record.clone()).await {
+            if let Err(rollback_error) = self.session_storage.delete(&fork_id.to_string()).await {
+                tracing::error!(
+                    %fork_id,
+                    error = %rollback_error,
+                    "could not remove fork transcript after metadata creation failed"
+                );
+            }
+            return Err(error.into());
+        }
+
+        Ok(SessionListing {
+            record,
+            state: None,
+        })
+    }
+
+    pub async fn set_session_pinned(
+        &self,
+        session_id: SessionId,
+        pinned: bool,
+    ) -> Result<SessionListing, ServiceError> {
+        let _lifecycle = self.enter().await?;
+        let _session_guard = self.registry.lock_session(session_id).await;
+        let mut record = self
+            .store
+            .get_session(session_id)
+            .await?
+            .ok_or(ServiceError::SessionNotFound { session_id })?;
+
+        if record.pinned != pinned {
+            if let Some(handle) = self.registry.get(session_id).await
+                && handle.status() != crate::runtime::AgentStatus::Closed
+            {
+                handle.set_pinned(pinned).await?;
+            } else {
+                record.pinned = pinned;
+                self.store.update_session(record).await?;
+            }
+        }
+
+        self.get_session(session_id).await
+    }
+
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<(), ServiceError> {
+        let _lifecycle = self.enter().await?;
+        let _session_guard = self.registry.lock_session(session_id).await;
+        if self.store.get_session(session_id).await?.is_none() {
+            return Err(ServiceError::SessionNotFound { session_id });
+        }
+
+        if let Some(handle) = self.registry.get(session_id).await {
+            if handle.status() != crate::runtime::AgentStatus::Closed {
+                handle.shutdown().await?;
+            }
+            self.registry.remove(session_id).await;
+        }
+
+        let record = self
+            .store
+            .get_session(session_id)
+            .await?
+            .ok_or(ServiceError::SessionNotFound { session_id })?;
+
+        if !self.store.delete_session(session_id).await? {
+            return Err(ServiceError::SessionNotFound { session_id });
+        }
+        if let Err(error) = self.session_storage.delete(&session_id.to_string()).await {
+            if let Err(rollback_error) = self.store.create_session(record).await {
+                tracing::error!(
+                    %session_id,
+                    error = %rollback_error,
+                    "could not restore session metadata after transcript deletion failed"
+                );
+            }
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Returns the immutable skill snapshot used by a live session. For an
@@ -755,14 +910,13 @@ impl ApplicationService {
         let subagents = self
             .subagents_enabled
             .then(|| self.install_subagents(session_id, &mut built));
-        AgentHandle::spawn_configured_with_plan_store_skills_and_subagents(
+        AgentHandle::spawn_configured_with_skills_and_subagents(
             session_id,
             built.agent,
             built.profile_id,
             built.agent_profile,
             built.model,
             built.reasoning_effort,
-            Arc::clone(&self.plan_store),
             built.skills,
             subagents,
         )
@@ -801,6 +955,65 @@ impl ApplicationService {
         runtime
     }
 
+    async fn schedule_session_title(&self, handle: &AgentHandle, initial_content: Content) {
+        let Some(generator) = self.title_generator.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let summary = handle.summary();
+        if summary.title.is_some() {
+            return;
+        }
+        let request = SessionTitleRequest {
+            session_id: summary.session_id,
+            profile_id: summary.profile_id,
+            model: summary.model,
+            reasoning_effort: summary.reasoning_effort,
+            initial_content,
+        };
+        let title_permit = match Arc::clone(&self.title_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %summary.session_id,
+                    capacity = MAX_CONCURRENT_SESSION_TITLE_TASKS,
+                    "session title generation concurrency is full"
+                );
+                return;
+            }
+        };
+        let handle = handle.clone();
+        let session_id = handle.session_id();
+        let mut tasks = self.title_tasks.lock().await;
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!(error = %error, "session title task failed");
+            }
+        }
+        tasks.spawn(async move {
+            let _title_permit = title_permit;
+            match generator.generate_title(request).await {
+                Ok(title) => {
+                    if let Err(error) = handle.set_title(title).await {
+                        tracing::warn!(
+                            %session_id,
+                            error = %error,
+                            "could not persist generated session title"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        error = %error,
+                        "could not generate session title"
+                    );
+                }
+            }
+        });
+    }
+
     pub async fn discard_prepared(&self, prepared: &PreparedSession) {
         let session_id = prepared.handle.session_id();
         let removed = self.prepared.lock().await.remove(&session_id);
@@ -820,6 +1033,18 @@ impl ApplicationService {
                 .map(|(_, handle)| handle)
                 .collect::<Vec<_>>()
         };
+
+        {
+            let mut title_tasks = self.title_tasks.lock().await;
+            title_tasks.abort_all();
+            while let Some(result) = title_tasks.join_next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(error = %error, "session title task failed during shutdown");
+                }
+            }
+        }
 
         let mut failures = self.registry.shutdown_all().await;
         let mut pending = FuturesUnordered::new();
@@ -943,6 +1168,12 @@ pub struct SessionListing {
     pub state: Option<AgentSummary>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkPosition {
+    After,
+    BeforeToolCalls,
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("daemon is shutting down")]
@@ -950,6 +1181,15 @@ pub enum ServiceError {
 
     #[error("session {session_id} was not found")]
     SessionNotFound { session_id: SessionId },
+
+    #[error(
+        "message index {message_index} in session {session_id} is not a forkable boundary: {message}"
+    )]
+    InvalidForkPoint {
+        session_id: SessionId,
+        message_index: usize,
+        message: String,
+    },
 
     #[error("Provider management is unavailable for this embedded service")]
     ProviderManagementUnavailable,
@@ -964,6 +1204,9 @@ pub enum ServiceError {
     Store(#[from] ControlStoreError),
 
     #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    #[error(transparent)]
     ProviderStore(#[from] ProviderStoreError),
 
     #[error(transparent)]
@@ -974,4 +1217,172 @@ pub enum ServiceError {
 
     #[error(transparent)]
     Registry(#[from] RegistryError),
+}
+
+fn fork_messages_at(
+    messages: &[Message],
+    session_id: SessionId,
+    message_index: usize,
+    position: ForkPosition,
+) -> Result<Vec<Message>, ServiceError> {
+    let invalid = |message: &str| ServiceError::InvalidForkPoint {
+        session_id,
+        message_index,
+        message: message.to_owned(),
+    };
+    let assistant = messages
+        .get(message_index)
+        .ok_or_else(|| invalid("message index is out of range"))?;
+    if assistant.role != Role::Assistant || !assistant.visibility.is_public() {
+        return Err(invalid(
+            "selected message is not a public assistant response",
+        ));
+    }
+
+    let end = message_index
+        .checked_add(1 + assistant.tool_calls.len())
+        .ok_or_else(|| invalid("message index overflowed"))?;
+    if end > messages.len() {
+        return Err(invalid("assistant tool-call batch has missing results"));
+    }
+    for (offset, call) in assistant.tool_calls.iter().enumerate() {
+        let result = &messages[message_index + 1 + offset];
+        if result.role != Role::Tool || result.tool_call_id.as_deref() != Some(call.id.as_str()) {
+            return Err(invalid(
+                "assistant tool-call batch is not followed by its ordered results",
+            ));
+        }
+    }
+
+    match position {
+        ForkPosition::After => Ok(messages[..end].to_vec()),
+        ForkPosition::BeforeToolCalls => {
+            if assistant.tool_calls.is_empty() {
+                return Err(invalid(
+                    "selected assistant response does not contain tool calls",
+                ));
+            }
+            let mut prefix = messages[..message_index].to_vec();
+            if assistant.content.as_ref().is_some_and(content_has_payload) {
+                // The provider-specific replay state can still contain the
+                // removed tool calls, so rebuild a normalized text-only
+                // assistant message instead of mutating the original.
+                prefix.push(Message::assistant(assistant.content.clone(), Vec::new()));
+            }
+            Ok(prefix)
+        }
+    }
+}
+
+fn content_has_payload(content: &Content) -> bool {
+    match content {
+        Content::Text(text) => !text.trim().is_empty(),
+        Content::Parts(parts) => !parts.is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use phi::{MessageVisibility, ToolCall};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn fork_boundary_keeps_the_complete_selected_tool_batch() {
+        let messages = vec![
+            Message::user("inspect"),
+            Message::assistant(
+                Some(Content::text("checking")),
+                vec![ToolCall::new("call-1", "read", json!({}))],
+            ),
+            Message::tool("call-1", "result"),
+            Message::assistant(Some(Content::text("done")), Vec::new()),
+        ];
+
+        let prefix = fork_messages_at(&messages, SessionId::new(), 1, ForkPosition::After).unwrap();
+
+        assert_eq!(prefix, messages[..3]);
+    }
+
+    #[test]
+    fn fork_boundary_rejects_non_public_or_incomplete_assistant_nodes() {
+        let session_id = SessionId::new();
+        let internal = Message::assistant(Some(Content::text("hidden")), Vec::new())
+            .with_visibility(MessageVisibility::Internal);
+        assert!(matches!(
+            fork_messages_at(
+                &[Message::user("hello"), internal],
+                session_id,
+                1,
+                ForkPosition::After,
+            ),
+            Err(ServiceError::InvalidForkPoint { .. })
+        ));
+
+        let incomplete = Message::assistant(None, vec![ToolCall::new("call-1", "read", json!({}))]);
+        assert!(matches!(
+            fork_messages_at(
+                &[Message::user("hello"), incomplete],
+                session_id,
+                1,
+                ForkPosition::After,
+            ),
+            Err(ServiceError::InvalidForkPoint { .. })
+        ));
+    }
+
+    #[test]
+    fn fork_boundary_before_tool_calls_keeps_only_the_visible_preamble() {
+        let mut assistant = Message::assistant(
+            Some(Content::text("I will inspect the workspace.")),
+            vec![ToolCall::new("call-1", "read", json!({}))],
+        );
+        assistant.reasoning = Some("private normalized reasoning".to_owned());
+        assistant.provider_state = Some(phi::ProviderState::OpenAiResponses {
+            output: vec![json!({ "type": "function_call" })],
+        });
+        let messages = vec![
+            Message::user("inspect"),
+            assistant,
+            Message::tool("call-1", "result"),
+            Message::assistant(Some(Content::text("done")), Vec::new()),
+        ];
+
+        let prefix = fork_messages_at(
+            &messages,
+            SessionId::new(),
+            1,
+            ForkPosition::BeforeToolCalls,
+        )
+        .unwrap();
+
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(
+            prefix[1].text_content(),
+            Some("I will inspect the workspace.")
+        );
+        assert!(prefix[1].tool_calls.is_empty());
+        assert_eq!(prefix[1].reasoning, None);
+        assert_eq!(prefix[1].provider_state, None);
+    }
+
+    #[test]
+    fn fork_boundary_before_tool_only_response_ends_at_the_prior_message() {
+        let messages = vec![
+            Message::user("inspect"),
+            Message::assistant(None, vec![ToolCall::new("call-1", "read", json!({}))]),
+            Message::tool("call-1", "result"),
+        ];
+
+        let prefix = fork_messages_at(
+            &messages,
+            SessionId::new(),
+            1,
+            ForkPosition::BeforeToolCalls,
+        )
+        .unwrap();
+
+        assert_eq!(prefix, messages[..1]);
+    }
 }

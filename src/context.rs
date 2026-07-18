@@ -10,9 +10,9 @@ mod default_compactor;
 
 pub(crate) use default_compactor::estimate_messages_tokens;
 pub use default_compactor::{
-    DEFAULT_CONTEXT_COMPACTION_BUFFER_TOKENS, DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES,
-    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS, DefaultContextCompactor,
-    default_context_compaction_threshold,
+    DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE, DEFAULT_CONTEXT_COMPACTION_BUFFER_TOKENS,
+    DEFAULT_CONTEXT_COMPACTION_MAX_RETRIES, DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_TOKENS,
+    DefaultContextCompactor, default_context_compaction_threshold,
 };
 
 /// Why context compaction was activated.

@@ -20,8 +20,9 @@ use tokio::{
 
 use crate::{
     Workspace,
-    tool::{AgentMode, CapabilityMode},
-    types::{Message, TokenUsage},
+    context::DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE,
+    tool::CapabilityMode,
+    types::{Message, MessageVisibility, Role, TokenUsage},
 };
 
 const DISK_FORMAT_VERSION: u32 = 1;
@@ -39,14 +40,12 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub workspace: Option<Workspace>,
     pub messages: Vec<Message>,
+    /// Durable conversation projection retained for callers after context
+    /// compaction. These messages are never used as Provider input.
+    #[serde(default)]
+    pub history: SessionHistory,
     pub last_usage: Option<TokenUsage>,
     pub cumulative_usage: TokenUsage,
-    /// Execution mode restored when this session is resumed.
-    ///
-    /// The default preserves compatibility with snapshots written before
-    /// modes were introduced.
-    #[serde(default)]
-    pub mode: AgentMode,
     /// Maximum tool capability restored when this session is resumed.
     ///
     /// Full access preserves compatibility with snapshots written before
@@ -55,17 +54,130 @@ pub struct SessionSnapshot {
     pub capability_mode: CapabilityMode,
 }
 
+/// One completed compaction boundary in [`SessionHistory`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionCompaction {
+    /// Position in `SessionHistory::messages` where the divider is rendered.
+    pub history_index: usize,
+    /// First active transcript message replaced by the compactor.
+    pub changed_from: usize,
+    /// Active transcript length immediately after the replacement.
+    pub after_message_count: usize,
+}
+
+/// Append-oriented conversation history that is separate from the active
+/// Provider transcript in [`SessionSnapshot::messages`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionHistory {
+    pub messages: Vec<Message>,
+    pub compactions: Vec<SessionCompaction>,
+    /// Maps current active transcript positions back to retained history.
+    /// Compaction replacement messages deliberately have no history entry.
+    #[serde(default)]
+    active_message_indices: Vec<Option<usize>>,
+}
+
+impl SessionHistory {
+    pub fn from_messages(messages: &[Message]) -> Self {
+        Self {
+            messages: messages.to_vec(),
+            compactions: Vec::new(),
+            active_message_indices: (0..messages.len()).map(Some).collect(),
+        }
+    }
+
+    pub(crate) fn normalize(&mut self, active_messages: &[Message]) {
+        if self.messages.is_empty() && !active_messages.is_empty() {
+            *self = Self::from_messages(active_messages);
+            return;
+        }
+        if self.active_message_indices.len() == active_messages.len()
+            && self
+                .active_message_indices
+                .iter()
+                .flatten()
+                .all(|index| *index < self.messages.len())
+        {
+            return;
+        }
+
+        self.active_message_indices = vec![None; active_messages.len()];
+        if let Some(compaction) = self.compactions.last() {
+            let active_start = compaction.after_message_count.min(active_messages.len());
+            let history_start = compaction.history_index.min(self.messages.len());
+            for offset in 0..active_messages.len().saturating_sub(active_start) {
+                let history_index = history_start + offset;
+                if history_index < self.messages.len() {
+                    self.active_message_indices[active_start + offset] = Some(history_index);
+                }
+            }
+        } else if self.messages == active_messages {
+            self.active_message_indices = (0..active_messages.len()).map(Some).collect();
+        }
+    }
+
+    pub(crate) fn append_active(&mut self, messages: &[Message]) {
+        for message in messages {
+            let history_index = self.messages.len();
+            self.messages.push(message.clone());
+            self.active_message_indices.push(Some(history_index));
+        }
+    }
+
+    pub(crate) fn replace_active_tail(&mut self, from: usize, messages: &[Message]) {
+        let from = from.min(self.active_message_indices.len());
+        let history_from = if from == 0 && messages.is_empty() {
+            0
+        } else {
+            self.active_message_indices[from..]
+                .iter()
+                .flatten()
+                .copied()
+                .min()
+                .unwrap_or(self.messages.len())
+        };
+        self.active_message_indices.truncate(from);
+        self.messages.truncate(history_from);
+        if history_from == 0 {
+            self.compactions.clear();
+        } else {
+            self.compactions
+                .retain(|compaction| compaction.history_index <= history_from);
+        }
+        self.append_active(messages);
+    }
+
+    pub(crate) fn apply_compaction(&mut self, changed_from: usize, replacement: &[Message]) {
+        let changed_from = changed_from.min(self.active_message_indices.len());
+        self.active_message_indices.truncate(changed_from);
+        self.active_message_indices
+            .extend(std::iter::repeat_n(None, replacement.len()));
+        self.compactions.push(SessionCompaction {
+            history_index: self.messages.len(),
+            changed_from,
+            after_message_count: changed_from + replacement.len(),
+        });
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.messages.clear();
+        self.compactions.clear();
+        self.active_message_indices.clear();
+    }
+}
+
 impl SessionSnapshot {
     pub fn new(id: impl Into<String>, messages: Vec<Message>) -> Result<Self, StorageError> {
         let id = id.into();
         validate_session_id(&id)?;
+        let history = SessionHistory::from_messages(&messages);
         Ok(Self {
             id,
             workspace: None,
             messages,
+            history,
             last_usage: None,
             cumulative_usage: TokenUsage::default(),
-            mode: AgentMode::default(),
             capability_mode: CapabilityMode::default(),
         })
     }
@@ -317,7 +429,6 @@ enum StoredSessionEventRef<'a> {
         workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     },
     Replace {
@@ -325,7 +436,6 @@ enum StoredSessionEventRef<'a> {
         workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     },
     ReplaceTail {
@@ -334,7 +444,6 @@ enum StoredSessionEventRef<'a> {
         workspace: Option<&'a Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     },
 }
@@ -349,8 +458,6 @@ enum StoredSessionEvent {
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         #[serde(default)]
-        mode: AgentMode,
-        #[serde(default)]
         capability_mode: CapabilityMode,
     },
     Replace {
@@ -359,8 +466,6 @@ enum StoredSessionEvent {
         workspace: Option<Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
-        #[serde(default)]
-        mode: AgentMode,
         #[serde(default)]
         capability_mode: CapabilityMode,
     },
@@ -371,8 +476,6 @@ enum StoredSessionEvent {
         workspace: Option<Workspace>,
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
-        #[serde(default)]
-        mode: AgentMode,
         #[serde(default)]
         capability_mode: CapabilityMode,
     },
@@ -391,7 +494,6 @@ struct LogCursor {
     workspace: Option<Workspace>,
     last_usage: Option<TokenUsage>,
     cumulative_usage: TokenUsage,
-    mode: AgentMode,
     capability_mode: CapabilityMode,
     valid_len: usize,
     file_len: usize,
@@ -400,34 +502,30 @@ struct LogCursor {
 
 impl LogCursor {
     fn from_parsed(parsed: &ParsedLog) -> Self {
-        let (message_count, workspace, last_usage, cumulative_usage, mode, capability_mode) =
-            parsed
-                .snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    (
-                        snapshot.messages.len(),
-                        snapshot.workspace.clone(),
-                        snapshot.last_usage,
-                        snapshot.cumulative_usage,
-                        snapshot.mode,
-                        snapshot.capability_mode,
-                    )
-                })
-                .unwrap_or((
-                    0,
-                    None,
-                    None,
-                    TokenUsage::default(),
-                    AgentMode::default(),
-                    CapabilityMode::default(),
-                ));
+        let (message_count, workspace, last_usage, cumulative_usage, capability_mode) = parsed
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot.messages.len(),
+                    snapshot.workspace.clone(),
+                    snapshot.last_usage,
+                    snapshot.cumulative_usage,
+                    snapshot.capability_mode,
+                )
+            })
+            .unwrap_or((
+                0,
+                None,
+                None,
+                TokenUsage::default(),
+                CapabilityMode::default(),
+            ));
         Self {
             message_count,
             workspace,
             last_usage,
             cumulative_usage,
-            mode,
             capability_mode,
             valid_len: parsed.valid_len,
             file_len: parsed.file_len,
@@ -473,7 +571,6 @@ impl SessionStorage for DiskSessionStorage {
                     workspace: session.workspace.as_ref(),
                     last_usage: session.last_usage,
                     cumulative_usage: session.cumulative_usage,
-                    mode: session.mode,
                     capability_mode: session.capability_mode,
                 }
             }
@@ -482,7 +579,6 @@ impl SessionStorage for DiskSessionStorage {
                 workspace: session.workspace.as_ref(),
                 last_usage: session.last_usage,
                 cumulative_usage: session.cumulative_usage,
-                mode: session.mode,
                 capability_mode: session.capability_mode,
             },
         };
@@ -564,7 +660,6 @@ impl SessionStorage for DiskSessionStorage {
             && cursor.workspace == session.workspace
             && cursor.last_usage == session.last_usage
             && cursor.cumulative_usage == session.cumulative_usage
-            && cursor.mode == session.mode
             && cursor.capability_mode == session.capability_mode
             && cursor.valid_len == cursor.file_len
         {
@@ -582,7 +677,6 @@ impl SessionStorage for DiskSessionStorage {
             workspace: session.workspace.as_ref(),
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
-            mode: session.mode,
             capability_mode: session.capability_mode,
         };
         let cursor = append_record(
@@ -660,7 +754,6 @@ impl SessionStorage for DiskSessionStorage {
             workspace: session.workspace.as_ref(),
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
-            mode: session.mode,
             capability_mode: session.capability_mode,
         };
         let cursor = append_record(
@@ -701,55 +794,48 @@ async fn append_record(
     prior_message_count: usize,
     inject_post_write_sync_failure: bool,
 ) -> Result<LogCursor, StorageError> {
-    let (message_count, workspace, last_usage, cumulative_usage, mode, capability_mode) =
-        match &event {
-            StoredSessionEventRef::Append {
-                messages,
-                workspace,
-                last_usage,
-                cumulative_usage,
-                mode,
-                capability_mode,
-            } => (
-                prior_message_count + messages.len(),
-                (*workspace).cloned(),
-                *last_usage,
-                *cumulative_usage,
-                *mode,
-                *capability_mode,
-            ),
-            StoredSessionEventRef::Replace {
-                messages,
-                workspace,
-                last_usage,
-                cumulative_usage,
-                mode,
-                capability_mode,
-            } => (
-                messages.len(),
-                (*workspace).cloned(),
-                *last_usage,
-                *cumulative_usage,
-                *mode,
-                *capability_mode,
-            ),
-            StoredSessionEventRef::ReplaceTail {
-                from,
-                messages,
-                workspace,
-                last_usage,
-                cumulative_usage,
-                mode,
-                capability_mode,
-            } => (
-                from + messages.len(),
-                (*workspace).cloned(),
-                *last_usage,
-                *cumulative_usage,
-                *mode,
-                *capability_mode,
-            ),
-        };
+    let (message_count, workspace, last_usage, cumulative_usage, capability_mode) = match &event {
+        StoredSessionEventRef::Append {
+            messages,
+            workspace,
+            last_usage,
+            cumulative_usage,
+            capability_mode,
+        } => (
+            prior_message_count + messages.len(),
+            (*workspace).cloned(),
+            *last_usage,
+            *cumulative_usage,
+            *capability_mode,
+        ),
+        StoredSessionEventRef::Replace {
+            messages,
+            workspace,
+            last_usage,
+            cumulative_usage,
+            capability_mode,
+        } => (
+            messages.len(),
+            (*workspace).cloned(),
+            *last_usage,
+            *cumulative_usage,
+            *capability_mode,
+        ),
+        StoredSessionEventRef::ReplaceTail {
+            from,
+            messages,
+            workspace,
+            last_usage,
+            cumulative_usage,
+            capability_mode,
+        } => (
+            from + messages.len(),
+            (*workspace).cloned(),
+            *last_usage,
+            *cumulative_usage,
+            *capability_mode,
+        ),
+    };
     let mut bytes = serde_json::to_vec(&StoredSessionRecordRef {
         format_version: DISK_FORMAT_VERSION,
         session_id,
@@ -793,10 +879,10 @@ async fn append_record(
         // A sync error is reported after write_all's logical commit point. The
         // complete record may therefore already be visible in the journal. If
         // callers rolled their in-memory checkpoint back unconditionally while
-        // the file kept this record, a restart could restore a different mode
-        // or tool outcome. Reconcile the exact appended bytes before deciding
-        // whether this operation failed. This rare error path may read the
-        // complete log; ordinary checkpoints remain append-only.
+        // the file kept this record, a restart could restore a different tool
+        // outcome. Reconcile the exact appended bytes before deciding whether
+        // this operation failed. This rare error path may read the complete log;
+        // ordinary checkpoints remain append-only.
         drop(file);
         if !appended_record_is_complete(path, parsed.valid_len, separator_len, &bytes).await {
             return Err(io_error(path.to_owned(), source));
@@ -809,7 +895,6 @@ async fn append_record(
         workspace,
         last_usage,
         cumulative_usage,
-        mode,
         capability_mode,
         valid_len: file_len,
         file_len,
@@ -923,25 +1008,23 @@ fn apply_record(
             workspace,
             last_usage,
             cumulative_usage,
-            mode,
             capability_mode,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
                 workspace: None,
                 messages: Vec::new(),
+                history: SessionHistory::default(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
-                mode: AgentMode::default(),
                 capability_mode: CapabilityMode::default(),
             });
             if workspace.is_some() {
                 session.workspace = workspace;
             }
-            session.messages.extend(messages);
+            append_replayed_messages(session, messages);
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
-            session.mode = mode;
             session.capability_mode = capability_mode;
         }
         StoredSessionEvent::Replace {
@@ -949,18 +1032,23 @@ fn apply_record(
             workspace,
             last_usage,
             cumulative_usage,
-            mode,
             capability_mode,
         } => {
-            *snapshot = Some(SessionSnapshot {
+            let mut replacement = snapshot.take().unwrap_or_else(|| SessionSnapshot {
                 id: session_id.to_owned(),
-                workspace,
-                messages,
-                last_usage,
-                cumulative_usage,
-                mode,
-                capability_mode,
+                workspace: None,
+                messages: Vec::new(),
+                history: SessionHistory::default(),
+                last_usage: None,
+                cumulative_usage: TokenUsage::default(),
+                capability_mode: CapabilityMode::default(),
             });
+            replace_replayed_messages(&mut replacement, messages);
+            replacement.workspace = workspace;
+            replacement.last_usage = last_usage;
+            replacement.cumulative_usage = cumulative_usage;
+            replacement.capability_mode = capability_mode;
+            *snapshot = Some(replacement);
         }
         StoredSessionEvent::ReplaceTail {
             from,
@@ -968,16 +1056,15 @@ fn apply_record(
             workspace,
             last_usage,
             cumulative_usage,
-            mode,
             capability_mode,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
                 workspace: None,
                 messages: Vec::new(),
+                history: SessionHistory::default(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
-                mode: AgentMode::default(),
                 capability_mode: CapabilityMode::default(),
             });
             if workspace.is_some() {
@@ -992,15 +1079,66 @@ fn apply_record(
                     ),
                 });
             }
-            session.messages.truncate(from);
-            session.messages.extend(messages);
+            replace_replayed_tail(session, from, messages);
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
-            session.mode = mode;
             session.capability_mode = capability_mode;
         }
     }
     Ok(())
+}
+
+fn append_replayed_messages(session: &mut SessionSnapshot, messages: Vec<Message>) {
+    if session.messages.is_empty()
+        && let Some(boundary) = default_compaction_boundary(&messages)
+    {
+        session.history.append_active(&messages[..boundary]);
+        session
+            .history
+            .apply_compaction(boundary, &messages[boundary..boundary + 2]);
+        session.history.append_active(&messages[boundary + 2..]);
+    } else {
+        session.history.append_active(&messages);
+    }
+    session.messages.extend(messages);
+}
+
+fn replace_replayed_messages(session: &mut SessionSnapshot, messages: Vec<Message>) {
+    if let Some(boundary) = default_compaction_boundary(&messages)
+        && messages[..boundary] == session.messages[..session.messages.len().min(boundary)]
+        && boundary <= session.messages.len()
+    {
+        session
+            .history
+            .apply_compaction(boundary, &messages[boundary..boundary + 2]);
+        session.history.append_active(&messages[boundary + 2..]);
+    } else {
+        session.history = SessionHistory::from_messages(&messages);
+    }
+    session.messages = messages;
+}
+
+fn replace_replayed_tail(session: &mut SessionSnapshot, from: usize, messages: Vec<Message>) {
+    if default_compaction_boundary(&messages) == Some(0) {
+        session.history.apply_compaction(from, &messages[..2]);
+        session.history.append_active(&messages[2..]);
+    } else {
+        session.history.replace_active_tail(from, &messages);
+    }
+    session.messages.truncate(from);
+    session.messages.extend(messages);
+}
+
+fn default_compaction_boundary(messages: &[Message]) -> Option<usize> {
+    messages.windows(2).position(|pair| {
+        let boundary = &pair[0];
+        let summary = &pair[1];
+        boundary.role == Role::System
+            && boundary.visibility == MessageVisibility::Internal
+            && boundary.text_content() == Some(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+            && summary.role == Role::User
+            && summary.visibility == MessageVisibility::Internal
+    })
 }
 
 pub(crate) fn validate_session_id(session_id: &str) -> Result<(), StorageError> {
@@ -1047,16 +1185,17 @@ mod tests {
     use crate::types::{ContentPart, ImageUrl, Message, ProviderState};
 
     fn snapshot() -> SessionSnapshot {
+        let messages = vec![Message::user_parts([
+            ContentPart::text("hello"),
+            ContentPart::image(ImageUrl::from_bytes("image/png", &[1, 2, 3])),
+        ])];
         SessionSnapshot {
             id: "session/with spaces".to_owned(),
             workspace: Some(Workspace::new("/workspace/project")),
-            messages: vec![Message::user_parts([
-                ContentPart::text("hello"),
-                ContentPart::image(ImageUrl::from_bytes("image/png", &[1, 2, 3])),
-            ])],
+            history: SessionHistory::from_messages(&messages),
+            messages,
             last_usage: Some(TokenUsage::new(10, 2, 1)),
             cumulative_usage: TokenUsage::new(20, 5, 2),
-            mode: AgentMode::Plan,
             capability_mode: CapabilityMode::WorkspaceEdit,
         }
     }
@@ -1076,16 +1215,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_without_mode_defaults_to_normal_execution() {
+    fn legacy_snapshot_mode_is_ignored() {
         let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
             "id": "legacy",
             "messages": [],
             "last_usage": null,
-            "cumulative_usage": TokenUsage::default()
+            "cumulative_usage": TokenUsage::default(),
+            "mode": "plan"
         }))
         .unwrap();
 
-        assert_eq!(snapshot.mode, AgentMode::Default);
         assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
         assert_eq!(snapshot.workspace, None);
     }
@@ -1110,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_disk_record_without_mode_still_loads() {
+    async fn legacy_disk_record_with_mode_still_loads() {
         let directory = tempfile::tempdir().unwrap();
         let storage = DiskSessionStorage::new(directory.path());
         let path = storage.session_path("legacy-disk").unwrap();
@@ -1124,14 +1263,14 @@ mod tests {
                     "type": "replace",
                     "messages": [],
                     "last_usage": null,
-                    "cumulative_usage": TokenUsage::default()
+                    "cumulative_usage": TokenUsage::default(),
+                    "mode": "plan"
                 })
             ),
         )
         .unwrap();
 
         let snapshot = storage.load("legacy-disk").await.unwrap().unwrap();
-        assert_eq!(snapshot.mode, AgentMode::Default);
         assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
         assert_eq!(snapshot.workspace, None);
     }
@@ -1156,6 +1295,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disk_storage_round_trips_internal_message_visibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let session = SessionSnapshot::new(
+            "internal-message",
+            vec![
+                Message::user("runtime coordination")
+                    .with_visibility(crate::types::MessageVisibility::Internal),
+            ],
+        )
+        .unwrap();
+
+        storage.save(&session).await.unwrap();
+
+        assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
+    }
+
+    #[tokio::test]
     async fn disk_storage_round_trips_multimodal_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let storage = DiskSessionStorage::new(directory.path());
@@ -1167,10 +1324,9 @@ mod tests {
             Some(session.clone())
         );
         let mut updated = session.clone();
-        updated.messages.push(Message::assistant(
-            Some(crate::types::Content::text("updated")),
-            Vec::new(),
-        ));
+        let update = Message::assistant(Some(crate::types::Content::text("updated")), Vec::new());
+        updated.history.append_active(std::slice::from_ref(&update));
+        updated.messages.push(update);
         storage.save(&updated).await.unwrap();
         assert_eq!(
             storage.load(&session.id).await.unwrap(),
@@ -1200,10 +1356,14 @@ mod tests {
         );
 
         let mut repaired = updated;
-        repaired.messages.push(Message::assistant(
+        let recovery = Message::assistant(
             Some(crate::types::Content::text("after recovery")),
             Vec::new(),
-        ));
+        );
+        repaired
+            .history
+            .append_active(std::slice::from_ref(&recovery));
+        repaired.messages.push(recovery);
         storage.save(&repaired).await.unwrap();
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(repaired));
 
@@ -1233,10 +1393,9 @@ mod tests {
         let mut session = SessionSnapshot::new("incremental", vec![Message::user("one")]).unwrap();
 
         storage.save_incremental(&session, 0).await.unwrap();
-        session.messages.push(Message::assistant(
-            Some(crate::types::Content::text("two")),
-            Vec::new(),
-        ));
+        let second = Message::assistant(Some(crate::types::Content::text("two")), Vec::new());
+        session.history.append_active(std::slice::from_ref(&second));
+        session.messages.push(second);
         storage.save_incremental(&session, 1).await.unwrap();
 
         let path = storage.session_path(&session.id).unwrap();
@@ -1260,7 +1419,9 @@ mod tests {
             .unwrap()
             .write_all(b"{\"partial\":")
             .unwrap();
-        session.messages.push(Message::user("three"));
+        let third = Message::user("three");
+        session.history.append_active(std::slice::from_ref(&third));
+        session.messages.push(third);
         storage.save_incremental(&session, 2).await.unwrap();
 
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
@@ -1296,6 +1457,9 @@ mod tests {
         storage.save_incremental(&session, 0).await.unwrap();
 
         session.messages[2] = Message::tool_result("call-1", "completed", false);
+        session
+            .history
+            .replace_active_tail(1, &session.messages[1..]);
         storage.save_replacing_from(&session, 1).await.unwrap();
 
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
@@ -1313,6 +1477,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disk_load_recovers_visible_history_across_legacy_compaction_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = DiskSessionStorage::new(directory.path());
+        let mut session = SessionSnapshot::new(
+            "compacted-history",
+            vec![
+                Message::user("old question"),
+                Message::assistant(Some(crate::types::Content::text("old answer")), Vec::new()),
+            ],
+        )
+        .unwrap();
+        storage.save_incremental(&session, 0).await.unwrap();
+
+        session.messages = vec![
+            Message::system(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+                .with_visibility(MessageVisibility::Internal),
+            Message::user("private summary").with_visibility(MessageVisibility::Internal),
+        ];
+        storage.save_replacing_from(&session, 0).await.unwrap();
+
+        session.messages.extend([
+            Message::user("new question"),
+            Message::assistant(Some(crate::types::Content::text("new answer")), Vec::new()),
+        ]);
+        storage.save_incremental(&session, 2).await.unwrap();
+
+        let reopened = DiskSessionStorage::new(directory.path());
+        let restored = reopened.load(&session.id).await.unwrap().unwrap();
+        assert_eq!(restored.messages, session.messages);
+        assert_eq!(
+            restored.history.messages,
+            vec![
+                Message::user("old question"),
+                Message::assistant(Some(crate::types::Content::text("old answer")), Vec::new(),),
+                Message::user("new question"),
+                Message::assistant(Some(crate::types::Content::text("new answer")), Vec::new(),),
+            ]
+        );
+        assert_eq!(
+            restored.history.compactions,
+            vec![SessionCompaction {
+                history_index: 2,
+                changed_from: 0,
+                after_message_count: 2,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn post_write_sync_error_keeps_a_complete_tail_replacement_committed() {
         let directory = tempfile::tempdir().unwrap();
         let storage = DiskSessionStorage::new(directory.path());
@@ -1323,20 +1536,21 @@ mod tests {
                 Message::assistant(
                     None,
                     vec![crate::types::ToolCall::new(
-                        "call-exit",
-                        "exit_plan_mode",
+                        "call-side-effect",
+                        "side_effect",
                         serde_json::json!({}),
                     )],
                 ),
-                Message::tool_result("call-exit", "outcome unknown", true),
+                Message::tool_result("call-side-effect", "outcome unknown", true),
             ],
         )
         .unwrap();
-        session.mode = AgentMode::Plan;
         storage.save_incremental(&session, 0).await.unwrap();
 
-        session.messages[2] = Message::tool_result("call-exit", "approved", false);
-        session.mode = AgentMode::Default;
+        session.messages[2] = Message::tool_result("call-side-effect", "completed", false);
+        session
+            .history
+            .replace_active_tail(1, &session.messages[1..]);
         storage.fail_next_post_write_sync();
         storage.save_replacing_from(&session, 1).await.unwrap();
 

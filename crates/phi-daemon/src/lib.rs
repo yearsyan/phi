@@ -3,8 +3,10 @@
 pub mod api;
 pub mod config;
 pub mod runtime;
+pub mod scheduled_task;
 pub mod server;
 pub mod service;
+pub mod session_title;
 pub mod store;
 pub mod telemetry;
 

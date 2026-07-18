@@ -1,0 +1,52 @@
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  color: var(--phi-text-dim);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.line {
+  height: 1px;
+  flex: 1 1 auto;
+  background: var(--phi-border);
+}
+
+.label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--phi-border-strong);
+  border-top-color: var(--phi-text-muted);
+  border-radius: 50%;
+  animation: spin 800ms linear infinite;
+}
+
+.failed {
+  color: var(--phi-danger);
+}
+
+.failed .line {
+  background: var(--phi-danger-soft);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}

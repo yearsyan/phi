@@ -1,9 +1,12 @@
 .card {
-  margin: 22px 0 24px 42px;
+  display: flex;
+  max-height: var(--ask-card-max-height, min(60dvh, 720px));
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--phi-accent-border);
   border-radius: 8px;
   background: var(--phi-surface);
+  box-shadow: var(--phi-shadow-panel);
 }
 
 .header,
@@ -14,6 +17,7 @@
 }
 
 .header {
+  flex: 0 0 auto;
   gap: 9px;
   padding: 12px 14px;
   border-bottom: 1px solid var(--phi-border);
@@ -38,9 +42,12 @@
 
 .questions {
   display: flex;
+  min-height: 0;
   flex-direction: column;
   gap: 18px;
   padding: 15px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .question {
@@ -175,9 +182,13 @@
 }
 
 .actions {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
   justify-content: flex-end;
   padding: 11px 14px 13px;
   border-top: 1px solid var(--phi-border);
+  background: var(--phi-surface);
 }
 
 .submitBtn {
@@ -203,10 +214,6 @@
 }
 
 @media (max-width: 720px) {
-  .card {
-    margin-left: 0;
-  }
-
   .optionsGrid {
     grid-template-columns: 1fr;
   }

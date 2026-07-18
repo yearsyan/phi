@@ -18,18 +18,17 @@ use crate::{
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
     provider::LlmProvider,
     storage::{
-        SessionSnapshot, SessionStorage, StorageError, validate_session_id,
+        SessionHistory, SessionSnapshot, SessionStorage, StorageError, validate_session_id,
         validate_workspace_binding,
     },
     tool::{
-        AgentMode, AgentModeControl, CapabilityMode, Tool, ToolCancellation, ToolConcurrency,
-        ToolEffect, ToolExecutionContext, ToolOutput, ToolPolicy, ToolProgress,
-        builtins::BuiltinTools,
+        CapabilityMode, Tool, ToolCancellation, ToolConcurrency, ToolEffect, ToolExecutionContext,
+        ToolOutput, ToolPolicy, ToolProgress, builtins::BuiltinTools,
     },
     types::{
         AgentEvent, AgentRun, AgentRunOutcome, AssistantDelta, Content, ContentPart, ContextUsage,
-        GenerationConfig, ImageUrl, Message, ProviderEvent, ProviderRequest, ReasoningEffort, Role,
-        TokenUsage, ToolCall, ToolDefinition, ToolExecutionMode,
+        GenerationConfig, ImageUrl, Message, MessageVisibility, ProviderEvent, ProviderRequest,
+        ReasoningEffort, Role, TokenUsage, ToolCall, ToolDefinition, ToolExecutionMode,
     },
 };
 
@@ -41,7 +40,6 @@ const UNKNOWN_TOOL_RESULT: &str = "tool execution outcome is unknown; it may hav
 pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 pub const DEFAULT_AGENT_MAILBOX_CAPACITY: usize = 32;
-const PLAN_MODE_SYSTEM_REMINDER: &str = "You are in Plan mode. Explore and design only. Do not modify workspace files, run commands with side effects, or perform external side effects. Use only read-only, internal, and plan-only tools until the plan is approved.";
 
 /// Result of adding a message to an [`AgentMailbox`].
 ///
@@ -393,7 +391,6 @@ pub struct AgentBuilder {
     tool_execution: ToolExecutionMode,
     tool_call_timeout: Option<Duration>,
     max_parallel_tools: usize,
-    mode: AgentMode,
     capability_mode: CapabilityMode,
     tool_policy: ToolPolicy,
     generation_config: GenerationConfig,
@@ -414,7 +411,6 @@ impl AgentBuilder {
             tool_execution: ToolExecutionMode::Parallel,
             tool_call_timeout: Some(DEFAULT_TOOL_CALL_TIMEOUT),
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
-            mode: AgentMode::default(),
             capability_mode: CapabilityMode::default(),
             tool_policy: ToolPolicy::default(),
             generation_config: GenerationConfig::default(),
@@ -500,12 +496,6 @@ impl AgentBuilder {
     /// Bounds the number of read-only tool calls that may execute at once.
     pub fn max_parallel_tools(mut self, maximum: usize) -> Self {
         self.max_parallel_tools = maximum.max(1);
-        self
-    }
-
-    /// Sets the agent's initial execution mode.
-    pub fn mode(mut self, mode: AgentMode) -> Self {
-        self.mode = mode;
         self
     }
 
@@ -624,11 +614,11 @@ impl AgentBuilder {
             system_prompt: self.system_prompt,
             tools,
             messages: Vec::new(),
+            session_history: SessionHistory::default(),
             listeners: Vec::new(),
             tool_execution: self.tool_execution,
             tool_call_timeout: self.tool_call_timeout,
             max_parallel_tools: self.max_parallel_tools,
-            mode_control: AgentModeControl::new(self.mode),
             capability_mode: self.capability_mode,
             tool_policy: self.tool_policy,
             mandatory_tools: HashSet::new(),
@@ -654,11 +644,11 @@ pub struct Agent {
     system_prompt: String,
     tools: HashMap<String, Arc<dyn Tool>>,
     messages: Vec<Message>,
+    session_history: SessionHistory,
     listeners: Vec<EventListener>,
     tool_execution: ToolExecutionMode,
     tool_call_timeout: Option<Duration>,
     max_parallel_tools: usize,
-    mode_control: AgentModeControl,
     capability_mode: CapabilityMode,
     tool_policy: ToolPolicy,
     mandatory_tools: HashSet<String>,
@@ -692,8 +682,8 @@ impl Agent {
 
     /// Installs a harness tool that bypasses only the name-based tool policy.
     ///
-    /// Mandatory tools remain constrained by [`AgentMode`] and
-    /// [`CapabilityMode`] at definition and execution time.
+    /// Mandatory tools remain constrained by [`CapabilityMode`] at definition
+    /// and execution time.
     pub fn add_mandatory_tool(&mut self, tool: impl Tool + 'static) {
         let tool: Arc<dyn Tool> = Arc::new(tool);
         let name = tool.definition().name;
@@ -717,12 +707,19 @@ impl Agent {
         &self.messages
     }
 
+    /// Durable conversation projection retained across context compaction.
+    /// It is never included in Provider requests.
+    pub fn session_history(&self) -> &SessionHistory {
+        &self.session_history
+    }
+
     pub fn workspace(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
     }
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.session_history.clear();
         self.last_usage = None;
         self.context_usage = None;
         self.context_usage_message_count = None;
@@ -765,10 +762,6 @@ impl Agent {
         self.consecutive_auto_compaction_failures = 0;
     }
 
-    pub fn mode(&self) -> AgentMode {
-        self.mode_control.mode()
-    }
-
     pub fn capability_mode(&self) -> CapabilityMode {
         self.capability_mode
     }
@@ -780,34 +773,6 @@ impl Agent {
     /// Replaces the name-based tool policy while the agent is idle.
     pub fn set_tool_policy(&mut self, tool_policy: ToolPolicy) {
         self.tool_policy = tool_policy;
-    }
-
-    /// Returns a clonable in-memory mode control for transition tools.
-    ///
-    /// Prefer [`Agent::set_mode`] when the agent owner changes mode while the
-    /// agent is idle, because that method also persists the new state.
-    pub fn mode_control(&self) -> AgentModeControl {
-        self.mode_control.clone()
-    }
-
-    /// Changes mode in memory. The next transcript checkpoint will persist it.
-    pub fn set_mode_in_memory(&mut self, mode: AgentMode) {
-        self.mode_control.set_mode(mode);
-    }
-
-    /// Changes mode and immediately persists it for an attached session.
-    ///
-    /// If persistence fails, the agent remains in the more restrictive of the
-    /// old and requested modes. In particular, a failed attempt to leave Plan
-    /// mode cannot accidentally enable side-effecting tools.
-    pub async fn set_mode(&mut self, mode: AgentMode) -> Result<(), AgentError> {
-        let checkpoint = self.mode();
-        self.mode_control.set_mode(mode);
-        if let Err(error) = self.synchronize_session().await {
-            self.mode_control.restore_safely(checkpoint);
-            return Err(error.into());
-        }
-        Ok(())
     }
 
     /// Changes capability in memory. The next checkpoint will persist it.
@@ -904,16 +869,22 @@ impl Agent {
             if workspace_migrated {
                 snapshot.workspace = self.workspace.clone();
             }
-            if repair_interrupted_tool_turn(&session_id, &mut snapshot.messages)?
-                || workspace_migrated
-            {
+            snapshot.history.normalize(&snapshot.messages);
+            let before_repair = snapshot.messages.len();
+            let repaired = repair_interrupted_tool_turn(&session_id, &mut snapshot.messages)?;
+            if repaired {
+                snapshot
+                    .history
+                    .append_active(&snapshot.messages[before_repair..]);
+            }
+            if repaired || workspace_migrated {
                 storage.save(&snapshot).await?;
             }
             persisted_message_count = snapshot.messages.len();
             self.messages = snapshot.messages;
+            self.session_history = snapshot.history;
             self.last_usage = snapshot.last_usage;
             self.cumulative_usage = snapshot.cumulative_usage;
-            self.mode_control.set_mode(snapshot.mode);
             self.capability_mode = snapshot.capability_mode;
             self.context_usage = self.last_usage.and_then(|usage| {
                 self.max_context_tokens
@@ -1042,8 +1013,23 @@ impl Agent {
         content: Content,
         control: AgentRunControl,
     ) -> Result<AgentRunOutcome, AgentError> {
+        self.prompt_content_with_visibility_controlled(content, MessageVisibility::Public, control)
+            .await
+    }
+
+    /// Runs a prompt with explicit application visibility.
+    ///
+    /// `Internal` content is still sent to the provider and persisted in the
+    /// transcript, but daemon/UI projections can keep runtime coordination out
+    /// of the visible user conversation.
+    pub async fn prompt_content_with_visibility_controlled(
+        &mut self,
+        content: Content,
+        visibility: MessageVisibility,
+        control: AgentRunControl,
+    ) -> Result<AgentRunOutcome, AgentError> {
         let mailbox_run = self.mailbox.as_ref().map(AgentMailbox::begin_run);
-        self.run_controlled(Some(content), control, mailbox_run, None)
+        self.run_controlled(Some((content, visibility)), control, mailbox_run, None)
             .await
     }
 
@@ -1082,7 +1068,7 @@ impl Agent {
 
     async fn run_controlled(
         &mut self,
-        content: Option<Content>,
+        content: Option<(Content, MessageVisibility)>,
         control: AgentRunControl,
         mut mailbox_run: Option<MailboxRunGuard>,
         initial_batch: Option<MailboxBatch>,
@@ -1096,9 +1082,11 @@ impl Agent {
             return self.finish_stopped_run(false).await;
         }
 
-        if let Some(content) = content {
-            let user_message = Message::user_content(content);
+        if let Some((content, visibility)) = content {
+            let user_message = Message::user_content(content).with_visibility(visibility);
             self.messages.push(user_message.clone());
+            self.session_history
+                .append_active(std::slice::from_ref(&user_message));
             self.commit_or_rollback(&checkpoint).await?;
             checkpoint = AgentCheckpoint::capture(self);
             self.emit(AgentEvent::MessageStart {
@@ -1133,7 +1121,7 @@ impl Agent {
             self.emit(AgentEvent::TurnStart { turn });
 
             let mut context_overflow_recovery_attempted = false;
-            let (response, request_mode, request_capability_mode, message_started) = loop {
+            let (response, request_capability_mode, message_started) = loop {
                 if let Some(trigger) = self.automatic_compaction_trigger() {
                     match self
                         .run_context_compactor(trigger, &control, Some(&mut run_usage))
@@ -1156,7 +1144,7 @@ impl Agent {
                         messages: std::iter::once(Message::system(self.system_prompt.clone()))
                             .chain(self.messages.iter().cloned())
                             .collect(),
-                        tools: self.tool_definitions_for_policy(self.mode(), self.capability_mode),
+                        tools: self.tool_definitions_for_policy(self.capability_mode),
                         config: self.generation_config.clone(),
                     },
                 };
@@ -1176,15 +1164,9 @@ impl Agent {
 
                 // Hooks may mutate the complete request, including
                 // reintroducing hidden tools. Re-apply the capability boundary
-                // after every hook and use the latest mode before the provider
-                // sees the request.
-                let request_mode = self.mode();
+                // after every hook before the provider sees the request.
                 let request_capability_mode = self.capability_mode;
-                self.enforce_request_policy(
-                    &mut turn_start.request,
-                    request_mode,
-                    request_capability_mode,
-                );
+                self.enforce_request_policy(&mut turn_start.request, request_capability_mode);
 
                 let mut stream = self.provider.stream(turn_start.request);
                 let mut message_started = false;
@@ -1231,12 +1213,7 @@ impl Agent {
 
                 match response {
                     Ok(response) => {
-                        break (
-                            response,
-                            request_mode,
-                            request_capability_mode,
-                            message_started,
-                        );
+                        break (response, request_capability_mode, message_started);
                     }
                     Err(error)
                         if !received_model_output
@@ -1295,18 +1272,10 @@ impl Agent {
             let response_usage = response.usage;
 
             let tool_calls = response.message.tool_calls.clone();
-            // Freeze both permission boundaries that were in force before the
-            // tool batch. They cannot be collapsed to one AgentMode: the
-            // intersection of Default and Plan allows neither PlanOnly nor
-            // side-effecting tools. Every call also checks the live mode just
-            // before it starts, so a transition cannot unlock or outlive a
-            // sibling call in the same response.
-            let tool_batch_permissions = ToolBatchPermissions::new(
-                request_mode,
-                request_capability_mode,
-                self.mode(),
-                self.capability_mode,
-            );
+            // Freeze the capability boundaries that were in force for the
+            // provider request and immediately before execution.
+            let tool_batch_permissions =
+                ToolBatchPermissions::new(request_capability_mode, self.capability_mode);
             let assistant_message = response.message.into_message();
 
             let had_tool_calls = !tool_calls.is_empty();
@@ -1321,12 +1290,15 @@ impl Agent {
                 // deliberately pessimistic: after a crash we continue from
                 // this turn instead of silently invoking the tool again.
                 self.apply_response_usage(response_usage, &mut run_usage);
-                self.messages.push(assistant_message.clone());
-                self.messages.extend(
+                let mut journal_messages = Vec::with_capacity(tool_calls.len() + 1);
+                journal_messages.push(assistant_message.clone());
+                journal_messages.extend(
                     tool_calls.iter().map(|call| {
                         Message::tool_result(call.id.clone(), UNKNOWN_TOOL_RESULT, true)
                     }),
                 );
+                self.messages.extend(journal_messages.iter().cloned());
+                self.session_history.append_active(&journal_messages);
                 self.commit_or_rollback(&checkpoint).await?;
                 checkpoint = AgentCheckpoint::capture(self);
 
@@ -1390,6 +1362,9 @@ impl Agent {
                 self.apply_response_usage(response_usage, &mut run_usage);
                 self.messages.push(turn_end.message.clone());
                 self.messages.extend_from_slice(&turn_end.tool_results);
+                self.session_history
+                    .append_active(std::slice::from_ref(&turn_end.message));
+                self.session_history.append_active(&turn_end.tool_results);
                 self.commit_or_rollback(&checkpoint).await?;
             }
 
@@ -1446,6 +1421,7 @@ impl Agent {
             .map(Message::user_content)
             .collect::<Vec<_>>();
         self.messages.extend(messages.iter().cloned());
+        self.session_history.append_active(&messages);
         self.commit_or_rollback(checkpoint).await?;
         batch.commit();
         *checkpoint = AgentCheckpoint::capture(self);
@@ -1461,17 +1437,12 @@ impl Agent {
         Ok(())
     }
 
-    fn tool_definitions_for_policy(
-        &self,
-        mode: AgentMode,
-        capability_mode: CapabilityMode,
-    ) -> Vec<ToolDefinition> {
+    fn tool_definitions_for_policy(&self, capability_mode: CapabilityMode) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .filter(|(name, tool)| {
                 self.tool_policy
                     .allows(name, self.mandatory_tools.contains(*name))
-                    && mode.allows(tool.effect())
                     && capability_mode.allows(tool.effect())
             })
             .map(|(_, tool)| tool.definition())
@@ -1482,42 +1453,23 @@ impl Agent {
         &self,
         name: &str,
         effect: ToolEffect,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     ) -> bool {
         self.tool_policy
             .allows(name, self.mandatory_tools.contains(name))
-            && mode.allows(effect)
             && capability_mode.allows(effect)
     }
 
     fn enforce_request_policy(
         &self,
         request: &mut ProviderRequest,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     ) {
         request.tools.retain(|definition| {
             self.tools.get(&definition.name).is_some_and(|tool| {
-                self.tool_is_allowed(&definition.name, tool.effect(), mode, capability_mode)
+                self.tool_is_allowed(&definition.name, tool.effect(), capability_mode)
             })
         });
-
-        request.messages.retain(|message| {
-            !(message.role == Role::System
-                && message.text_content() == Some(PLAN_MODE_SYSTEM_REMINDER))
-        });
-        if mode == AgentMode::Plan {
-            let insertion = request
-                .messages
-                .iter()
-                .take_while(|message| message.role == Role::System)
-                .count();
-            request.messages.insert(
-                insertion,
-                Message::system(PLAN_MODE_SYSTEM_REMINDER.to_owned()),
-            );
-        }
     }
 
     fn automatic_compaction_trigger(&self) -> Option<ContextCompactionTrigger> {
@@ -1605,6 +1557,8 @@ impl Agent {
         let before_message_count = self.messages.len();
         let changed_from = first_changed_message(&self.messages, &plan.messages)
             .unwrap_or_else(|| self.messages.len().min(plan.messages.len()));
+        self.session_history
+            .apply_compaction(changed_from, &plan.messages[changed_from..]);
         self.messages = plan.messages;
         self.last_usage = None;
         self.context_usage = None;
@@ -1711,9 +1665,9 @@ impl Agent {
             id: session.id.clone(),
             workspace: self.workspace.clone(),
             messages: self.messages.clone(),
+            history: self.session_history.clone(),
             last_usage: self.last_usage,
             cumulative_usage: self.cumulative_usage,
-            mode: self.mode_control.mode(),
             capability_mode: self.capability_mode,
         };
         if let Some(unchanged_message_count) = session.replace_from {
@@ -1744,11 +1698,8 @@ impl Agent {
                 .filter_map(|message| message.tool_call_id.clone())
                 .collect::<HashSet<_>>(),
         );
-        // Plan-only and Internal tools are coordination barriers. In
-        // particular, a mode-transition tool is Internal state: later calls
-        // must observe the new mode before they start. Any batch whose request
-        // or pre-execution state was Plan is likewise serialized so approval
-        // and plan mutations cannot race each other.
+        // Internal tools are coordination barriers and must complete before
+        // later calls in the same batch begin.
         let execution_mode = if permissions.requires_sequential(&calls, &self.tools) {
             ToolExecutionMode::Sequential
         } else {
@@ -1772,7 +1723,6 @@ impl Agent {
                         &call,
                         control,
                         visible_tool_results.clone(),
-                        self.mode(),
                         self.capability_mode,
                     );
                     let name_allowed = self
@@ -1788,7 +1738,6 @@ impl Agent {
                         call,
                         self.tool_call_timeout,
                         authorization,
-                        &self.mode_control,
                         context,
                     );
                     tokio::pin!(execution);
@@ -1838,7 +1787,6 @@ impl Agent {
                         started[index] = true;
                         let tool = self.tools.get(&call.name).cloned();
                         let timeout = self.tool_call_timeout;
-                        let mode_control = self.mode_control.clone();
                         let capability_mode = self.capability_mode;
                         let name_allowed = self
                             .tool_policy
@@ -1852,7 +1800,6 @@ impl Agent {
                             &call,
                             control,
                             visible_tool_results.clone(),
-                            self.mode(),
                             capability_mode,
                         );
                         pending.push(async move {
@@ -1861,7 +1808,6 @@ impl Agent {
                                 call,
                                 timeout,
                                 authorization,
-                                &mode_control,
                                 context,
                             )
                             .await;
@@ -1921,7 +1867,6 @@ impl Agent {
         call: ToolCall,
         timeout: Option<Duration>,
         authorization: ToolInvocationPermissions,
-        mode_control: &AgentModeControl,
         context: ToolExecutionContext,
     ) -> ExecutedTool {
         let arguments = call.arguments.clone();
@@ -1932,18 +1877,14 @@ impl Agent {
             match tool {
                 Some(tool) => {
                     let effect = tool.effect_for(&arguments);
-                    let current_mode = mode_control.mode();
                     if !authorization.name_allowed
                         || !authorization.frozen.allows(effect)
-                        || !current_mode.allows(effect)
                         || !authorization.live_capability_mode.allows(effect)
                     {
                         ToolOutput::error(format!(
-                            "tool {:?} is not available under the current policy boundary (request mode: {:?}, request capability: {:?}, batch mode: {:?}, batch capability: {:?}, current mode: {current_mode:?}, current capability: {:?}, effect: {effect:?})",
+                            "tool {:?} is not available under the current policy boundary (request capability: {:?}, batch capability: {:?}, current capability: {:?}, effect: {effect:?})",
                             call.name,
-                            authorization.frozen.request_mode,
                             authorization.frozen.request_capability_mode,
-                            authorization.frozen.batch_mode,
                             authorization.frozen.batch_capability_mode,
                             authorization.live_capability_mode,
                         ))
@@ -1999,6 +1940,11 @@ impl Agent {
         self.messages.truncate(start);
         self.messages.push(assistant.clone());
         self.messages.extend_from_slice(tool_results);
+        let mut replacement = Vec::with_capacity(tool_results.len() + 1);
+        replacement.push(assistant.clone());
+        replacement.extend_from_slice(tool_results);
+        self.session_history
+            .replace_active_tail(start, &replacement);
         if let Some(session) = &mut self.session {
             session.mark_replace_from(start);
         }
@@ -2050,7 +1996,6 @@ impl Agent {
         call: &ToolCall,
         control: &AgentRunControl,
         visible_tool_results: Arc<HashSet<String>>,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
     ) -> ToolExecutionContext {
         let listeners = self.listeners.clone();
@@ -2070,7 +2015,7 @@ impl Agent {
             visible_tool_results,
             Some(progress),
         )
-        .with_workspace_policy(self.workspace.clone(), mode, capability_mode)
+        .with_workspace_policy(self.workspace.clone(), capability_mode)
     }
 
     fn hook_failure(&self, error: HookError) -> AgentError {
@@ -2113,16 +2058,10 @@ enum ContextCompactorRunOutcome {
     Stopped,
 }
 
-/// Immutable permission boundaries for one assistant tool-call batch.
-///
-/// Keeping the request and pre-execution modes separate is important. If one
-/// is Default and the other is Plan, their permission intersection permits
-/// only ReadOnly/Internal tools; no single [`AgentMode`] represents that set.
+/// Immutable capability boundaries for one assistant tool-call batch.
 #[derive(Clone, Copy, Debug)]
 struct ToolBatchPermissions {
-    request_mode: AgentMode,
     request_capability_mode: CapabilityMode,
-    batch_mode: AgentMode,
     batch_capability_mode: CapabilityMode,
 }
 
@@ -2134,25 +2073,15 @@ struct ToolInvocationPermissions {
 }
 
 impl ToolBatchPermissions {
-    fn new(
-        request_mode: AgentMode,
-        request_capability_mode: CapabilityMode,
-        batch_mode: AgentMode,
-        batch_capability_mode: CapabilityMode,
-    ) -> Self {
+    fn new(request_capability_mode: CapabilityMode, batch_capability_mode: CapabilityMode) -> Self {
         Self {
-            request_mode,
             request_capability_mode,
-            batch_mode,
             batch_capability_mode,
         }
     }
 
     fn allows(self, effect: ToolEffect) -> bool {
-        self.request_mode.allows(effect)
-            && self.request_capability_mode.allows(effect)
-            && self.batch_mode.allows(effect)
-            && self.batch_capability_mode.allows(effect)
+        self.request_capability_mode.allows(effect) && self.batch_capability_mode.allows(effect)
     }
 
     fn requires_sequential(
@@ -2160,16 +2089,12 @@ impl ToolBatchPermissions {
         calls: &[ToolCall],
         tools: &HashMap<String, Arc<dyn Tool>>,
     ) -> bool {
-        self.request_mode == AgentMode::Plan
-            || self.batch_mode == AgentMode::Plan
-            || calls.iter().any(|call| {
-                tools.get(&call.name).is_none_or(|tool| {
-                    matches!(
-                        tool.effect_for(&call.arguments),
-                        ToolEffect::Internal | ToolEffect::PlanOnly
-                    ) || tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive
-                })
+        calls.iter().any(|call| {
+            tools.get(&call.name).is_none_or(|tool| {
+                tool.effect_for(&call.arguments) == ToolEffect::Internal
+                    || tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive
             })
+        })
     }
 }
 
@@ -2184,6 +2109,7 @@ fn nonzero_timeout(timeout: Duration) -> Duration {
 
 fn delta_has_output(delta: &AssistantDelta) -> bool {
     match delta {
+        AssistantDelta::Reasoning { delta } => !delta.is_empty(),
         AssistantDelta::Text { delta } => !delta.is_empty(),
         AssistantDelta::ToolCall {
             id,
@@ -2201,12 +2127,12 @@ fn delta_has_output(delta: &AssistantDelta) -> bool {
 #[derive(Clone)]
 struct AgentCheckpoint {
     messages: Vec<Message>,
+    session_history: SessionHistory,
     last_usage: Option<TokenUsage>,
     context_usage: Option<ContextUsage>,
     context_usage_message_count: Option<usize>,
     consecutive_auto_compaction_failures: u8,
     cumulative_usage: TokenUsage,
-    mode: AgentMode,
     capability_mode: CapabilityMode,
 }
 
@@ -2214,24 +2140,24 @@ impl AgentCheckpoint {
     fn capture(agent: &Agent) -> Self {
         Self {
             messages: agent.messages.clone(),
+            session_history: agent.session_history.clone(),
             last_usage: agent.last_usage,
             context_usage: agent.context_usage,
             context_usage_message_count: agent.context_usage_message_count,
             consecutive_auto_compaction_failures: agent.consecutive_auto_compaction_failures,
             cumulative_usage: agent.cumulative_usage,
-            mode: agent.mode(),
             capability_mode: agent.capability_mode,
         }
     }
 
     fn restore(&self, agent: &mut Agent) {
         agent.messages.clone_from(&self.messages);
+        agent.session_history.clone_from(&self.session_history);
         agent.last_usage = self.last_usage;
         agent.context_usage = self.context_usage;
         agent.context_usage_message_count = self.context_usage_message_count;
         agent.consecutive_auto_compaction_failures = self.consecutive_auto_compaction_failures;
         agent.cumulative_usage = self.cumulative_usage;
-        agent.mode_control.restore_safely(self.mode);
         agent.capability_mode = agent.capability_mode.safest(self.capability_mode);
     }
 }
@@ -2559,40 +2485,6 @@ mod tests {
         waiting: Arc<Notify>,
     }
 
-    struct PausedToolCallProvider {
-        started: Arc<Notify>,
-        release: Arc<Notify>,
-        calls: AtomicUsize,
-    }
-
-    impl LlmProvider for PausedToolCallProvider {
-        fn stream(&self, _request: ProviderRequest) -> ProviderEventStream {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                let started = Arc::clone(&self.started);
-                let release = Arc::clone(&self.release);
-                Box::pin(async_stream::stream! {
-                    started.notify_one();
-                    release.notified().await;
-                    yield Ok(ProviderEvent::Done(ProviderResponse {
-                        message: AssistantMessage::tool_calls(vec![ToolCall::new(
-                            "call-after-mode-change",
-                            "count",
-                            json!({}),
-                        )]),
-                        usage: None,
-                    }));
-                })
-            } else {
-                Box::pin(futures_util::stream::iter([Ok(ProviderEvent::Done(
-                    ProviderResponse {
-                        message: AssistantMessage::text("done"),
-                        usage: None,
-                    },
-                ))]))
-            }
-        }
-    }
-
     impl LlmProvider for HangingDeltaProvider {
         fn stream(&self, _request: ProviderRequest) -> ProviderEventStream {
             let waiting = Arc::clone(&self.waiting);
@@ -2726,18 +2618,6 @@ mod tests {
         active: Arc<AtomicUsize>,
         maximum: Arc<AtomicUsize>,
         effect: ToolEffect,
-    }
-
-    struct ExitModeTool {
-        mode: AgentModeControl,
-    }
-
-    struct EnterModeTool {
-        mode: AgentModeControl,
-    }
-
-    struct PlanOnlyCountingTool {
-        executions: Arc<AtomicUsize>,
     }
 
     struct FailingTurnEndHook;
@@ -3007,66 +2887,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(ToolOutput::success("probed"))
-        }
-    }
-
-    #[async_trait]
-    impl Tool for ExitModeTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition::new(
-                "exit_plan_mode",
-                "Leaves plan mode",
-                json!({ "type": "object" }),
-            )
-        }
-
-        fn effect(&self) -> ToolEffect {
-            ToolEffect::PlanOnly
-        }
-
-        async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-            self.mode.set_mode(AgentMode::Default);
-            Ok(ToolOutput::success("plan approved"))
-        }
-    }
-
-    #[async_trait]
-    impl Tool for EnterModeTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition::new(
-                "enter_plan_mode",
-                "Enters plan mode",
-                json!({ "type": "object" }),
-            )
-        }
-
-        fn effect(&self) -> ToolEffect {
-            ToolEffect::Internal
-        }
-
-        async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-            self.mode.set_mode(AgentMode::Plan);
-            Ok(ToolOutput::success("entered plan mode"))
-        }
-    }
-
-    #[async_trait]
-    impl Tool for PlanOnlyCountingTool {
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition::new(
-                "update_plan",
-                "Mutates the current plan",
-                json!({ "type": "object" }),
-            )
-        }
-
-        fn effect(&self) -> ToolEffect {
-            ToolEffect::PlanOnly
-        }
-
-        async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-            self.executions.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolOutput::success("plan updated"))
         }
     }
 
@@ -3497,6 +3317,41 @@ mod tests {
             panic!("expected a completed controlled run");
         };
         assert_eq!(run.text(), Some("done"));
+        assert_eq!(run.new_messages[0].visibility, MessageVisibility::Public);
+    }
+
+    #[tokio::test]
+    async fn internal_prompt_is_sent_and_persisted_without_becoming_public() {
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([ProviderResponse {
+                message: AssistantMessage::text("handled"),
+                usage: None,
+            }])),
+        };
+        let storage = InMemorySessionStorage::new();
+        let mut agent = Agent::builder(provider)
+            .build()
+            .with_session("internal-prompt", storage.clone())
+            .await
+            .unwrap();
+
+        let outcome = agent
+            .prompt_content_with_visibility_controlled(
+                Content::text("runtime coordination"),
+                MessageVisibility::Internal,
+                AgentRunControl::new(),
+            )
+            .await
+            .unwrap();
+
+        let AgentRunOutcome::Completed(run) = outcome else {
+            panic!("expected a completed internal prompt run");
+        };
+        assert_eq!(run.new_messages[0].role, Role::User);
+        assert_eq!(run.new_messages[0].visibility, MessageVisibility::Internal);
+        assert_eq!(run.new_messages[1].visibility, MessageVisibility::Public);
+        let snapshot = storage.load("internal-prompt").await.unwrap().unwrap();
+        assert_eq!(snapshot.messages[0].visibility, MessageVisibility::Internal);
     }
 
     #[tokio::test]
@@ -3975,9 +3830,9 @@ mod tests {
                 id: session_id.to_owned(),
                 workspace: None,
                 messages: vec![Message::user("run it"), dangling.clone()],
+                history: SessionHistory::default(),
                 last_usage: Some(TokenUsage::new(40, 5, 0)),
                 cumulative_usage: TokenUsage::new(40, 5, 0),
-                mode: AgentMode::default(),
                 capability_mode: CapabilityMode::default(),
             })
             .await
@@ -4024,9 +3879,9 @@ mod tests {
                 id: session_id.to_owned(),
                 workspace: None,
                 messages: original.clone(),
+                history: SessionHistory::default(),
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
-                mode: AgentMode::default(),
                 capability_mode: CapabilityMode::default(),
             })
             .await
@@ -4292,6 +4147,7 @@ mod tests {
             .unwrap();
         agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
         agent.prompt("question").await.unwrap();
+        let visible_before = agent.session_history().messages.clone();
 
         let outcome = agent
             .compact_context(Some("Focus on storage invariants".to_owned()))
@@ -4303,14 +4159,27 @@ mod tests {
         assert_eq!(outcome.replacement, agent.messages());
         assert!(agent.last_usage().is_none());
         assert!(agent.context_usage().is_none());
+        assert_eq!(agent.session_history().messages, visible_before);
+        assert_eq!(agent.session_history().compactions.len(), 1);
         let snapshot = observed_storage
             .load("manual-compaction")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.messages, agent.messages());
+        assert_eq!(snapshot.history, agent.session_history().clone());
         assert!(snapshot.last_usage.is_none());
         assert_eq!(snapshot.cumulative_usage.total_tokens, 165);
+
+        let restored = Agent::builder(MockProvider {
+            responses: Mutex::new(VecDeque::new()),
+        })
+        .build()
+        .with_session("manual-compaction", observed_storage.clone())
+        .await
+        .unwrap();
+        assert_eq!(restored.session_history().messages, visible_before);
+        assert_eq!(restored.session_history().compactions.len(), 1);
 
         let events = events.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
@@ -4661,85 +4530,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_refilters_hook_mutations_and_injects_a_system_reminder() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let executions = Arc::new(AtomicUsize::new(0));
-        let provider = RecordingProvider {
-            response: Mutex::new(Some(ProviderResponse {
-                message: AssistantMessage::text("planned"),
-                usage: None,
-            })),
-            requests: Arc::clone(&requests),
-        };
-        let mut agent = Agent::builder(provider)
-            .mode(AgentMode::Plan)
-            .tool(ReadOnlyTool)
-            .tool(CountingTool {
-                executions: Arc::clone(&executions),
-            })
-            .hook(InjectToolDefinitionsHook)
-            .build();
-
-        agent.prompt("make a plan").await.unwrap();
-
-        let requests = requests.lock().unwrap();
-        let request = &requests[0];
-        assert_eq!(
-            request
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["inspect"]
-        );
-        assert!(request.messages.iter().any(|message| {
-            message.role == Role::System
-                && message.text_content() == Some(PLAN_MODE_SYSTEM_REMINDER)
-        }));
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn plan_mode_runtime_guard_rejects_an_unadvertised_side_effect() {
-        let executions = Arc::new(AtomicUsize::new(0));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingQueueProvider {
-            responses: Mutex::new(VecDeque::from([
-                ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
-                        "call-count",
-                        "count",
-                        json!({}),
-                    )]),
-                    usage: None,
-                },
-                ProviderResponse {
-                    message: AssistantMessage::text("done"),
-                    usage: None,
-                },
-            ])),
-            requests,
-        };
-        let mut agent = Agent::builder(provider)
-            .mode(AgentMode::Plan)
-            .tool(CountingTool {
-                executions: Arc::clone(&executions),
-            })
-            .build();
-
-        agent.prompt("try it").await.unwrap();
-
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
-        let result = agent
-            .messages()
-            .iter()
-            .find(|message| message.tool_call_id.as_deref() == Some("call-count"))
-            .expect("blocked call must still receive a protocol-valid tool result");
-        assert!(result.tool_result_is_error);
-        assert!(result.text_content().unwrap().contains("not available"));
-    }
-
-    #[tokio::test]
     async fn read_only_capability_refilters_hooks_and_rejects_forged_side_effects() {
         let executions = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -4841,7 +4631,7 @@ mod tests {
 
         assert_eq!(
             agent
-                .tool_definitions_for_policy(AgentMode::Default, CapabilityMode::FullAccess)
+                .tool_definitions_for_policy(CapabilityMode::FullAccess)
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<HashSet<_>>(),
@@ -4849,257 +4639,12 @@ mod tests {
         );
         assert_eq!(
             agent
-                .tool_definitions_for_policy(AgentMode::Default, CapabilityMode::ReadOnly)
+                .tool_definitions_for_policy(CapabilityMode::ReadOnly)
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             ["inspect"]
         );
-    }
-
-    #[tokio::test]
-    async fn leaving_plan_while_a_request_is_streaming_cannot_unlock_its_tool_calls() {
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let executions = Arc::new(AtomicUsize::new(0));
-        let provider = PausedToolCallProvider {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            calls: AtomicUsize::new(0),
-        };
-        let agent = Agent::builder(provider)
-            .mode(AgentMode::Plan)
-            .tool(CountingTool {
-                executions: Arc::clone(&executions),
-            })
-            .build();
-        let mode = agent.mode_control();
-
-        let run = tokio::spawn(async move {
-            let mut agent = agent;
-            let result = agent.prompt("plan first").await;
-            (agent, result)
-        });
-        started.notified().await;
-        mode.set_mode(AgentMode::Default);
-        release.notify_one();
-        let (agent, result) = run.await.unwrap();
-        result.unwrap();
-
-        assert_eq!(agent.mode(), AgentMode::Default);
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
-        let result = agent
-            .messages()
-            .iter()
-            .find(|message| message.tool_call_id.as_deref() == Some("call-after-mode-change"))
-            .unwrap();
-        assert!(result.tool_result_is_error);
-        assert!(result.text_content().unwrap().contains("not available"));
-    }
-
-    #[tokio::test]
-    async fn a_plan_exit_does_not_unlock_sibling_calls_in_the_same_response() {
-        let executions = Arc::new(AtomicUsize::new(0));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let storage = InMemorySessionStorage::new();
-        let provider = RecordingQueueProvider {
-            responses: Mutex::new(VecDeque::from([
-                ProviderResponse {
-                    message: AssistantMessage::tool_calls(vec![
-                        ToolCall::new("call-exit", "exit_plan_mode", json!({})),
-                        ToolCall::new("call-count", "count", json!({})),
-                    ]),
-                    usage: None,
-                },
-                ProviderResponse {
-                    message: AssistantMessage::text("executing next turn"),
-                    usage: None,
-                },
-            ])),
-            requests: Arc::clone(&requests),
-        };
-        let mut agent = Agent::builder(provider)
-            .mode(AgentMode::Plan)
-            .tool(CountingTool {
-                executions: Arc::clone(&executions),
-            })
-            .tool_execution(ToolExecutionMode::Sequential)
-            .build();
-        agent.add_tool(ExitModeTool {
-            mode: agent.mode_control(),
-        });
-        agent
-            .attach_session("frozen-plan-batch", storage.clone())
-            .await
-            .unwrap();
-
-        agent.prompt("approve and execute").await.unwrap();
-
-        assert_eq!(agent.mode(), AgentMode::Default);
-        assert_eq!(executions.load(Ordering::SeqCst), 0);
-        {
-            let requests = requests.lock().unwrap();
-            assert_eq!(
-                requests[0]
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["exit_plan_mode"]
-            );
-            assert_eq!(
-                requests[1]
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["count"]
-            );
-        }
-        assert_eq!(
-            storage
-                .load("frozen-plan-batch")
-                .await
-                .unwrap()
-                .unwrap()
-                .mode,
-            AgentMode::Default
-        );
-    }
-
-    #[tokio::test]
-    async fn entering_plan_blocks_later_side_effects_in_sequential_and_parallel_agents() {
-        for execution_mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
-            let executions = Arc::new(AtomicUsize::new(0));
-            let provider = RecordingQueueProvider {
-                responses: Mutex::new(VecDeque::from([
-                    ProviderResponse {
-                        message: AssistantMessage::tool_calls(vec![
-                            ToolCall::new("call-enter", "enter_plan_mode", json!({})),
-                            ToolCall::new("call-count", "count", json!({})),
-                        ]),
-                        usage: None,
-                    },
-                    ProviderResponse {
-                        message: AssistantMessage::text("planned"),
-                        usage: None,
-                    },
-                ])),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            };
-            let mut agent = Agent::builder(provider)
-                .tool(CountingTool {
-                    executions: Arc::clone(&executions),
-                })
-                .tool_execution(execution_mode)
-                .build();
-            agent.add_tool(EnterModeTool {
-                mode: agent.mode_control(),
-            });
-
-            agent.prompt("enter plan first").await.unwrap();
-
-            assert_eq!(agent.mode(), AgentMode::Plan, "mode: {execution_mode:?}");
-            assert_eq!(
-                executions.load(Ordering::SeqCst),
-                0,
-                "mode: {execution_mode:?}"
-            );
-            let result = agent
-                .messages()
-                .iter()
-                .find(|message| message.tool_call_id.as_deref() == Some("call-count"))
-                .unwrap();
-            assert!(result.tool_result_is_error, "mode: {execution_mode:?}");
-            assert!(result.text_content().unwrap().contains("not available"));
-        }
-    }
-
-    #[tokio::test]
-    async fn exiting_plan_blocks_later_plan_mutations_in_sequential_and_parallel_agents() {
-        for execution_mode in [ToolExecutionMode::Sequential, ToolExecutionMode::Parallel] {
-            let plan_updates = Arc::new(AtomicUsize::new(0));
-            let provider = RecordingQueueProvider {
-                responses: Mutex::new(VecDeque::from([
-                    ProviderResponse {
-                        message: AssistantMessage::tool_calls(vec![
-                            ToolCall::new("call-exit", "exit_plan_mode", json!({})),
-                            ToolCall::new("call-update", "update_plan", json!({})),
-                        ]),
-                        usage: None,
-                    },
-                    ProviderResponse {
-                        message: AssistantMessage::text("approved"),
-                        usage: None,
-                    },
-                ])),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            };
-            let mut agent = Agent::builder(provider)
-                .mode(AgentMode::Plan)
-                .tool(PlanOnlyCountingTool {
-                    executions: Arc::clone(&plan_updates),
-                })
-                .tool_execution(execution_mode)
-                .build();
-            agent.add_tool(ExitModeTool {
-                mode: agent.mode_control(),
-            });
-
-            agent.prompt("approve this revision").await.unwrap();
-
-            assert_eq!(agent.mode(), AgentMode::Default, "mode: {execution_mode:?}");
-            assert_eq!(
-                plan_updates.load(Ordering::SeqCst),
-                0,
-                "mode: {execution_mode:?}"
-            );
-            let result = agent
-                .messages()
-                .iter()
-                .find(|message| message.tool_call_id.as_deref() == Some("call-update"))
-                .unwrap();
-            assert!(result.tool_result_is_error, "mode: {execution_mode:?}");
-            assert!(result.text_content().unwrap().contains("not available"));
-        }
-    }
-
-    #[tokio::test]
-    async fn set_mode_persists_without_a_transcript_change() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = DiskSessionStorage::new(directory.path());
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::new()),
-        };
-        let mut agent = Agent::builder(provider)
-            .build()
-            .with_session("mode-only", storage.clone())
-            .await
-            .unwrap();
-
-        agent.set_mode(AgentMode::Plan).await.unwrap();
-
-        assert_eq!(agent.mode(), AgentMode::Plan);
-        let snapshot = storage.load("mode-only").await.unwrap().unwrap();
-        assert!(snapshot.messages.is_empty());
-        assert_eq!(snapshot.mode, AgentMode::Plan);
-    }
-
-    #[tokio::test]
-    async fn failed_persistence_cannot_unlock_plan_mode() {
-        let storage = FailOnSaveStorage::new(1);
-        let provider = MockProvider {
-            responses: Mutex::new(VecDeque::new()),
-        };
-        let mut agent = Agent::builder(provider)
-            .mode(AgentMode::Plan)
-            .build()
-            .with_session("mode-save-fails", storage)
-            .await
-            .unwrap();
-
-        assert!(agent.set_mode(AgentMode::Default).await.is_err());
-        assert_eq!(agent.mode(), AgentMode::Plan);
     }
 
     #[tokio::test]
@@ -5254,9 +4799,9 @@ mod tests {
                 id: "saved".to_owned(),
                 workspace: None,
                 messages: vec![Message::user("before restart")],
+                history: SessionHistory::default(),
                 last_usage: Some(TokenUsage::new(100, 20, 0)),
                 cumulative_usage: TokenUsage::new(250, 50, 0),
-                mode: AgentMode::Plan,
                 capability_mode: CapabilityMode::WorkspaceEdit,
             })
             .await
@@ -5278,7 +4823,6 @@ mod tests {
         assert_eq!(agent.context_usage().unwrap().remaining_tokens, 880);
         assert_eq!(agent.context_usage_message_count, Some(0));
         assert_eq!(agent.cumulative_usage().total_tokens, 300);
-        assert_eq!(agent.mode(), AgentMode::Plan);
         assert_eq!(agent.capability_mode(), CapabilityMode::WorkspaceEdit);
     }
 

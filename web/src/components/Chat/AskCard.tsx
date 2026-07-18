@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
 import type { AskUserAnswer, AskUserRequest } from '../../types/wire.ts';
 import styles from './AskCard.module.css';
@@ -16,12 +16,13 @@ interface QuestionDraft {
 const emptyDraft = (): QuestionDraft => ({ selected: new Set(), custom: '' });
 
 /**
- * Inline card for an `askuser_requested` interaction. The model asks 1–3
+ * Interactive card for an `askuser_requested` interaction. The model asks 1–3
  * questions; the user picks explicit options (single- or multi-select) and may
  * supply a custom "Other" reply. Submitting answers all questions at once.
  */
 export function AskCard({ request, onAnswer }: AskCardProps) {
   const { t } = useI18n();
+  const titleId = useId();
   const [drafts, setDrafts] = useState<QuestionDraft[]>(() =>
     request.questions.map(() => emptyDraft()),
   );
@@ -149,10 +150,12 @@ export function AskCard({ request, onAnswer }: AskCardProps) {
   };
 
   return (
-    <div className={styles.card}>
+    <section className={styles.card} role="dialog" aria-labelledby={titleId}>
       <div className={styles.header}>
         <span className={styles.badge}>{t('ask.badge')}</span>
-        <span className={styles.title}>{t('ask.title')}</span>
+        <span className={styles.title} id={titleId}>
+          {t('ask.title')}
+        </span>
       </div>
       <div className={styles.questions}>
         {request.questions.map((question, questionIndex) => {
@@ -249,7 +252,7 @@ export function AskCard({ request, onAnswer }: AskCardProps) {
           {submitting ? t('ask.submitting') : t('ask.submit')}
         </button>
       </div>
-    </div>
+    </section>
   );
 }
 

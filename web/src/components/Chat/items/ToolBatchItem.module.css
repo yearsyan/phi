@@ -1,0 +1,94 @@
+.batch {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+.trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  margin-left: -6px;
+  border: 0;
+  border-radius: var(--phi-radius);
+  background: transparent;
+  color: var(--phi-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.trigger:hover {
+  background: var(--phi-accent-soft);
+}
+
+.batchIcon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-size: 13px;
+}
+
+.summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--phi-text-strong);
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.count {
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 11px;
+}
+
+.statusSlot {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.statusDone {
+  color: var(--phi-success);
+}
+
+.statusError {
+  color: var(--phi-danger);
+}
+
+.spin {
+  color: var(--phi-warning);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.chevron {
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-size: 11px;
+  transition: transform 140ms ease;
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 4px 11px;
+  padding-left: 12px;
+  border-left: 1px solid var(--phi-border);
+}

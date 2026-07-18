@@ -1,12 +1,17 @@
-use std::{fmt, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fmt,
+    time::Duration,
+};
 
+use chrono::{DateTime, Utc};
 use phi::{
-    ActiveSubagentRun, AgentEvent, AgentMode, AssistantDelta, CapabilityMode, Content, ContentPart,
-    ContextCompactionTrigger, ContextUsage, EffectiveSubagentConfig, Message, ProviderRetryReason,
-    ReasoningEffort, Role, SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent,
-    SubagentEventKind, SubagentNotification, SubagentResourceFinalization, SubagentResourceInfo,
-    SubagentRunOutcome, SubagentSnapshot, SubagentState, TokenUsage, ToolCall, ToolProgress,
-    ValidatedSubagentOutput,
+    ActiveSubagentRun, AgentEvent, AssistantDelta, CapabilityMode, Content, ContentPart,
+    ContextCompactionTrigger, ContextUsage, EffectiveSubagentConfig, Message, MessageVisibility,
+    ProviderRetryReason, ProviderState, ReasoningEffort, Role, SkillDiagnostic, SkillInvocation,
+    SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotification,
+    SubagentResourceFinalization, SubagentResourceInfo, SubagentRunOutcome, SubagentSnapshot,
+    SubagentState, TokenUsage, ToolCall, ToolProgress, ValidatedSubagentOutput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,16 +19,212 @@ use serde_json::Value;
 use crate::{
     runtime::{
         AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
-        AskUserId, AskUserRequest, AssistantDraft, NamePolicy, PlanApprovalDecision,
-        PlanApprovalId, PlanApprovalRequest, PromptDefinition, PromptMode, RunId, RuntimeEvent,
-        RuntimeEventKind, SessionId, SubagentSummary, ToolCallDraft,
+        AskUserId, AskUserRequest, AssistantDraft, ContextCompactionPhase, ContextCompactionView,
+        NamePolicy, PromptDefinition, PromptMode, RunId, RuntimeEvent, RuntimeEventKind, SessionId,
+        SubagentSummary, ToolCallDraft,
     },
-    service::SessionListing,
+    scheduled_task::{
+        CreateScheduledTask, ScheduledIntervalUnit, ScheduledRunOutcome, ScheduledTask,
+        ScheduledTaskId, ScheduledTaskRun, ScheduledTaskSchedule, ScheduledWeekday,
+        UpdateScheduledTask,
+    },
+    service::{ForkPosition, SessionListing},
     store::{
         DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT, ProviderConfig,
         ProviderKind, ProviderProfile,
     },
 };
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateScheduledTaskRequest {
+    pub name: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub agent_profile_id: Option<String>,
+    #[serde(default)]
+    pub capability_mode: Option<CapabilityMode>,
+    pub schedule: ScheduledTaskScheduleDto,
+}
+
+impl fmt::Debug for CreateScheduledTaskRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateScheduledTaskRequest")
+            .field("name", &self.name)
+            .field("prompt", &"[REDACTED]")
+            .field("workspace", &self.workspace)
+            .field("profile_id", &self.profile_id)
+            .field("agent_profile_id", &self.agent_profile_id)
+            .field("capability_mode", &self.capability_mode)
+            .field("schedule", &self.schedule)
+            .finish()
+    }
+}
+
+impl CreateScheduledTaskRequest {
+    pub fn into_create(
+        self,
+        workspace: phi::Workspace,
+        default_profile_id: &str,
+        default_agent_profile_id: &str,
+    ) -> CreateScheduledTask {
+        CreateScheduledTask {
+            name: self.name,
+            prompt: self.prompt,
+            workspace,
+            profile_id: self
+                .profile_id
+                .unwrap_or_else(|| default_profile_id.to_owned()),
+            agent_profile_id: self
+                .agent_profile_id
+                .unwrap_or_else(|| default_agent_profile_id.to_owned()),
+            capability_mode: self.capability_mode,
+            schedule: self.schedule.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScheduledTaskScheduleDto {
+    Daily {
+        time: String,
+        weekdays: Vec<ScheduledWeekday>,
+        timezone: String,
+    },
+    Interval {
+        every: u32,
+        unit: ScheduledIntervalUnit,
+    },
+}
+
+impl From<ScheduledTaskScheduleDto> for ScheduledTaskSchedule {
+    fn from(schedule: ScheduledTaskScheduleDto) -> Self {
+        match schedule {
+            ScheduledTaskScheduleDto::Daily {
+                time,
+                weekdays,
+                timezone,
+            } => Self::Daily {
+                time,
+                weekdays,
+                timezone,
+            },
+            ScheduledTaskScheduleDto::Interval { every, unit } => Self::Interval { every, unit },
+        }
+    }
+}
+
+impl From<&ScheduledTaskSchedule> for ScheduledTaskScheduleDto {
+    fn from(schedule: &ScheduledTaskSchedule) -> Self {
+        match schedule {
+            ScheduledTaskSchedule::Daily {
+                time,
+                weekdays,
+                timezone,
+            } => Self::Daily {
+                time: time.clone(),
+                weekdays: weekdays.clone(),
+                timezone: timezone.clone(),
+            },
+            ScheduledTaskSchedule::Interval { every, unit } => Self::Interval {
+                every: *every,
+                unit: *unit,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateScheduledTaskRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+impl From<UpdateScheduledTaskRequest> for UpdateScheduledTask {
+    fn from(request: UpdateScheduledTaskRequest) -> Self {
+        Self {
+            enabled: request.enabled,
+            expected_revision: request.expected_revision,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScheduledTasksResponse {
+    pub tasks: Vec<ScheduledTaskDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScheduledTaskDto {
+    pub task_id: ScheduledTaskId,
+    pub name: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub profile_id: String,
+    pub agent_profile_id: String,
+    pub capability_mode: Option<CapabilityMode>,
+    pub schedule: ScheduledTaskScheduleDto,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub last_run: Option<ScheduledTaskRunDto>,
+    pub skipped_runs: u64,
+    pub revision: u64,
+}
+
+impl From<ScheduledTask> for ScheduledTaskDto {
+    fn from(task: ScheduledTask) -> Self {
+        Self {
+            task_id: task.id,
+            name: task.name,
+            prompt: task.prompt,
+            workspace: task.workspace.to_string(),
+            profile_id: task.profile_id,
+            agent_profile_id: task.agent_profile_id,
+            capability_mode: task.capability_mode,
+            schedule: ScheduledTaskScheduleDto::from(&task.schedule),
+            enabled: task.enabled,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            next_run_at: task.next_run_at,
+            last_run: task.last_run.map(ScheduledTaskRunDto::from),
+            skipped_runs: task.skipped_runs,
+            revision: task.revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScheduledTaskRunDto {
+    pub scheduled_for: DateTime<Utc>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub outcome: ScheduledRunOutcome,
+    pub session_id: Option<SessionId>,
+    pub error: Option<String>,
+}
+
+impl From<ScheduledTaskRun> for ScheduledTaskRunDto {
+    fn from(run: ScheduledTaskRun) -> Self {
+        Self {
+            scheduled_for: run.scheduled_for,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            outcome: run.outcome,
+            session_id: run.session_id,
+            error: run.error,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct PutProviderRequest {
@@ -194,14 +395,21 @@ pub struct PutAgentProfileRequest {
     pub tools: NamePolicyDto,
     #[serde(default)]
     pub skills: NamePolicyDto,
-    #[serde(default)]
-    pub initial_agent_mode: AgentMode,
+    #[serde(default, rename = "initial_agent_mode")]
+    _initial_agent_mode: Option<LegacyAgentMode>,
     #[serde(default)]
     pub initial_capability_mode: CapabilityMode,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyAgentMode {
+    Default,
+    Plan,
 }
 
 impl From<PutAgentProfileRequest> for AgentProfileDefinition {
@@ -219,7 +427,6 @@ impl From<PutAgentProfileRequest> for AgentProfileDefinition {
                 allow: request.skills.allow,
                 deny: request.skills.deny,
             },
-            initial_agent_mode: request.initial_agent_mode,
             initial_capability_mode: request.initial_capability_mode,
             model: request.model,
             reasoning_effort: request.reasoning_effort,
@@ -234,7 +441,6 @@ pub struct PublicAgentProfile {
     pub prompt: PromptDefinitionDto,
     pub tools: NamePolicyDto,
     pub skills: NamePolicyDto,
-    pub initial_agent_mode: AgentMode,
     pub initial_capability_mode: CapabilityMode,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -258,7 +464,6 @@ impl From<AgentProfile> for PublicAgentProfile {
                 allow: definition.skills.allow,
                 deny: definition.skills.deny,
             },
-            initial_agent_mode: definition.initial_agent_mode,
             initial_capability_mode: definition.initial_capability_mode,
             model: definition.model,
             reasoning_effort: definition.reasoning_effort,
@@ -318,10 +523,6 @@ pub enum ClientCommand {
         request_id: String,
         effort: Option<ReasoningEffort>,
     },
-    SetMode {
-        request_id: String,
-        mode: AgentMode,
-    },
     SetCapabilityMode {
         request_id: String,
         capability_mode: CapabilityMode,
@@ -331,11 +532,6 @@ pub enum ClientCommand {
         request_id: String,
         ask_id: AskUserId,
         answers: Vec<AskUserAnswer>,
-    },
-    DecidePlanApproval {
-        request_id: String,
-        approval_id: PlanApprovalId,
-        decision: PlanApprovalDecision,
     },
     Ping {
         request_id: String,
@@ -350,10 +546,8 @@ impl ClientCommand {
             | Self::Compact { request_id, .. }
             | Self::SetModel { request_id, .. }
             | Self::SetReasoningEffort { request_id, .. }
-            | Self::SetMode { request_id, .. }
             | Self::SetCapabilityMode { request_id, .. }
             | Self::AnswerAskUser { request_id, .. }
-            | Self::DecidePlanApproval { request_id, .. }
             | Self::Ping { request_id } => request_id,
         }
     }
@@ -365,10 +559,11 @@ pub enum ServerMessage {
     Building,
     Ready {
         config: SessionConfigDto,
-        mode: AgentMode,
         capability_mode: CapabilityMode,
         agent_profile: AgentProfileRefDto,
         workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skills: Vec<SkillSummaryDto>,
     },
     SessionCreated {
         session_id: SessionId,
@@ -552,6 +747,7 @@ impl From<SubagentEventKind> for SubagentEventDto {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionDto {
     pub session_id: SessionId,
+    pub title: Option<String>,
     pub profile_id: String,
     pub agent_profile: AgentProfileRefDto,
     pub workspace: Option<String>,
@@ -559,13 +755,17 @@ pub struct SessionDto {
     pub status: SessionStatusDto,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
-    pub mode: AgentMode,
     pub capability_mode: CapabilityMode,
     pub config: SessionConfigDto,
     pub history: Vec<PublicMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_compactions: Vec<ContextCompactionStatusDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_compaction: Option<ContextCompactionStatusDto>,
     pub draft: Option<AssistantDraftDto>,
     pub pending_asks: Vec<AskUserRequest>,
-    pub pending_plan_approvals: Vec<PlanApprovalRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillSummaryDto>,
     pub subagents: Vec<SubagentSummaryDto>,
     pub usage: UsageDto,
     pub last_sequence: u64,
@@ -575,6 +775,7 @@ impl From<&AgentView> for SessionDto {
     fn from(view: &AgentView) -> Self {
         Self {
             session_id: view.session_id,
+            title: view.title.clone(),
             profile_id: view.profile_id.clone(),
             agent_profile: AgentProfileRefDto {
                 agent_profile_id: view.agent_profile_id.clone(),
@@ -585,17 +786,21 @@ impl From<&AgentView> for SessionDto {
             status: view.status.into(),
             active_run_id: view.active_run_id,
             queued_runs: view.queued_runs,
-            mode: view.mode,
             capability_mode: view.capability_mode,
             config: SessionConfigDto {
                 model: view.model.clone(),
                 reasoning_effort: view.reasoning_effort,
                 revision: view.config_revision,
             },
-            history: view.messages.iter().map(PublicMessage::from).collect(),
+            history: public_history(view),
+            context_compactions: public_compactions(view),
+            context_compaction: view
+                .context_compaction
+                .as_ref()
+                .map(ContextCompactionStatusDto::from),
             draft: view.draft.as_ref().map(AssistantDraftDto::from),
             pending_asks: view.pending_asks.clone(),
-            pending_plan_approvals: view.pending_plan_approvals.clone(),
+            skills: Vec::new(),
             subagents: view
                 .subagents
                 .iter()
@@ -608,6 +813,14 @@ impl From<&AgentView> for SessionDto {
             },
             last_sequence: view.last_event_sequence,
         }
+    }
+}
+
+impl SessionDto {
+    pub fn from_view_with_skills(view: &AgentView, skills: &[SkillMetadata]) -> Self {
+        let mut session = Self::from(view);
+        session.skills = skills.iter().map(SkillSummaryDto::from).collect();
+        session
     }
 }
 
@@ -679,10 +892,53 @@ impl From<AgentStatus> for SessionStatusDto {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionPhaseDto {
+    Started,
+    Completed,
+    Failed,
+}
+
+impl From<ContextCompactionPhase> for ContextCompactionPhaseDto {
+    fn from(value: ContextCompactionPhase) -> Self {
+        match value {
+            ContextCompactionPhase::Started => Self::Started,
+            ContextCompactionPhase::Completed => Self::Completed,
+            ContextCompactionPhase::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ContextCompactionStatusDto {
+    pub phase: ContextCompactionPhaseDto,
+    pub history_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_message_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl From<&ContextCompactionView> for ContextCompactionStatusDto {
+    fn from(value: &ContextCompactionView) -> Self {
+        Self {
+            phase: value.phase.into(),
+            history_index: value.history_index,
+            after_message_count: value.after_message_count,
+            message: value.message.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PublicMessage {
     pub role: Role,
+    #[serde(default, skip_serializing_if = "MessageVisibility::is_public")]
+    pub visibility: MessageVisibility,
     pub content: Option<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
     pub tool_result_is_error: bool,
@@ -690,11 +946,41 @@ pub struct PublicMessage {
     pub tool_result_metadata: Option<Value>,
 }
 
-impl From<&Message> for PublicMessage {
-    fn from(message: &Message) -> Self {
+impl PublicMessage {
+    fn redacted(message: &Message) -> Self {
         Self {
             role: message.role.clone(),
+            visibility: MessageVisibility::Internal,
+            content: None,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_result_is_error: false,
+            tool_result_metadata: None,
+        }
+    }
+}
+
+impl From<&Message> for PublicMessage {
+    fn from(message: &Message) -> Self {
+        let visibility = public_message_visibility(message);
+        if visibility == MessageVisibility::Internal {
+            return Self::redacted(message);
+        }
+        Self {
+            role: message.role.clone(),
+            visibility,
             content: message.content.clone(),
+            reasoning: message
+                .reasoning
+                .clone()
+                .filter(|reasoning| !reasoning.is_empty())
+                .or_else(|| {
+                    message
+                        .provider_state
+                        .as_ref()
+                        .and_then(ProviderState::reasoning_text)
+                }),
             tool_calls: message.tool_calls.clone(),
             tool_call_id: message.tool_call_id.clone(),
             tool_result_is_error: message.tool_result_is_error,
@@ -703,21 +989,79 @@ impl From<&Message> for PublicMessage {
     }
 }
 
+fn public_history(view: &AgentView) -> Vec<PublicMessage> {
+    view.display_messages
+        .iter()
+        .map(PublicMessage::from)
+        .collect()
+}
+
+fn public_compactions(view: &AgentView) -> Vec<ContextCompactionStatusDto> {
+    let mut compactions = view
+        .context_compactions
+        .iter()
+        .map(ContextCompactionStatusDto::from)
+        .collect::<Vec<_>>();
+    if let Some(current) = view.context_compaction.as_ref()
+        && view.context_compactions.last() != Some(current)
+    {
+        compactions.push(ContextCompactionStatusDto::from(current));
+    }
+    compactions
+}
+
+fn public_message_visibility(message: &Message) -> MessageVisibility {
+    if message.visibility == MessageVisibility::Internal || is_legacy_subagent_notification(message)
+    {
+        MessageVisibility::Internal
+    } else {
+        MessageVisibility::Public
+    }
+}
+
+fn is_legacy_subagent_notification(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    let Some(payload) = message
+        .text_content()
+        .and_then(|text| text.strip_prefix("<subagent_notification>"))
+        .and_then(|text| text.strip_suffix("</subagent_notification>"))
+    else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    payload["type"] == "subagent_notification"
+        && payload["agent_id"].is_string()
+        && payload["sequence"].is_u64()
+        && payload["delivery_id"].is_string()
+        && payload["kind"].is_string()
+        && payload["source"].is_string()
+        && payload["message"].is_string()
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AssistantDraftDto {
+    pub reasoning: String,
     pub text: String,
     pub tool_calls: Vec<ToolCallDraftDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_message_index: Option<usize>,
 }
 
 impl From<&AssistantDraft> for AssistantDraftDto {
     fn from(draft: &AssistantDraft) -> Self {
         Self {
+            reasoning: draft.reasoning.clone(),
             text: draft.text.clone(),
             tool_calls: draft
                 .tool_calls
                 .iter()
                 .map(ToolCallDraftDto::from)
                 .collect(),
+            fork_message_index: draft.fork_message_index,
         }
     }
 }
@@ -768,6 +1112,71 @@ impl From<ContextUsage> for ContextUsageDto {
 #[derive(Debug, Serialize)]
 pub struct SessionsResponse {
     pub sessions: Vec<SessionSummaryDto>,
+    pub workspaces: Vec<WorkspaceSessionsDto>,
+}
+
+impl SessionsResponse {
+    pub fn from_sessions(sessions: Vec<SessionSummaryDto>) -> Self {
+        let mut workspaces: Vec<WorkspaceSessionsDto> = Vec::new();
+        let mut workspace_indices = HashMap::<Option<String>, usize>::new();
+        for session in &sessions {
+            let workspace = session.workspace.clone();
+            let index = match workspace_indices.entry(workspace.clone()) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    let index = workspaces.len();
+                    entry.insert(index);
+                    workspaces.push(WorkspaceSessionsDto {
+                        workspace,
+                        sessions: Vec::new(),
+                    });
+                    index
+                }
+            };
+            workspaces[index].sessions.push(session.clone());
+        }
+        Self {
+            sessions,
+            workspaces,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspaceSessionsDto {
+    pub workspace: Option<String>,
+    pub sessions: Vec<SessionSummaryDto>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSessionRequest {
+    pub pinned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionRequest {
+    pub message_index: usize,
+    #[serde(default)]
+    pub position: ForkPositionDto,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPositionDto {
+    #[default]
+    After,
+    BeforeToolCalls,
+}
+
+impl From<ForkPositionDto> for ForkPosition {
+    fn from(position: ForkPositionDto) -> Self {
+        match position {
+            ForkPositionDto::After => Self::After,
+            ForkPositionDto::BeforeToolCalls => Self::BeforeToolCalls,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -778,7 +1187,7 @@ pub struct SkillsResponse {
     pub diagnostics: Vec<SkillDiagnosticDto>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SkillSummaryDto {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -839,15 +1248,30 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct WorkspaceDirectoryDto {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspaceBrowseResponse {
+    pub path: String,
+    pub parent: Option<String>,
+    pub directories: Vec<WorkspaceDirectoryDto>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SessionSummaryDto {
     pub session_id: SessionId,
+    pub title: Option<String>,
+    pub pinned: bool,
     pub profile_id: String,
     pub agent_profile: AgentProfileRefDto,
     pub workspace: Option<String>,
     pub status: SessionStatusDto,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
-    pub mode: Option<AgentMode>,
     pub capability_mode: Option<CapabilityMode>,
     pub config: SessionConfigDto,
     pub message_count: Option<usize>,
@@ -856,9 +1280,12 @@ pub struct SessionSummaryDto {
 
 impl From<SessionListing> for SessionSummaryDto {
     fn from(listing: SessionListing) -> Self {
+        let pinned = listing.record.pinned;
         match listing.state {
             Some(state) => Self {
                 session_id: state.session_id,
+                title: state.title,
+                pinned,
                 profile_id: state.profile_id,
                 agent_profile: AgentProfileRefDto {
                     agent_profile_id: state.agent_profile_id,
@@ -868,7 +1295,6 @@ impl From<SessionListing> for SessionSummaryDto {
                 status: state.status.into(),
                 active_run_id: state.active_run_id,
                 queued_runs: state.queued_runs,
-                mode: Some(state.mode),
                 capability_mode: Some(state.capability_mode),
                 config: SessionConfigDto {
                     model: state.model,
@@ -884,6 +1310,8 @@ impl From<SessionListing> for SessionSummaryDto {
             },
             None => Self {
                 session_id: listing.record.id,
+                title: listing.record.title,
+                pinned,
                 profile_id: listing.record.profile_id,
                 agent_profile: listing
                     .record
@@ -901,7 +1329,6 @@ impl From<SessionListing> for SessionSummaryDto {
                 status: SessionStatusDto::Offline,
                 active_run_id: None,
                 queued_runs: 0,
-                mode: None,
                 capability_mode: None,
                 config: SessionConfigDto {
                     model: listing.record.model,
@@ -926,6 +1353,9 @@ pub enum EventDto {
         status: SessionStatusDto,
     },
     SessionInitialized,
+    TitleChanged {
+        title: String,
+    },
     RunQueued {
         run_id: RunId,
     },
@@ -945,9 +1375,6 @@ pub enum EventDto {
     ConfigChanged {
         config: SessionConfigDto,
     },
-    ModeChanged {
-        mode: AgentMode,
-    },
     CapabilityModeChanged {
         capability_mode: CapabilityMode,
     },
@@ -962,16 +1389,6 @@ pub enum EventDto {
     #[serde(rename = "askuser_cancelled")]
     AskUserCancelled {
         ask_id: AskUserId,
-    },
-    PlanApprovalRequested {
-        request: PlanApprovalRequest,
-    },
-    PlanApprovalDecided {
-        approval_id: PlanApprovalId,
-        decision: PlanApprovalDecision,
-    },
-    PlanApprovalCancelled {
-        approval_id: PlanApprovalId,
     },
     OperationFailed {
         operation: String,
@@ -1079,16 +1496,12 @@ pub enum EventDto {
     ContextCompactionStarted {
         trigger: ContextCompactionTriggerDto,
         compactor: String,
-        prompt: String,
     },
     ContextCompactionCompleted {
         trigger: ContextCompactionTriggerDto,
         compactor: String,
         before_message_count: usize,
         after_message_count: usize,
-        changed_from: usize,
-        replacement: Vec<PublicMessage>,
-        summary: String,
         usage: Option<TokenUsage>,
         estimated_context_tokens: u64,
     },
@@ -1121,6 +1534,7 @@ impl EventDto {
                 status: status.into(),
             },
             RuntimeEventKind::SessionInitialized => Self::SessionInitialized,
+            RuntimeEventKind::TitleChanged { title } => Self::TitleChanged { title },
             RuntimeEventKind::RunQueued { run_id } => Self::RunQueued { run_id },
             RuntimeEventKind::RunStarted { run_id } => Self::RunStarted { run_id },
             RuntimeEventKind::RunCompleted { run_id } => Self::RunCompleted { run_id },
@@ -1137,26 +1551,12 @@ impl EventDto {
                     revision,
                 },
             },
-            RuntimeEventKind::ModeChanged { mode } => Self::ModeChanged { mode },
             RuntimeEventKind::CapabilityModeChanged { capability_mode } => {
                 Self::CapabilityModeChanged { capability_mode }
             }
             RuntimeEventKind::AskUserRequested { request } => Self::AskUserRequested { request },
             RuntimeEventKind::AskUserAnswered { ask_id } => Self::AskUserAnswered { ask_id },
             RuntimeEventKind::AskUserCancelled { ask_id } => Self::AskUserCancelled { ask_id },
-            RuntimeEventKind::PlanApprovalRequested { request } => {
-                Self::PlanApprovalRequested { request }
-            }
-            RuntimeEventKind::PlanApprovalDecided {
-                approval_id,
-                decision,
-            } => Self::PlanApprovalDecided {
-                approval_id,
-                decision,
-            },
-            RuntimeEventKind::PlanApprovalCancelled { approval_id } => {
-                Self::PlanApprovalCancelled { approval_id }
-            }
             RuntimeEventKind::OperationFailed { operation, message } => {
                 Self::OperationFailed { operation, message }
             }
@@ -1291,32 +1691,24 @@ impl From<AgentEvent> for EventDto {
                 reason: event.reason.into(),
             },
             AgentEvent::ContextCompactionStarted {
-                trigger,
-                compactor,
-                prompt,
+                trigger, compactor, ..
             } => Self::ContextCompactionStarted {
                 trigger: trigger.into(),
                 compactor,
-                prompt,
             },
             AgentEvent::ContextCompactionCompleted {
                 trigger,
                 compactor,
                 before_message_count,
                 after_message_count,
-                changed_from,
-                replacement,
-                summary,
                 usage,
                 estimated_context_tokens,
+                ..
             } => Self::ContextCompactionCompleted {
                 trigger: trigger.into(),
                 compactor,
                 before_message_count,
                 after_message_count,
-                changed_from,
-                replacement: replacement.iter().map(PublicMessage::from).collect(),
-                summary,
                 usage,
                 estimated_context_tokens,
             },
@@ -1357,6 +1749,9 @@ impl From<ContextCompactionTrigger> for ContextCompactionTriggerDto {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DeltaDto {
+    Reasoning {
+        delta: String,
+    },
     Text {
         delta: String,
     },
@@ -1371,6 +1766,7 @@ pub enum DeltaDto {
 impl From<AssistantDelta> for DeltaDto {
     fn from(delta: AssistantDelta) -> Self {
         match delta {
+            AssistantDelta::Reasoning { delta } => Self::Reasoning { delta },
             AssistantDelta::Text { delta } => Self::Text { delta },
             AssistantDelta::ToolCall {
                 index,
@@ -1435,6 +1831,25 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_task_request_debug_redacts_prompt() {
+        let secret = "canary-scheduled-prompt-that-must-not-appear-in-debug";
+        let request: CreateScheduledTaskRequest = serde_json::from_value(serde_json::json!({
+            "name": "review",
+            "prompt": secret,
+            "schedule": {
+                "type": "interval",
+                "every": 1,
+                "unit": "hours"
+            }
+        }))
+        .unwrap();
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
     fn provider_request_requires_max_context_tokens() {
         let missing = serde_json::from_value::<PutProviderRequest>(serde_json::json!({
             "provider": "openai_chat",
@@ -1483,7 +1898,6 @@ mod tests {
         assert_eq!(defaults.prompt.text, "");
         assert_eq!(defaults.tools, NamePolicy::default());
         assert_eq!(defaults.skills, NamePolicy::default());
-        assert_eq!(defaults.initial_agent_mode, AgentMode::Default);
         assert_eq!(defaults.initial_capability_mode, CapabilityMode::FullAccess);
         assert_eq!(defaults.model, None);
         assert_eq!(defaults.reasoning_effort, None);
@@ -1518,7 +1932,6 @@ mod tests {
             configured.skills.allow,
             Some(vec!["rust-review".to_owned()])
         );
-        assert_eq!(configured.initial_agent_mode, AgentMode::Plan);
         assert_eq!(
             configured.initial_capability_mode,
             CapabilityMode::WorkspaceEdit
@@ -1562,7 +1975,6 @@ mod tests {
                     allow: Some(vec!["rust-review".to_owned()]),
                     deny: Vec::new(),
                 },
-                initial_agent_mode: AgentMode::Default,
                 initial_capability_mode: CapabilityMode::WorkspaceEdit,
                 model: Some("review-model".to_owned()),
                 reasoning_effort: Some(ReasoningEffort::High),
@@ -1575,6 +1987,7 @@ mod tests {
         assert_eq!(value["agent_profile"]["agent_profile_id"], "reviewer");
         assert_eq!(value["agent_profile"]["revision"], 3);
         assert_eq!(value["agent_profile"]["prompt"]["mode"], "extend");
+        assert!(value["agent_profile"].get("initial_agent_mode").is_none());
         assert_eq!(
             value["agent_profile"]["initial_capability_mode"],
             "workspace_edit"
@@ -1617,19 +2030,33 @@ mod tests {
                 reasoning_effort: None,
                 revision: 0,
             },
-            mode: AgentMode::Default,
             capability_mode: CapabilityMode::FullAccess,
             agent_profile: AgentProfileRefDto {
                 agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
                 revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
             },
             workspace: Some("/workspace/project".to_owned()),
+            skills: vec![SkillSummaryDto {
+                name: "review".to_owned(),
+                display_name: Some("Code review".to_owned()),
+                description: "Review the current change".to_owned(),
+                when_to_use: None,
+                argument_hint: Some("[focus]".to_owned()),
+                arguments: Vec::new(),
+                version: None,
+                model_invocable: true,
+                user_invocable: true,
+                source: Some("workspace".to_owned()),
+            }],
         };
         let value = serde_json::to_value(message).unwrap();
 
         assert_eq!(value["type"], "ready");
         assert_eq!(value["workspace"], "/workspace/project");
         assert_eq!(value["capability_mode"], "full_access");
+        assert_eq!(value["skills"][0]["name"], "review");
+        assert_eq!(value["skills"][0]["user_invocable"], true);
+        assert!(value.get("mode").is_none());
         assert_eq!(
             value["agent_profile"]["agent_profile_id"],
             crate::runtime::DEFAULT_AGENT_PROFILE_ID
@@ -1637,6 +2064,56 @@ mod tests {
         assert_eq!(
             value["agent_profile"]["revision"],
             crate::runtime::DEFAULT_AGENT_PROFILE_REVISION
+        );
+    }
+
+    #[test]
+    fn removed_plan_mode_commands_are_not_part_of_the_wire_protocol() {
+        assert!(
+            serde_json::from_value::<ClientCommand>(serde_json::json!({
+                "type": "set_mode",
+                "request_id": "legacy-mode",
+                "mode": "plan"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ClientCommand>(serde_json::json!({
+                "type": "decide_plan_approval",
+                "request_id": "legacy-approval",
+                "approval_id": "019c0000-0000-7000-8000-000000000001",
+                "decision": {
+                    "type": "approve",
+                    "revision": 1
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fork_request_defaults_after_and_accepts_before_tool_calls() {
+        let legacy: ForkSessionRequest = serde_json::from_value(serde_json::json!({
+            "message_index": 7
+        }))
+        .unwrap();
+        assert_eq!(legacy.message_index, 7);
+        assert_eq!(legacy.position, ForkPositionDto::After);
+
+        let intermediate: ForkSessionRequest = serde_json::from_value(serde_json::json!({
+            "message_index": 9,
+            "position": "before_tool_calls"
+        }))
+        .unwrap();
+        assert_eq!(intermediate.message_index, 9);
+        assert_eq!(intermediate.position, ForkPositionDto::BeforeToolCalls);
+
+        assert!(
+            serde_json::from_value::<ForkSessionRequest>(serde_json::json!({
+                "message_index": 9,
+                "position": "during_tool_call"
+            }))
+            .is_err()
         );
     }
 
@@ -1667,6 +2144,109 @@ mod tests {
                 "capability_mode": "full_access"
             })
         );
+    }
+
+    #[test]
+    fn generated_title_uses_a_stable_wire_event_and_summary_field() {
+        let event = serde_json::to_value(EventDto::TitleChanged {
+            title: "Fix flaky storage tests".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "type": "title_changed",
+                "title": "Fix flaky storage tests"
+            })
+        );
+
+        let summary = SessionSummaryDto {
+            session_id: SessionId::new(),
+            title: Some("Fix flaky storage tests".to_owned()),
+            pinned: true,
+            profile_id: "default".to_owned(),
+            agent_profile: AgentProfileRefDto {
+                agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
+                revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
+            },
+            workspace: None,
+            status: SessionStatusDto::Idle,
+            active_run_id: None,
+            queued_runs: 0,
+            capability_mode: Some(CapabilityMode::FullAccess),
+            config: SessionConfigDto {
+                model: "test-model".to_owned(),
+                reasoning_effort: None,
+                revision: 0,
+            },
+            message_count: Some(2),
+            subagents: Vec::new(),
+        };
+        let summary = serde_json::to_value(summary).unwrap();
+        assert_eq!(summary["title"], "Fix flaky storage tests");
+        assert_eq!(summary["pinned"], true);
+    }
+
+    #[test]
+    fn reasoning_uses_normalized_public_fields_and_stable_delta_shape() {
+        let mut message = Message::assistant(Some(Content::text("done")), Vec::new());
+        message.provider_state = Some(ProviderState::AnthropicMessages {
+            content: vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "inspect inputs",
+                "signature": "opaque-signature"
+            })],
+        });
+
+        let public = serde_json::to_value(PublicMessage::from(&message)).unwrap();
+        assert_eq!(public["reasoning"], "inspect inputs");
+        assert!(public.get("provider_state").is_none());
+        assert!(!public.to_string().contains("opaque-signature"));
+
+        let delta = serde_json::to_value(DeltaDto::from(AssistantDelta::Reasoning {
+            delta: "inspect".to_owned(),
+        }))
+        .unwrap();
+        assert_eq!(
+            delta,
+            serde_json::json!({
+                "type": "reasoning",
+                "delta": "inspect"
+            })
+        );
+    }
+
+    #[test]
+    fn public_messages_mark_internal_and_upgrade_legacy_subagent_wakes() {
+        let public = serde_json::to_value(PublicMessage::from(&Message::user("hello"))).unwrap();
+        assert!(public.get("visibility").is_none());
+
+        let internal =
+            Message::user("runtime coordination").with_visibility(MessageVisibility::Internal);
+        let internal = serde_json::to_value(PublicMessage::from(&internal)).unwrap();
+        assert_eq!(internal["visibility"], "internal");
+        assert_eq!(internal["content"], Value::Null);
+        assert!(!internal.to_string().contains("runtime coordination"));
+
+        let legacy = Message::user(format!(
+            "<subagent_notification>{}</subagent_notification>",
+            serde_json::json!({
+                "type": "subagent_notification",
+                "agent_id": "agent-1",
+                "sequence": 7,
+                "delivery_id": "delivery-1",
+                "kind": "result",
+                "source": "runtime",
+                "message": "done"
+            })
+        ));
+        let legacy = serde_json::to_value(PublicMessage::from(&legacy)).unwrap();
+        assert_eq!(legacy["visibility"], "internal");
+
+        let user_authored =
+            Message::user("<subagent_notification>not valid JSON</subagent_notification>");
+        let user_authored = serde_json::to_value(PublicMessage::from(&user_authored)).unwrap();
+        assert!(user_authored.get("visibility").is_none());
     }
 
     #[test]
@@ -1701,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_event_serializes_trigger_prompt_and_replacement_patch() {
+    fn compaction_event_serializes_status_without_prompt_or_summary_content() {
         let started = EventDto::from(AgentEvent::ContextCompactionStarted {
             trigger: ContextCompactionTrigger::Manual {
                 instructions: Some("Preserve decisions".to_owned()),
@@ -1711,7 +2291,8 @@ mod tests {
         });
         let started = serde_json::to_value(started).unwrap();
         assert_eq!(started["type"], "context_compaction_started");
-        assert_eq!(started["prompt"], "Summarize this conversation");
+        assert!(started.get("prompt").is_none());
+        assert!(!started.to_string().contains("Summarize this conversation"));
 
         let automatic = serde_json::to_value(ContextCompactionTriggerDto::from(
             ContextCompactionTrigger::Automatic {
@@ -1745,9 +2326,10 @@ mod tests {
         assert_eq!(value["trigger"]["type"], "manual");
         assert_eq!(value["trigger"]["instructions"], "Preserve decisions");
         assert_eq!(value["compactor"], "test_compactor");
-        assert_eq!(value["changed_from"], 0);
-        assert_eq!(value["replacement"][0]["role"], "user");
-        assert_eq!(value["replacement"][0]["content"]["value"], "summary");
+        assert!(value.get("changed_from").is_none());
+        assert!(value.get("replacement").is_none());
+        assert!(value.get("summary").is_none());
+        assert!(!value.to_string().contains("summary"));
         assert_eq!(value["usage"]["total_tokens"], 12);
         assert_eq!(value["estimated_context_tokens"], 7);
 

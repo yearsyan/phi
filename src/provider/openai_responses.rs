@@ -267,6 +267,11 @@ impl LlmProvider for OpenAiResponsesProvider {
 
 fn response_delta(value: &Value) -> Option<AssistantDelta> {
     match value["type"].as_str()? {
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            Some(AssistantDelta::Reasoning {
+                delta: value["delta"].as_str()?.to_owned(),
+            })
+        }
         "response.output_text.delta" => Some(AssistantDelta::Text {
             delta: value["delta"].as_str()?.to_owned(),
         }),
@@ -456,6 +461,8 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
         .ok_or_else(|| ProviderError::InvalidResponse("output is not an array".to_owned()))?;
     let raw_output = output.clone();
     let (content, tool_calls) = normalized_responses_output(output)?;
+    let provider_state = ProviderState::OpenAiResponses { output: raw_output };
+    let reasoning = provider_state.reasoning_text();
     if content.is_none() && tool_calls.is_empty() {
         return Err(ProviderError::InvalidResponse(
             "response contains neither output text nor function calls".to_owned(),
@@ -464,8 +471,9 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
     Ok(ProviderResponse {
         message: AssistantMessage {
             content,
+            reasoning,
             tool_calls,
-            provider_state: Some(ProviderState::OpenAiResponses { output: raw_output }),
+            provider_state: Some(provider_state),
         },
         usage,
     })
@@ -761,6 +769,15 @@ mod tests {
     fn maps_responses_stream_deltas() {
         assert_eq!(
             response_delta(&json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "inspect inputs"
+            })),
+            Some(AssistantDelta::Reasoning {
+                delta: "inspect inputs".to_owned()
+            })
+        );
+        assert_eq!(
+            response_delta(&json!({
                 "type": "response.output_text.delta",
                 "delta": "hello"
             })),
@@ -781,5 +798,27 @@ mod tests {
                 arguments_delta: "{\"x\":".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn normalizes_responses_reasoning_summary() {
+        let parsed = parse_response(json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        { "type": "summary_text", "text": "inspect " },
+                        { "type": "summary_text", "text": "inputs" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "done" }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.message.reasoning.as_deref(), Some("inspect inputs"));
     }
 }

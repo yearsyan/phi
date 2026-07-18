@@ -6,10 +6,12 @@
  *
  *   - `history`: the committed transcript (canonical from snapshot, appended to
  *     from turn/message events between snapshots).
- *   - `activeRun`: the ephemeral per-run activity log — tool calls, retries,
- *     compaction, subagent notices — grouped per turn so the UI can show a
+ *   - `activeRun`: the ephemeral per-run activity log — tool calls, retries
+ *     and subagent notices — grouped per turn so the UI can show a
  *     "work detail" block that expands while a turn runs and collapses when the
  *     turn ends (leaving only the assistant's final answer).
+ *   - `compactions`: transcript-independent progress/boundary markers. Summary
+ *     content never enters this projection.
  *
  * On `snapshot` / `resync` the whole state is replaced with the server's
  * `SessionDto`; this is the documented contract for resync. Between resyncs,
@@ -17,7 +19,6 @@
  * are immutable.
  */
 import type {
-  AgentMode,
   AgentProfileRef,
   AskUserRequest,
   AssistantDelta,
@@ -26,12 +27,12 @@ import type {
   Content,
   ContextUsage,
   EventDto,
-  PlanApprovalRequest,
   PublicMessage,
   RetryReason,
   SessionConfig,
   SessionDto,
   SessionStatus,
+  SkillSummary,
   SubagentSummary,
   TokenUsage,
   ToolCall,
@@ -67,9 +68,11 @@ export interface SubagentStep {
   detail?: string;
 }
 
-export interface CompactionStep {
-  kind: 'compaction';
+export interface CompactionMarker {
+  key: string;
   phase: 'started' | 'completed' | 'failed';
+  historyIndex: number;
+  afterMessageCount: number | null;
   message?: string;
 }
 
@@ -80,12 +83,7 @@ export interface RetryStep {
   reason: string;
 }
 
-export type Step =
-  | ToolStep
-  | NoticeStep
-  | SubagentStep
-  | CompactionStep
-  | RetryStep;
+export type Step = ToolStep | NoticeStep | SubagentStep | RetryStep;
 
 /** Per-turn activity log inside a run. */
 export interface TurnActivity {
@@ -109,6 +107,8 @@ export interface PendingPrompt {
   content: Content;
   status: 'sending' | 'accepted' | 'queued';
   queuePosition: number | null;
+  /** Skill expansion changes the durable user content; match its next echo. */
+  matchAnyEcho?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -117,13 +117,15 @@ export interface PendingPrompt {
 
 export interface SessionState {
   sessionId: string | null;
+  title: string | null;
+  workspace: string | null;
   profileId: string | null;
   agentProfile: AgentProfileRef | null;
   ready: boolean;
   status: SessionStatus;
-  mode: AgentMode;
   capabilityMode: CapabilityMode;
   config: SessionConfig | null;
+  skills: SkillSummary[];
   usage: Usage | null;
   contextUsage: ContextUsage | null;
   activeRunId: string | null;
@@ -131,9 +133,10 @@ export interface SessionState {
   /** Live assistant draft (uncommitted). */
   draft: AssistantDraft | null;
   pendingAsks: AskUserRequest[];
-  pendingPlanApprovals: PlanApprovalRequest[];
   subagents: SubagentSummary[];
   history: PublicMessage[];
+  /** UI-only status boundaries; compacted transcript content is never shown. */
+  compactions: CompactionMarker[];
   activeRun: RunActivity | null;
   /** Optimistic prompts waiting for their durable user-message echo. */
   pendingPrompts: PendingPrompt[];
@@ -146,22 +149,24 @@ export interface SessionState {
 
 export const initialSessionState: SessionState = {
   sessionId: null,
+  title: null,
+  workspace: null,
   profileId: null,
   agentProfile: null,
   ready: false,
   status: 'awaiting_first_prompt',
-  mode: 'default',
   capabilityMode: 'full_access',
   config: null,
+  skills: [],
   usage: null,
   contextUsage: null,
   activeRunId: null,
   queuedRuns: 0,
   draft: null,
   pendingAsks: [],
-  pendingPlanApprovals: [],
   subagents: [],
   history: [],
+  compactions: [],
   activeRun: null,
   pendingPrompts: [],
   fatalError: null,
@@ -179,9 +184,10 @@ export type SessionAction =
   | {
       type: 'ready';
       config: SessionConfig;
-      mode: AgentMode;
       capabilityMode: CapabilityMode;
       agentProfile: AgentProfileRef;
+      workspace: string | null;
+      skills: SkillSummary[];
     }
   | { type: 'session_created'; sessionId: string }
   | { type: 'snapshot'; session: SessionDto }
@@ -190,7 +196,12 @@ export type SessionAction =
   | { type: 'event'; envelope: EventEnvelopeInput }
   | { type: 'fatal_error'; code: string; message: string }
   | { type: 'notice'; message: string }
-  | { type: 'local_send_prompt'; requestId: string; content: Content }
+  | {
+      type: 'local_send_prompt';
+      requestId: string;
+      content: Content;
+      matchAnyEcho?: boolean;
+    }
   | {
       type: 'command_accepted';
       requestId: string;
@@ -212,16 +223,21 @@ export interface EventEnvelopeInput {
 function cloneDraft(draft: AssistantDraft | null): AssistantDraft | null {
   if (draft === null) return null;
   return {
+    reasoning: draft.reasoning ?? '',
     text: draft.text,
     tool_calls: draft.tool_calls.map((toolCall) => ({ ...toolCall })),
+    fork_message_index: draft.fork_message_index,
   };
 }
 
 function emptyDraft(): AssistantDraft {
-  return { text: '', tool_calls: [] };
+  return { reasoning: '', text: '', tool_calls: [] };
 }
 
-function fromSnapshot(session: SessionDto): SessionState {
+function fromSnapshot(
+  session: SessionDto,
+  skills: SkillSummary[],
+): SessionState {
   const activeRun: RunActivity | null =
     session.active_run_id === null
       ? null
@@ -232,24 +248,41 @@ function fromSnapshot(session: SessionDto): SessionState {
           errorMessage: null,
           historyStart: session.history.length,
         };
+  const restoredCompactions =
+    session.context_compactions && session.context_compactions.length > 0
+      ? session.context_compactions
+      : session.context_compaction
+        ? [session.context_compaction]
+        : [];
+  const compactions: CompactionMarker[] = restoredCompactions.map(
+    (compaction, index) => ({
+      key: `compaction-snapshot-${session.last_sequence}${restoredCompactions.length > 1 ? `-${index}` : ''}`,
+      phase: compaction.phase,
+      historyIndex: Math.min(compaction.history_index, session.history.length),
+      afterMessageCount: compaction.after_message_count ?? null,
+      message: compaction.message,
+    }),
+  );
   return {
     sessionId: session.session_id,
+    title: session.title,
+    workspace: session.workspace ?? null,
     profileId: session.profile_id,
     agentProfile: session.agent_profile,
     ready: true,
     status: session.status,
-    mode: session.mode,
     capabilityMode: session.capability_mode,
     config: session.config,
+    skills: [...(session.skills ?? skills)],
     usage: session.usage,
     contextUsage: session.usage.context,
     activeRunId: session.active_run_id,
     queuedRuns: session.queued_runs,
     draft: cloneDraft(session.draft),
     pendingAsks: session.pending_asks,
-    pendingPlanApprovals: session.pending_plan_approvals,
     subagents: session.subagents,
     history: session.history,
+    compactions,
     activeRun,
     pendingPrompts: [],
     fatalError: null,
@@ -409,6 +442,51 @@ function pushStep(
   }));
 }
 
+function startCompaction(state: SessionState): SessionState {
+  return {
+    ...state,
+    compactions: [
+      ...state.compactions,
+      {
+        key: `compaction-${state.lastSequence + 1}`,
+        phase: 'started',
+        historyIndex: state.history.length,
+        afterMessageCount: null,
+      },
+    ],
+  };
+}
+
+function finishCompaction(
+  state: SessionState,
+  phase: 'completed' | 'failed',
+  afterMessageCount: number | null,
+  message?: string,
+): SessionState {
+  const compactions = state.compactions.map((compaction) => ({
+    ...compaction,
+  }));
+  let index = compactions.length - 1;
+  while (index >= 0 && compactions[index]?.phase !== 'started') index -= 1;
+  if (index < 0) {
+    compactions.push({
+      key: `compaction-${state.lastSequence + 1}`,
+      phase,
+      historyIndex: state.history.length,
+      afterMessageCount,
+      message,
+    });
+  } else {
+    compactions[index] = {
+      ...compactions[index],
+      phase,
+      afterMessageCount,
+      message,
+    };
+  }
+  return { ...state, compactions };
+}
+
 function finalizeRun(
   state: SessionState,
   runId: string,
@@ -459,9 +537,10 @@ export function sessionReducer(
         ...state,
         ready: true,
         config: action.config,
-        mode: action.mode,
         capabilityMode: action.capabilityMode,
         agentProfile: action.agentProfile,
+        workspace: action.workspace,
+        skills: action.skills,
       };
 
     case 'session_created':
@@ -469,7 +548,7 @@ export function sessionReducer(
 
     case 'snapshot':
     case 'resync':
-      return fromSnapshot(action.session);
+      return fromSnapshot(action.session, state.skills);
 
     case 'disconnected':
       return {
@@ -500,6 +579,7 @@ export function sessionReducer(
             content: action.content,
             status: 'sending',
             queuePosition: null,
+            matchAnyEcho: action.matchAnyEcho ?? false,
           },
         ],
       };
@@ -562,6 +642,9 @@ function applyEvent(
     case 'state_changed':
       return { ...state, status: event.status };
 
+    case 'title_changed':
+      return { ...state, title: event.title };
+
     case 'run_queued':
       return { ...state, queuedRuns: state.queuedRuns + 1 };
 
@@ -580,9 +663,6 @@ function applyEvent(
     case 'config_changed':
       return { ...state, config: event.config };
 
-    case 'mode_changed':
-      return { ...state, mode: event.mode };
-
     case 'capability_mode_changed':
       return { ...state, capabilityMode: event.capability_mode };
 
@@ -595,21 +675,6 @@ function applyEvent(
         ...state,
         pendingAsks: state.pendingAsks.filter(
           (ask) => ask.ask_id !== event.ask_id,
-        ),
-      };
-
-    case 'plan_approval_requested':
-      return {
-        ...state,
-        pendingPlanApprovals: [...state.pendingPlanApprovals, event.request],
-      };
-
-    case 'plan_approval_decided':
-    case 'plan_approval_cancelled':
-      return {
-        ...state,
-        pendingPlanApprovals: state.pendingPlanApprovals.filter(
-          (approval) => approval.approval_id !== event.approval_id,
         ),
       };
 
@@ -676,12 +741,24 @@ function applyEvent(
       return { ...markedTurn, history, draft: null };
     }
 
-    case 'tool_execution_start':
-      return recordToolStep(state, runId, event.call, (step) => {
+    case 'tool_execution_start': {
+      const withTool = recordToolStep(state, runId, event.call, (step) => {
         step.status = 'running';
         step.content = null;
         step.isError = false;
       });
+      const draft = withTool.draft === null ? emptyDraft() : withTool.draft;
+      return {
+        ...withTool,
+        draft: {
+          ...draft,
+          fork_message_index: forkMessageIndex(
+            withTool.history.length,
+            withTool.compactions,
+          ),
+        },
+      };
+    }
 
     case 'tool_execution_progress':
       return recordToolStep(state, runId, event.call, (step) => {
@@ -745,37 +822,25 @@ function applyEvent(
       });
 
     case 'context_compaction_started':
-      return pushStep(state, runId, {
-        kind: 'compaction',
-        phase: 'started',
-        message: 'compacting context…',
-      });
+      return startCompaction(state);
 
     case 'context_compaction_completed': {
-      const withStep = pushStep(state, runId, {
-        kind: 'compaction',
-        phase: 'completed',
-        message: `context compacted (${event.before_message_count} → ${event.after_message_count} messages)`,
-      });
-      const history =
-        event.changed_from <= withStep.history.length
-          ? [
-              ...withStep.history.slice(0, event.changed_from),
-              ...event.replacement,
-            ]
-          : withStep.history;
+      const withMarker = finishCompaction(
+        state,
+        'completed',
+        event.after_message_count,
+      );
       return {
-        ...withStep,
-        history,
+        ...withMarker,
         draft: null,
-        usage: withStep.usage
+        usage: withMarker.usage
           ? {
-              ...withStep.usage,
+              ...withMarker.usage,
               last: null,
               context: null,
               cumulative: event.usage
-                ? addUsage(withStep.usage.cumulative, event.usage)
-                : withStep.usage.cumulative,
+                ? addUsage(withMarker.usage.cumulative, event.usage)
+                : withMarker.usage.cumulative,
             }
           : null,
         contextUsage: null,
@@ -783,11 +848,7 @@ function applyEvent(
     }
 
     case 'context_compaction_failed':
-      return pushStep(state, runId, {
-        kind: 'compaction',
-        phase: 'failed',
-        message: `compaction failed: ${event.message}`,
-      });
+      return finishCompaction(state, 'failed', null, event.message);
 
     case 'usage_update':
       return {
@@ -816,11 +877,21 @@ function handleRoleMessage(
   message: PublicMessage,
 ): SessionState {
   if (message.role === 'user') {
+    if (message.visibility === 'internal') {
+      // Internal payloads are redacted on the wire, so content cannot be used
+      // for deduplication. Preserve one placeholder per transcript entry to
+      // keep later assistant fork indexes aligned with the daemon.
+      return { ...state, history: [...state.history, message] };
+    }
     // The server echoes each committed user prompt. Remove exactly one matching
     // optimistic entry so identical queued prompts remain distinct.
-    const pendingIndex = state.pendingPrompts.findIndex((prompt) =>
+    const exactPendingIndex = state.pendingPrompts.findIndex((prompt) =>
       shallowEqualContent(prompt.content, message.content),
     );
+    const pendingIndex =
+      exactPendingIndex >= 0
+        ? exactPendingIndex
+        : state.pendingPrompts.findIndex((prompt) => prompt.matchAnyEcho);
     const pendingPrompts =
       pendingIndex < 0
         ? state.pendingPrompts
@@ -847,6 +918,12 @@ function applyDelta(
   draft: AssistantDraft,
   delta: AssistantDelta,
 ): AssistantDraft {
+  if (delta.type === 'reasoning') {
+    return {
+      ...draft,
+      reasoning: (draft.reasoning ?? '') + delta.delta,
+    };
+  }
   if (delta.type === 'text') {
     return { ...draft, text: draft.text + delta.delta };
   }
@@ -867,6 +944,22 @@ function applyDelta(
     toolCalls.sort((a, b) => a.index - b.index);
   }
   return { ...draft, tool_calls: toolCalls };
+}
+
+/** Maps a retained display-history position into the active transcript. */
+export function forkMessageIndex(
+  historyIndex: number,
+  compactions: CompactionMarker[],
+): number | undefined {
+  let latest: CompactionMarker | undefined;
+  for (const compaction of compactions) {
+    if (compaction.phase === 'completed') latest = compaction;
+  }
+  if (latest === undefined) return historyIndex;
+  if (historyIndex < latest.historyIndex || latest.afterMessageCount === null) {
+    return undefined;
+  }
+  return latest.afterMessageCount + (historyIndex - latest.historyIndex);
 }
 
 function emptyUsage(): TokenUsage {

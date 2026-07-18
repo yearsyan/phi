@@ -8,6 +8,7 @@ import { SessionSocket } from './connection.ts';
 export interface NewSessionSocketOpenOptions extends SessionSocketOpenOptions {
   agentProfileId?: string;
   capabilityMode?: CapabilityMode;
+  workspace?: string;
 }
 
 /**
@@ -27,6 +28,8 @@ export function openNewSession(
   if (options?.capabilityMode) {
     params.set('capability_mode', options.capabilityMode);
   }
+  const workspace = options?.workspace?.trim();
+  if (workspace) params.set('workspace', workspace);
   const path = `/v1/ws/new?${params.toString()}`;
   const socketOptions =
     options?.signal === undefined ? undefined : { signal: options.signal };

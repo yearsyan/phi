@@ -1,0 +1,171 @@
+.row {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+}
+
+.trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  margin-left: -6px;
+  border: 0;
+  border-radius: var(--phi-radius);
+  background: transparent;
+  color: var(--phi-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.trigger:hover {
+  background: var(--phi-accent-soft);
+}
+
+.triggerStatic {
+  cursor: default;
+}
+
+.triggerStatic:hover {
+  background: transparent;
+}
+
+.toolIcon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-size: 13px;
+}
+
+.toolName {
+  flex: 0 0 auto;
+  color: var(--phi-text-strong);
+  font-weight: 550;
+}
+
+.paramSummary {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusSlot {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.statusDone {
+  color: var(--phi-success);
+}
+
+.statusError {
+  color: var(--phi-danger);
+}
+
+.spin {
+  color: var(--phi-warning);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.chevron {
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+  font-size: 11px;
+  transition: transform 140ms ease;
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+.details {
+  margin: 2px 0 4px 11px;
+  padding-left: 12px;
+  border-left: 1px solid var(--phi-border);
+}
+
+.args {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.argInline {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--phi-mono);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.argBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--phi-mono);
+  font-size: 11px;
+}
+
+.argKey {
+  flex: 0 0 auto;
+  color: var(--phi-text-dim);
+}
+
+.argValue {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--phi-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sectionLabel {
+  margin-top: 6px;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.sectionLabelError {
+  color: var(--phi-danger);
+}
+
+.code {
+  max-height: 220px;
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--phi-border);
+  border-radius: var(--phi-radius);
+  background: var(--phi-code-bg);
+  color: var(--phi-code-text);
+  font-family: var(--phi-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.codeError {
+  border-color: var(--phi-danger);
+  color: var(--phi-danger);
+}

@@ -334,7 +334,7 @@ impl Tool for CloseAgentTool {
 
     fn effect(&self) -> ToolEffect {
         // Closing only mutates agent-local coordination state and remains
-        // available as a safety action in plan mode.
+        // available at every capability level as a safety action.
         ToolEffect::Internal
     }
 

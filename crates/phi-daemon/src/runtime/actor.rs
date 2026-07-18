@@ -10,12 +10,12 @@ use std::{
 
 use futures_util::FutureExt;
 use phi::{
-    Agent, AgentEvent, AgentMode, AgentModeControl, AgentRunControl, AgentRunOutcome,
-    AssistantDelta, CapabilityMode, Content, ContextCompactionRunOutcome, ContextUsage,
-    InMemoryPlanStore, Message, PlanStore, ReasoningEffort, Role, SessionStorage, SkillCatalog,
-    SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind,
-    SubagentNotificationKind, SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage,
-    Workspace,
+    Agent, AgentEvent, AgentRunControl, AgentRunOutcome, AssistantDelta, CapabilityMode, Content,
+    ContextCompactionRunOutcome, ContextUsage, DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE,
+    Message, MessageVisibility, ReasoningEffort, Role, SessionSnapshot, SessionStorage,
+    SkillCatalog, SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent,
+    SubagentEventKind, SubagentNotificationKind, SubagentRuntime, SubagentSnapshot, SubagentState,
+    TokenUsage, Workspace,
 };
 use thiserror::Error;
 use tokio::sync::{
@@ -23,16 +23,11 @@ use tokio::sync::{
 };
 
 use super::{
-    AskUserId, PinnedAgentProfile, PlanApprovalDecision, PlanApprovalId, PlanApprovalRequest,
-    RunId, SessionId,
+    AskUserId, PinnedAgentProfile, RunId, SessionId,
     ask_user::{
         AskUserAnswer, AskUserRequest, AskUserTool, PendingAskUserRequest, validate_answers,
     },
     compile_agent_profile, default_agent_profile,
-    plan_approval::{
-        ExitPlanModeTool, PendingPlanApprovalRequest, PlanApprovalMessage, ReadPlanTool,
-        WritePlanTool,
-    },
 };
 use crate::store::{ControlStore, SessionRecord};
 
@@ -50,10 +45,32 @@ pub enum AgentStatus {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextCompactionPhase {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextCompactionView {
+    pub phase: ContextCompactionPhase,
+    /// Transcript position where the client should render the status divider.
+    pub history_index: usize,
+    /// Replacement range hidden from public history snapshots.
+    pub hidden_range: Option<std::ops::Range<usize>>,
+    pub after_message_count: Option<usize>,
+    pub message: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AssistantDraft {
+    pub reasoning: String,
     pub text: String,
     pub tool_calls: Vec<ToolCallDraft>,
+    /// Durable assistant message index that can be forked before this draft's
+    /// tool calls. It is exposed only after the tool-call journal is saved.
+    pub fork_message_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +84,7 @@ pub struct ToolCallDraft {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentView {
     pub session_id: SessionId,
+    pub title: Option<String>,
     pub profile_id: String,
     pub agent_profile_id: String,
     pub agent_profile_revision: u64,
@@ -74,19 +92,21 @@ pub struct AgentView {
     pub status: AgentStatus,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
-    pub mode: AgentMode,
     pub capability_mode: CapabilityMode,
     pub model: String,
     pub workspace: Option<Workspace>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub config_revision: u64,
+    /// Complete durable conversation projection; never used as Provider input.
+    pub display_messages: Vec<Message>,
     pub messages: Vec<Message>,
+    pub context_compactions: Vec<ContextCompactionView>,
+    pub context_compaction: Option<ContextCompactionView>,
     pub draft: Option<AssistantDraft>,
     pub last_usage: Option<TokenUsage>,
     pub context_usage: Option<ContextUsage>,
     pub cumulative_usage: TokenUsage,
     pub pending_asks: Vec<AskUserRequest>,
-    pub pending_plan_approvals: Vec<PlanApprovalRequest>,
     pub subagents: Vec<SubagentSummary>,
     pub last_event_sequence: u64,
 }
@@ -104,6 +124,7 @@ pub struct SubagentSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentSummary {
     pub session_id: SessionId,
+    pub title: Option<String>,
     pub profile_id: String,
     pub agent_profile_id: String,
     pub agent_profile_revision: u64,
@@ -111,7 +132,6 @@ pub struct AgentSummary {
     pub status: AgentStatus,
     pub active_run_id: Option<RunId>,
     pub queued_runs: usize,
-    pub mode: AgentMode,
     pub capability_mode: CapabilityMode,
     pub model: String,
     pub workspace: Option<Workspace>,
@@ -136,6 +156,9 @@ pub enum RuntimeEventKind {
         status: AgentStatus,
     },
     SessionInitialized,
+    TitleChanged {
+        title: String,
+    },
     RunQueued {
         run_id: RunId,
     },
@@ -157,9 +180,6 @@ pub enum RuntimeEventKind {
         reasoning_effort: Option<ReasoningEffort>,
         revision: u64,
     },
-    ModeChanged {
-        mode: AgentMode,
-    },
     CapabilityModeChanged {
         capability_mode: CapabilityMode,
     },
@@ -171,16 +191,6 @@ pub enum RuntimeEventKind {
     },
     AskUserCancelled {
         ask_id: AskUserId,
-    },
-    PlanApprovalRequested {
-        request: PlanApprovalRequest,
-    },
-    PlanApprovalDecided {
-        approval_id: PlanApprovalId,
-        decision: PlanApprovalDecision,
-    },
-    PlanApprovalCancelled {
-        approval_id: PlanApprovalId,
     },
     OperationFailed {
         operation: String,
@@ -220,64 +230,42 @@ impl AgentHandle {
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
-        Self::spawn_with_plan_store(
+        Self::spawn_with_skills(
             session_id,
             agent,
             profile_id,
             model,
             reasoning_effort,
-            Arc::new(InMemoryPlanStore::new()),
-        )
-    }
-
-    pub fn spawn_with_plan_store(
-        session_id: SessionId,
-        agent: Agent,
-        profile_id: impl Into<String>,
-        model: impl Into<String>,
-        reasoning_effort: Option<ReasoningEffort>,
-        plan_store: Arc<dyn PlanStore>,
-    ) -> Self {
-        Self::spawn_with_plan_store_and_skills(
-            session_id,
-            agent,
-            profile_id,
-            model,
-            reasoning_effort,
-            plan_store,
             SkillCatalog::default(),
         )
     }
 
-    pub fn spawn_with_plan_store_and_skills(
+    pub fn spawn_with_skills(
         session_id: SessionId,
         agent: Agent,
         profile_id: impl Into<String>,
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
-        plan_store: Arc<dyn PlanStore>,
         skills: SkillCatalog,
     ) -> Self {
-        Self::spawn_with_plan_store_skills_and_subagents(
+        Self::spawn_with_skills_and_subagents(
             session_id,
             agent,
             profile_id,
             model,
             reasoning_effort,
-            plan_store,
             skills,
             None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_plan_store_skills_and_subagents(
+    pub fn spawn_with_skills_and_subagents(
         session_id: SessionId,
         agent: Agent,
         profile_id: impl Into<String>,
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
-        plan_store: Arc<dyn PlanStore>,
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
     ) -> Self {
@@ -287,46 +275,46 @@ impl AgentHandle {
             .unwrap_or_else(|| Workspace::new("."));
         let agent_profile = compile_agent_profile(&default_agent_profile(), &workspace)
             .expect("the built-in Agent Profile must compile");
-        Self::spawn_configured_with_plan_store_skills_and_subagents(
+        Self::spawn_configured_with_skills_and_subagents(
             session_id,
             agent,
             profile_id,
             agent_profile,
             model,
             reasoning_effort,
-            plan_store,
             skills,
             subagents,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_configured_with_plan_store_skills_and_subagents(
+    pub fn spawn_configured_with_skills_and_subagents(
         session_id: SessionId,
         mut agent: Agent,
         profile_id: impl Into<String>,
         agent_profile: PinnedAgentProfile,
         model: impl Into<String>,
         reasoning_effort: Option<ReasoningEffort>,
-        plan_store: Arc<dyn PlanStore>,
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
     ) -> Self {
         let stored_agent_profile = agent_profile.clone();
         let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
         agent.add_mandatory_tool(ask_user_tool);
-        agent.add_mandatory_tool(ReadPlanTool::new(session_id, Arc::clone(&plan_store)));
-        agent.add_mandatory_tool(WritePlanTool::new(session_id, Arc::clone(&plan_store)));
-        let (exit_plan_mode_tool, plan_approval_messages) =
-            ExitPlanModeTool::channel(session_id, Arc::clone(&plan_store));
-        agent.add_mandatory_tool(exit_plan_mode_tool);
-        let mode_control = agent.mode_control();
         // Subscribe before taking the initial projection so delegation that
         // races construction is either represented by the snapshot, buffered
         // as an event, or both (the projection update is idempotent).
         let subagent_events = subagents.as_ref().map(SubagentRuntime::subscribe);
+        let initial_messages = agent.messages().to_vec();
+        let initial_display_messages = agent.session_history().messages.clone();
+        let initial_context_compactions = restored_context_compactions(&agent);
+        let initial_context_compaction = initial_context_compactions
+            .last()
+            .cloned()
+            .or_else(|| restored_context_compaction(&initial_messages));
         let initial = AgentView {
             session_id,
+            title: None,
             profile_id: profile_id.into(),
             agent_profile_id: agent_profile.agent_profile_id,
             agent_profile_revision: agent_profile.revision,
@@ -334,19 +322,20 @@ impl AgentHandle {
             status: AgentStatus::AwaitingFirstPrompt,
             active_run_id: None,
             queued_runs: 0,
-            mode: agent.mode(),
             capability_mode: agent.capability_mode(),
             model: model.into(),
             workspace: agent.workspace().cloned(),
             reasoning_effort,
             config_revision: 0,
-            messages: agent.messages().to_vec(),
+            display_messages: initial_display_messages,
+            messages: initial_messages,
+            context_compactions: initial_context_compactions,
+            context_compaction: initial_context_compaction,
             draft: None,
             last_usage: agent.last_usage(),
             context_usage: agent.context_usage(),
             cumulative_usage: agent.cumulative_usage(),
             pending_asks: Vec::new(),
-            pending_plan_approvals: Vec::new(),
             subagents: subagents
                 .as_ref()
                 .map(SubagentRuntime::snapshots)
@@ -392,9 +381,6 @@ impl AgentHandle {
                 ActorRuntime {
                     commands: command_receiver,
                     ask_user_requests,
-                    plan_approval_messages,
-                    plan_store,
-                    mode_control,
                     hub: actor_hub,
                     active_run: actor_active_run,
                     active_compaction: actor_active_compaction,
@@ -509,6 +495,7 @@ impl AgentHandle {
         let state = self.state.borrow();
         AgentSummary {
             session_id: state.session_id,
+            title: state.title.clone(),
             profile_id: state.profile_id.clone(),
             agent_profile_id: state.agent_profile_id.clone(),
             agent_profile_revision: state.agent_profile_revision,
@@ -516,7 +503,6 @@ impl AgentHandle {
             status: state.status,
             active_run_id: state.active_run_id,
             queued_runs: state.queued_runs,
-            mode: state.mode,
             capability_mode: state.capability_mode,
             model: state.model.clone(),
             workspace: state.workspace.clone(),
@@ -577,6 +563,7 @@ impl AgentHandle {
             .try_send(AgentCommand::Prompt {
                 run_id,
                 content,
+                visibility: MessageVisibility::Public,
                 queue_permit,
                 admission: Some(admission),
             })
@@ -658,17 +645,10 @@ impl AgentHandle {
             })
     }
 
-    pub async fn set_reasoning_effort(
-        &self,
-        reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<(), AgentHandleError> {
-        self.ensure_configurable()?;
+    pub async fn set_title(&self, title: String) -> Result<(), AgentHandleError> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(AgentCommand::SetReasoning {
-                reasoning_effort,
-                reply,
-            })
+            .send(AgentCommand::SetTitle { title, reply })
             .await
             .map_err(|_| self.stopped_error())?;
         response
@@ -680,11 +660,68 @@ impl AgentHandle {
             })
     }
 
-    pub async fn set_mode(&self, mode: AgentMode) -> Result<(), AgentHandleError> {
+    pub async fn set_pinned(&self, pinned: bool) -> Result<(), AgentHandleError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AgentCommand::SetPinned { pinned, reply })
+            .await
+            .map_err(|_| self.stopped_error())?;
+        response
+            .await
+            .map_err(|_| self.response_error())?
+            .map_err(|message| AgentHandleError::Operation {
+                session_id: self.session_id,
+                message,
+            })
+    }
+
+    /// Returns a protocol-complete in-memory snapshot at an actor boundary.
+    ///
+    /// Forking is rejected while a run or compaction is active so callers can
+    /// never clone a streaming draft or race a transcript replacement.
+    pub async fn snapshot_for_fork(&self) -> Result<SessionSnapshot, AgentHandleError> {
+        let _fork_guard = self.acquire_fork_guard()?;
+        let status = self.status();
+        if status != AgentStatus::Idle {
+            return Err(AgentHandleError::Busy {
+                session_id: self.session_id,
+                status,
+            });
+        }
+
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AgentCommand::SnapshotForFork { reply })
+            .await
+            .map_err(|_| self.stopped_error())?;
+        response.await.map_err(|_| self.response_error())?
+    }
+
+    /// Prevents context replacement while a durable fork checkpoint is read.
+    /// Running turns may continue appending protocol-complete checkpoints.
+    pub(crate) fn acquire_fork_guard(&self) -> Result<OwnedSemaphorePermit, AgentHandleError> {
+        Arc::clone(&self.compaction_slot)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                TryAcquireError::NoPermits => AgentHandleError::Busy {
+                    session_id: self.session_id,
+                    status: AgentStatus::Compacting,
+                },
+                TryAcquireError::Closed => self.stopped_error(),
+            })
+    }
+
+    pub async fn set_reasoning_effort(
+        &self,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), AgentHandleError> {
         self.ensure_configurable()?;
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(AgentCommand::SetMode { mode, reply })
+            .send(AgentCommand::SetReasoning {
+                reasoning_effort,
+                reply,
+            })
             .await
             .map_err(|_| self.stopped_error())?;
         response
@@ -728,23 +765,6 @@ impl AgentHandle {
             .send(AgentCommand::AnswerAskUser {
                 ask_id,
                 answers,
-                reply,
-            })
-            .await
-            .map_err(|_| self.stopped_error())?;
-        response.await.map_err(|_| self.response_error())?
-    }
-
-    pub async fn decide_plan_approval(
-        &self,
-        approval_id: PlanApprovalId,
-        decision: PlanApprovalDecision,
-    ) -> Result<(), AgentHandleError> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(AgentCommand::DecidePlanApproval {
-                approval_id,
-                decision,
                 reply,
             })
             .await
@@ -886,6 +906,7 @@ enum AgentCommand {
     Prompt {
         run_id: RunId,
         content: Content,
+        visibility: MessageVisibility,
         queue_permit: OwnedSemaphorePermit,
         admission: Option<oneshot::Sender<Result<usize, ()>>>,
     },
@@ -898,12 +919,19 @@ enum AgentCommand {
         model: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    SetReasoning {
-        reasoning_effort: Option<ReasoningEffort>,
+    SetTitle {
+        title: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    SetMode {
-        mode: AgentMode,
+    SetPinned {
+        pinned: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SnapshotForFork {
+        reply: oneshot::Sender<Result<SessionSnapshot, AgentHandleError>>,
+    },
+    SetReasoning {
+        reasoning_effort: Option<ReasoningEffort>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     SetCapabilityMode {
@@ -915,11 +943,6 @@ enum AgentCommand {
         answers: Vec<AskUserAnswer>,
         reply: oneshot::Sender<Result<(), AgentHandleError>>,
     },
-    DecidePlanApproval {
-        approval_id: PlanApprovalId,
-        decision: PlanApprovalDecision,
-        reply: oneshot::Sender<Result<(), AgentHandleError>>,
-    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -928,9 +951,6 @@ enum AgentCommand {
 struct ActorRuntime {
     commands: mpsc::Receiver<AgentCommand>,
     ask_user_requests: mpsc::UnboundedReceiver<PendingAskUserRequest>,
-    plan_approval_messages: mpsc::UnboundedReceiver<PlanApprovalMessage>,
-    plan_store: Arc<dyn PlanStore>,
-    mode_control: AgentModeControl,
     hub: Arc<EventHub>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
     active_compaction: Arc<Mutex<Option<AgentRunControl>>>,
@@ -943,9 +963,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
     let ActorRuntime {
         mut commands,
         mut ask_user_requests,
-        mut plan_approval_messages,
-        plan_store,
-        mode_control,
         hub,
         active_run,
         active_compaction,
@@ -1028,6 +1045,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
             AgentCommand::Prompt {
                 run_id,
                 content,
+                visibility,
                 queue_permit,
                 admission: _,
             } => {
@@ -1060,13 +1078,13 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 }
 
                 let mut pending_asks = HashMap::new();
-                let mut pending_plan_approvals = HashMap::new();
-                let mut run = Box::pin(agent.prompt_content_controlled(content, control.clone()));
+                let mut run = Box::pin(agent.prompt_content_with_visibility_controlled(
+                    content,
+                    visibility,
+                    control.clone(),
+                ));
                 let result = loop {
                     tokio::select! {
-                        // Registration/cancellation channels precede commands
-                        // so a timed-out request is retired before a queued
-                        // decision for the same ID can be considered.
                         biased;
                         request = ask_user_requests.recv() => {
                             let Some(request) = request else {
@@ -1080,35 +1098,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 break run.as_mut().await;
                             };
                             register_pending_ask(&mut pending_asks, &hub, request);
-                        }
-                        message = plan_approval_messages.recv() => {
-                            let Some(message) = message else {
-                                closing = true;
-                                control.stop();
-                                hub.operation_failed(
-                                    "plan_approval",
-                                    "plan approval request channel closed unexpectedly".to_owned(),
-                                );
-                                hub.status(AgentStatus::Closing);
-                                break run.as_mut().await;
-                            };
-                            match message {
-                                PlanApprovalMessage::Request(request) => {
-                                    register_pending_plan_approval(
-                                        &mut pending_plan_approvals,
-                                        &hub,
-                                        request,
-                                    );
-                                }
-                                PlanApprovalMessage::Cancel { approval_id } => {
-                                    cancel_pending_plan_approval(
-                                        &mut pending_plan_approvals,
-                                        &hub,
-                                        approval_id,
-                                        "plan approval tool execution was cancelled",
-                                    );
-                                }
-                            }
                         }
                         // Delegation is published synchronously by the core
                         // runtime. If it and the parent run become ready in
@@ -1155,14 +1144,31 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 AgentCommand::SetReasoning { reply, .. } => {
                                     let _ = reply.send(Err("cannot change reasoning effort while the agent is running".to_owned()));
                                 }
-                                AgentCommand::SetMode { reply, .. } => {
-                                    let _ = reply.send(Err("cannot change mode directly while the agent is running".to_owned()));
-                                }
                                 AgentCommand::SetCapabilityMode { reply, .. } => {
                                     let _ = reply.send(Err("cannot change capability mode while the agent is running".to_owned()));
                                 }
                                 AgentCommand::CompactContext { admission, .. } => {
                                     let _ = admission.send(Err(AgentHandleError::Busy {
+                                        session_id: hub.session_id,
+                                        status: hub.current_status(),
+                                    }));
+                                }
+                                AgentCommand::SetTitle { title, reply } => {
+                                    let result = apply_title(&hub, &mut binding, title).await;
+                                    if let Err(error) = &result {
+                                        hub.operation_failed("set_title", error.clone());
+                                    }
+                                    let _ = reply.send(result);
+                                }
+                                AgentCommand::SetPinned { pinned, reply } => {
+                                    let result = apply_pinned(&mut binding, pinned).await;
+                                    if let Err(error) = &result {
+                                        hub.operation_failed("set_pinned", error.clone());
+                                    }
+                                    let _ = reply.send(result);
+                                }
+                                AgentCommand::SnapshotForFork { reply } => {
+                                    let _ = reply.send(Err(AgentHandleError::Busy {
                                         session_id: hub.session_id,
                                         status: hub.current_status(),
                                     }));
@@ -1198,50 +1204,12 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                     drop(active);
                                     let _ = reply.send(result);
                                 }
-                                AgentCommand::DecidePlanApproval {
-                                    approval_id,
-                                    decision,
-                                    reply,
-                                } => {
-                                    let result = decide_pending_plan_approval(
-                                        &mut pending_plan_approvals,
-                                        PlanApprovalDecisionContext {
-                                            hub: &hub,
-                                            plan_store: plan_store.as_ref(),
-                                            mode_control: &mode_control,
-                                            control: &control,
-                                            active_run: active_run.as_ref(),
-                                        },
-                                        approval_id,
-                                        decision,
-                                    )
-                                    .await;
-                                    let _ = reply.send(result);
-                                }
                                 command => backlog.push_back(command),
                             }
                         }
                     }
                 };
                 drop(run);
-                // Exit approval updates the shared in-memory mode control so
-                // the next model turn can execute immediately. If persisting
-                // the corresponding tool result fails, core restores its
-                // checkpointed mode. Reconcile the wire projection after the
-                // run future releases its borrow so snapshots never retain an
-                // optimistic mode that core rolled back.
-                let final_mode = agent.mode();
-                if hub.current_mode() != final_mode {
-                    hub.mode_changed(final_mode);
-                }
-                if let Some(subagents) = &subagents {
-                    let ceiling = if final_mode == AgentMode::Plan {
-                        CapabilityMode::ReadOnly
-                    } else {
-                        agent.capability_mode()
-                    };
-                    subagents.set_capability_ceiling(ceiling);
-                }
                 cancel_pending_asks(
                     &mut pending_asks,
                     &hub,
@@ -1250,15 +1218,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 drain_unregistered_asks(
                     &mut ask_user_requests,
                     "askuser request was cancelled because the run ended",
-                );
-                cancel_pending_plan_approvals(
-                    &mut pending_plan_approvals,
-                    &hub,
-                    "plan approval request was cancelled because the run ended",
-                );
-                drain_unregistered_plan_approvals(
-                    &mut plan_approval_messages,
-                    "plan approval request was cancelled because the run ended",
                 );
                 {
                     let mut active = active_run.lock().expect("active run lock poisoned");
@@ -1364,6 +1323,40 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 }
                 let _ = reply.send(result);
             }
+            AgentCommand::SetTitle { title, reply } => {
+                let result = apply_title(&hub, &mut binding, title).await;
+                if let Err(error) = &result {
+                    hub.operation_failed("set_title", error.clone());
+                }
+                let _ = reply.send(result);
+            }
+            AgentCommand::SetPinned { pinned, reply } => {
+                let result = apply_pinned(&mut binding, pinned).await;
+                if let Err(error) = &result {
+                    hub.operation_failed("set_pinned", error.clone());
+                }
+                let _ = reply.send(result);
+            }
+            AgentCommand::SnapshotForFork { reply } => {
+                let status = hub.current_status();
+                let result = if status == AgentStatus::Idle {
+                    Ok(SessionSnapshot {
+                        id: hub.session_id.to_string(),
+                        workspace: agent.workspace().cloned(),
+                        messages: agent.messages().to_vec(),
+                        history: phi::SessionHistory::from_messages(agent.messages()),
+                        last_usage: agent.last_usage(),
+                        cumulative_usage: agent.cumulative_usage(),
+                        capability_mode: agent.capability_mode(),
+                    })
+                } else {
+                    Err(AgentHandleError::Busy {
+                        session_id: hub.session_id,
+                        status,
+                    })
+                };
+                let _ = reply.send(result);
+            }
             AgentCommand::SetReasoning {
                 reasoning_effort,
                 reply,
@@ -1372,13 +1365,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     apply_reasoning(&mut agent, &hub, &mut binding, reasoning_effort).await;
                 if let Err(error) = &result {
                     hub.operation_failed("set_reasoning_effort", error.clone());
-                }
-                let _ = reply.send(result);
-            }
-            AgentCommand::SetMode { mode, reply } => {
-                let result = apply_mode(&mut agent, &hub, subagents.as_ref(), mode).await;
-                if let Err(error) = &result {
-                    hub.operation_failed("set_mode", error.clone());
                 }
                 let _ = reply.send(result);
             }
@@ -1398,14 +1384,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 let _ = reply.send(Err(AgentHandleError::AskUserNotPending {
                     session_id: hub.session_id,
                     ask_id,
-                }));
-            }
-            AgentCommand::DecidePlanApproval {
-                approval_id, reply, ..
-            } => {
-                let _ = reply.send(Err(AgentHandleError::PlanApprovalNotPending {
-                    session_id: hub.session_id,
-                    approval_id,
                 }));
             }
             AgentCommand::Shutdown { reply } => {
@@ -1428,10 +1406,6 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
     drain_unregistered_asks(
         &mut ask_user_requests,
         "askuser request was cancelled because the agent is closing",
-    );
-    drain_unregistered_plan_approvals(
-        &mut plan_approval_messages,
-        "plan approval request was cancelled because the agent is closing",
     );
     if let Some(subagents) = subagents {
         subagents.shutdown("parent agent actor stopped").await;
@@ -1491,6 +1465,7 @@ fn handle_subagent_event(
     backlog.push_back(AgentCommand::Prompt {
         run_id,
         content,
+        visibility: MessageVisibility::Internal,
         queue_permit,
         admission: None,
     });
@@ -1647,244 +1622,12 @@ fn drain_unregistered_asks(
     }
 }
 
-fn register_pending_plan_approval(
-    pending_approvals: &mut HashMap<PlanApprovalId, PendingPlanApprovalRequest>,
-    hub: &EventHub,
-    request: PendingPlanApprovalRequest,
-) {
-    // If core timed the tool out before the actor reached this FIFO message,
-    // its oneshot receiver is already gone and a Cancel message follows. Do
-    // not publish a transient request that was never actually answerable.
-    if request.reply.is_closed() {
-        return;
-    }
-    let approval_id = request.request.approval_id;
-    if let Some(previous) = pending_approvals.insert(approval_id, request) {
-        let _ = previous
-            .reply
-            .send(Err("plan approval request ID was reused".to_owned()));
-        hub.plan_approval_cancelled(approval_id);
-    }
-    let request = pending_approvals
-        .get(&approval_id)
-        .expect("the plan approval request was just inserted")
-        .request
-        .clone();
-    hub.plan_approval_requested(request);
-}
-
-struct PlanApprovalDecisionContext<'a> {
-    hub: &'a EventHub,
-    plan_store: &'a dyn PlanStore,
-    mode_control: &'a AgentModeControl,
-    control: &'a AgentRunControl,
-    active_run: &'a Mutex<Option<ActiveRun>>,
-}
-
-async fn decide_pending_plan_approval(
-    pending_approvals: &mut HashMap<PlanApprovalId, PendingPlanApprovalRequest>,
-    context: PlanApprovalDecisionContext<'_>,
-    approval_id: PlanApprovalId,
-    decision: PlanApprovalDecision,
-) -> Result<(), AgentHandleError> {
-    const MAX_FEEDBACK_BYTES: usize = 16 * 1024;
-    let PlanApprovalDecisionContext {
-        hub,
-        plan_store,
-        mode_control,
-        control,
-        active_run,
-    } = context;
-
-    if run_is_stopping(control, hub) {
-        cancel_pending_plan_approval(
-            pending_approvals,
-            hub,
-            approval_id,
-            "plan approval request was cancelled because the run is stopping",
-        );
-        return Err(AgentHandleError::PlanApprovalNotPending {
-            session_id: hub.session_id,
-            approval_id,
-        });
-    }
-    let Some(pending) = pending_approvals.get(&approval_id) else {
-        return Err(AgentHandleError::PlanApprovalNotPending {
-            session_id: hub.session_id,
-            approval_id,
-        });
-    };
-    if pending.reply.is_closed() {
-        cancel_pending_plan_approval(
-            pending_approvals,
-            hub,
-            approval_id,
-            "plan approval tool execution was cancelled",
-        );
-        return Err(AgentHandleError::PlanApprovalNotPending {
-            session_id: hub.session_id,
-            approval_id,
-        });
-    }
-    let expected_plan = pending.request.plan.clone();
-    let expected_revision = expected_plan.revision;
-    if decision.revision() != expected_revision {
-        return Err(AgentHandleError::InvalidPlanApprovalDecision {
-            message: format!(
-                "decision targets revision {}, but approval request targets revision {expected_revision}",
-                decision.revision()
-            ),
-        });
-    }
-
-    let decision = match decision {
-        PlanApprovalDecision::Approve { revision } => PlanApprovalDecision::Approve { revision },
-        PlanApprovalDecision::Reject { revision, feedback } => {
-            let feedback = feedback.and_then(|feedback| {
-                let feedback = feedback.trim();
-                (!feedback.is_empty()).then(|| feedback.to_owned())
-            });
-            if feedback
-                .as_ref()
-                .is_some_and(|feedback| feedback.len() > MAX_FEEDBACK_BYTES)
-            {
-                return Err(AgentHandleError::InvalidPlanApprovalDecision {
-                    message: format!(
-                        "rejection feedback exceeds the {MAX_FEEDBACK_BYTES}-byte limit"
-                    ),
-                });
-            }
-            PlanApprovalDecision::Reject { revision, feedback }
-        }
-    };
-
-    let session_id = hub.session_id.to_string();
-    let locked = tokio::select! {
-        biased;
-        _ = control.stopped() => {
-            cancel_pending_plan_approval(
-                pending_approvals,
-                hub,
-                approval_id,
-                "plan approval request was cancelled because the run is stopping",
-            );
-            return Err(AgentHandleError::PlanApprovalNotPending {
-                session_id: hub.session_id,
-                approval_id,
-            });
-        }
-        result = plan_store.lock_current(&session_id) => {
-            result.map_err(|error| AgentHandleError::Operation {
-                session_id: hub.session_id,
-                message: format!("could not lock plan revision before approval: {error}"),
-            })?
-        }
-    };
-    if locked.artifact() != Some(&expected_plan) {
-        let current_revision = locked.artifact().map_or(0, |plan| plan.revision);
-        let pending = pending_approvals
-            .remove(&approval_id)
-            .expect("the stale plan approval must still be pending");
-        let _ = pending.reply.send(Err(format!(
-            "plan changed while approval was pending (requested revision {expected_revision}, current revision {current_revision})"
-        )));
-        hub.plan_approval_cancelled(approval_id);
-        return Err(AgentHandleError::StalePlanApproval {
-            session_id: hub.session_id,
-            approval_id,
-            expected_revision,
-            current_revision,
-        });
-    }
-
-    // This is the synchronous commit section for approval vs. stop(). The
-    // PlanStore lease prevents an external writer from changing the approved
-    // artifact, and the same active-run mutex used by AgentHandle::stop keeps
-    // stop_requested/control and the mode transition linearly ordered.
-    let active = active_run.lock().expect("active run lock poisoned");
-    if active
-        .as_ref()
-        .is_none_or(|active| active.stop_requested || active.control.is_stopped())
-        || run_is_stopping(control, hub)
-    {
-        cancel_pending_plan_approval(
-            pending_approvals,
-            hub,
-            approval_id,
-            "plan approval request was cancelled because the run is stopping",
-        );
-        return Err(AgentHandleError::PlanApprovalNotPending {
-            session_id: hub.session_id,
-            approval_id,
-        });
-    }
-
-    let pending = pending_approvals
-        .remove(&approval_id)
-        .expect("the verified plan approval must still be pending");
-    if pending.reply.send(Ok(decision.clone())).is_err() {
-        hub.plan_approval_cancelled(approval_id);
-        return Err(AgentHandleError::PlanApprovalNotPending {
-            session_id: hub.session_id,
-            approval_id,
-        });
-    }
-
-    let approved = matches!(decision, PlanApprovalDecision::Approve { .. });
-    if approved {
-        mode_control.set_mode(AgentMode::Default);
-    }
-    hub.plan_approval_decided(approval_id, decision);
-    if approved {
-        hub.mode_changed(AgentMode::Default);
-    }
-    drop(active);
-    drop(locked);
-    Ok(())
-}
-
 fn run_is_stopping(control: &AgentRunControl, hub: &EventHub) -> bool {
     control.is_stopped()
         || matches!(
             hub.current_status(),
             AgentStatus::Stopping | AgentStatus::Closing | AgentStatus::Closed
         )
-}
-
-fn cancel_pending_plan_approvals(
-    pending_approvals: &mut HashMap<PlanApprovalId, PendingPlanApprovalRequest>,
-    hub: &EventHub,
-    message: &str,
-) {
-    for (approval_id, pending) in pending_approvals.drain() {
-        let _ = pending.reply.send(Err(message.to_owned()));
-        hub.plan_approval_cancelled(approval_id);
-    }
-}
-
-fn cancel_pending_plan_approval(
-    pending_approvals: &mut HashMap<PlanApprovalId, PendingPlanApprovalRequest>,
-    hub: &EventHub,
-    approval_id: PlanApprovalId,
-    message: &str,
-) -> bool {
-    let Some(pending) = pending_approvals.remove(&approval_id) else {
-        return false;
-    };
-    let _ = pending.reply.send(Err(message.to_owned()));
-    hub.plan_approval_cancelled(approval_id);
-    true
-}
-
-fn drain_unregistered_plan_approvals(
-    messages: &mut mpsc::UnboundedReceiver<PlanApprovalMessage>,
-    message: &str,
-) {
-    while let Ok(event) = messages.try_recv() {
-        if let PlanApprovalMessage::Request(pending) = event {
-            let _ = pending.reply.send(Err(message.to_owned()));
-        }
-    }
 }
 
 fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
@@ -1915,10 +1658,19 @@ fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
         AgentCommand::SetModel { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
         }
-        AgentCommand::SetReasoning { reply, .. } => {
+        AgentCommand::SetTitle { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
         }
-        AgentCommand::SetMode { reply, .. } => {
+        AgentCommand::SetPinned { reply, .. } => {
+            let _ = reply.send(Err("agent is closing".to_owned()));
+        }
+        AgentCommand::SnapshotForFork { reply } => {
+            let _ = reply.send(Err(AgentHandleError::Busy {
+                session_id: hub.session_id,
+                status: AgentStatus::Closing,
+            }));
+        }
+        AgentCommand::SetReasoning { reply, .. } => {
             let _ = reply.send(Err("agent is closing".to_owned()));
         }
         AgentCommand::SetCapabilityMode { reply, .. } => {
@@ -1928,14 +1680,6 @@ fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
             let _ = reply.send(Err(AgentHandleError::AskUserNotPending {
                 session_id: hub.session_id,
                 ask_id,
-            }));
-        }
-        AgentCommand::DecidePlanApproval {
-            approval_id, reply, ..
-        } => {
-            let _ = reply.send(Err(AgentHandleError::PlanApprovalNotPending {
-                session_id: hub.session_id,
-                approval_id,
             }));
         }
         AgentCommand::Shutdown { reply } => {
@@ -1967,6 +1711,48 @@ async fn apply_model(
     Ok(())
 }
 
+async fn apply_title(
+    hub: &EventHub,
+    binding: &mut Option<MetadataBinding>,
+    title: String,
+) -> Result<(), String> {
+    let title = crate::session_title::normalize_title(&title).map_err(|error| error.to_string())?;
+    let binding = binding
+        .as_mut()
+        .ok_or_else(|| "session is not initialized".to_owned())?;
+    if binding.record.title.is_some() {
+        return Ok(());
+    }
+    let mut next = binding.record.clone();
+    next.title = Some(title.clone());
+    binding
+        .store
+        .update_session(next.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    binding.record = next;
+    hub.title_changed(title);
+    Ok(())
+}
+
+async fn apply_pinned(binding: &mut Option<MetadataBinding>, pinned: bool) -> Result<(), String> {
+    let binding = binding
+        .as_mut()
+        .ok_or_else(|| "session is not initialized".to_owned())?;
+    if binding.record.pinned == pinned {
+        return Ok(());
+    }
+    let mut next = binding.record.clone();
+    next.pinned = pinned;
+    binding
+        .store
+        .update_session(next.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    binding.record = next;
+    Ok(())
+}
+
 async fn apply_reasoning(
     agent: &mut Agent,
     hub: &EventHub,
@@ -1990,38 +1776,6 @@ async fn apply_reasoning(
     Ok(())
 }
 
-async fn apply_mode(
-    agent: &mut Agent,
-    hub: &EventHub,
-    subagents: Option<&SubagentRuntime>,
-    mode: AgentMode,
-) -> Result<(), String> {
-    if let Some(subagents) = subagents
-        && mode == AgentMode::Plan
-    {
-        subagents
-            .close_exceeding_capability(CapabilityMode::ReadOnly, "parent entered plan mode")
-            .await;
-    }
-    let result = agent
-        .set_mode(mode)
-        .await
-        .map_err(|error| error.to_string());
-    let effective_mode = agent.mode();
-    if let Some(subagents) = subagents {
-        let ceiling = if effective_mode == AgentMode::Plan {
-            CapabilityMode::ReadOnly
-        } else {
-            agent.capability_mode()
-        };
-        subagents.set_capability_ceiling(ceiling);
-    }
-    if hub.current_mode() != effective_mode {
-        hub.mode_changed(effective_mode);
-    }
-    result
-}
-
 async fn apply_capability_mode(
     agent: &mut Agent,
     hub: &EventHub,
@@ -2029,13 +1783,8 @@ async fn apply_capability_mode(
     capability_mode: CapabilityMode,
 ) -> Result<(), String> {
     if let Some(subagents) = subagents {
-        let ceiling = if agent.mode() == AgentMode::Plan {
-            CapabilityMode::ReadOnly
-        } else {
-            capability_mode
-        };
         subagents
-            .close_exceeding_capability(ceiling, "parent capability mode was narrowed")
+            .close_exceeding_capability(capability_mode, "parent capability mode was narrowed")
             .await;
     }
     let result = agent
@@ -2044,12 +1793,7 @@ async fn apply_capability_mode(
         .map_err(|error| error.to_string());
     let effective = agent.capability_mode();
     if let Some(subagents) = subagents {
-        let ceiling = if agent.mode() == AgentMode::Plan {
-            CapabilityMode::ReadOnly
-        } else {
-            effective
-        };
-        subagents.set_capability_ceiling(ceiling);
+        subagents.set_capability_ceiling(effective);
     }
     if hub.current_capability_mode() != effective {
         hub.capability_mode_changed(effective);
@@ -2069,10 +1813,6 @@ struct EventHub {
 impl EventHub {
     fn current_status(&self) -> AgentStatus {
         self.state.borrow().status
-    }
-
-    fn current_mode(&self) -> AgentMode {
-        self.state.borrow().mode
     }
 
     fn current_capability_mode(&self) -> CapabilityMode {
@@ -2129,20 +1869,35 @@ impl EventHub {
         self.publish(RuntimeEventKind::SessionInitialized, |state| {
             state.initialized = true;
             state.status = AgentStatus::Idle;
+            state.title.clone_from(&record.title);
             state.profile_id.clone_from(&record.profile_id);
             state.model.clone_from(&record.model);
             state.reasoning_effort = record.reasoning_effort;
             state.config_revision = record.config_revision;
-            state.mode = agent.mode();
             state.capability_mode = agent.capability_mode();
             state.messages = agent.messages().to_vec();
+            state.display_messages = agent.session_history().messages.clone();
+            state.context_compactions = restored_context_compactions(agent);
+            state.context_compaction = state
+                .context_compactions
+                .last()
+                .cloned()
+                .or_else(|| restored_context_compaction(&state.messages));
             state.last_usage = agent.last_usage();
             state.context_usage = agent.context_usage();
             state.cumulative_usage = agent.cumulative_usage();
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
+    }
+
+    fn title_changed(&self, title: String) {
+        self.publish(
+            RuntimeEventKind::TitleChanged {
+                title: title.clone(),
+            },
+            |state| state.title = Some(title),
+        );
     }
 
     fn run_queued(&self, run_id: RunId) -> usize {
@@ -2179,7 +1934,6 @@ impl EventHub {
             state.active_run_id = Some(run_id);
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
     }
 
@@ -2208,51 +1962,12 @@ impl EventHub {
         });
     }
 
-    fn plan_approval_requested(&self, request: PlanApprovalRequest) {
-        self.publish(
-            RuntimeEventKind::PlanApprovalRequested {
-                request: request.clone(),
-            },
-            |state| state.pending_plan_approvals.push(request),
-        );
-    }
-
-    fn plan_approval_decided(&self, approval_id: PlanApprovalId, decision: PlanApprovalDecision) {
-        let approved = matches!(decision, PlanApprovalDecision::Approve { .. });
-        self.publish(
-            RuntimeEventKind::PlanApprovalDecided {
-                approval_id,
-                decision,
-            },
-            |state| {
-                state
-                    .pending_plan_approvals
-                    .retain(|request| request.approval_id != approval_id);
-                if approved {
-                    state.mode = AgentMode::Default;
-                }
-            },
-        );
-    }
-
-    fn plan_approval_cancelled(&self, approval_id: PlanApprovalId) {
-        self.publish(
-            RuntimeEventKind::PlanApprovalCancelled { approval_id },
-            |state| {
-                state
-                    .pending_plan_approvals
-                    .retain(|request| request.approval_id != approval_id);
-            },
-        );
-    }
-
     fn run_completed(&self, run_id: RunId, status: AgentStatus) {
         self.publish(RuntimeEventKind::RunCompleted { run_id }, |state| {
             state.status = status;
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
     }
 
@@ -2262,7 +1977,6 @@ impl EventHub {
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
     }
 
@@ -2272,7 +1986,6 @@ impl EventHub {
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
     }
 
@@ -2294,12 +2007,6 @@ impl EventHub {
                 state.config_revision = revision;
             },
         );
-    }
-
-    fn mode_changed(&self, mode: AgentMode) {
-        self.publish(RuntimeEventKind::ModeChanged { mode }, |state| {
-            state.mode = mode;
-        });
     }
 
     fn capability_mode_changed(&self, capability_mode: CapabilityMode) {
@@ -2324,7 +2031,6 @@ impl EventHub {
             state.status = AgentStatus::Closing;
             state.draft = None;
             state.pending_asks.clear();
-            state.pending_plan_approvals.clear();
         });
     }
 
@@ -2393,7 +2099,6 @@ impl EventHub {
                 state.queued_runs = 0;
                 state.draft = None;
                 state.pending_asks.clear();
-                state.pending_plan_approvals.clear();
             },
         );
     }
@@ -2467,36 +2172,75 @@ fn wire_agent_event(event: &AgentEvent) -> AgentEvent {
         AgentEvent::AgentStopped { .. } => AgentEvent::AgentStopped {
             messages: Vec::new(),
         },
+        AgentEvent::ContextCompactionStarted {
+            trigger, compactor, ..
+        } => AgentEvent::ContextCompactionStarted {
+            trigger: trigger.clone(),
+            compactor: compactor.clone(),
+            prompt: String::new(),
+        },
         AgentEvent::ContextCompactionCompleted {
             trigger,
             compactor,
             before_message_count,
             after_message_count,
             changed_from,
-            replacement,
-            summary,
             usage,
             estimated_context_tokens,
+            ..
         } => AgentEvent::ContextCompactionCompleted {
             trigger: trigger.clone(),
             compactor: compactor.clone(),
             before_message_count: *before_message_count,
             after_message_count: *after_message_count,
             changed_from: *changed_from,
-            replacement: replacement
-                .iter()
-                .cloned()
-                .map(|mut message| {
-                    message.provider_state = None;
-                    message
-                })
-                .collect(),
-            summary: summary.clone(),
+            replacement: Vec::new(),
+            summary: String::new(),
             usage: *usage,
             estimated_context_tokens: *estimated_context_tokens,
         },
         event => event.clone(),
     }
+}
+
+fn restored_context_compaction(messages: &[Message]) -> Option<ContextCompactionView> {
+    let boundary_index = messages
+        .windows(2)
+        .enumerate()
+        .rev()
+        .find_map(|(index, pair)| {
+            let boundary = &pair[0];
+            let summary = &pair[1];
+            (boundary.role == Role::System
+                && boundary.visibility == MessageVisibility::Internal
+                && boundary.text_content() == Some(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+                && summary.role == Role::User
+                && summary.visibility == MessageVisibility::Internal)
+                .then_some(index)
+        })?;
+    let after_message_count = boundary_index + 2;
+    Some(ContextCompactionView {
+        phase: ContextCompactionPhase::Completed,
+        history_index: after_message_count,
+        hidden_range: Some(boundary_index..after_message_count),
+        after_message_count: Some(after_message_count),
+        message: None,
+    })
+}
+
+fn restored_context_compactions(agent: &Agent) -> Vec<ContextCompactionView> {
+    agent
+        .session_history()
+        .compactions
+        .iter()
+        .map(|compaction| ContextCompactionView {
+            phase: ContextCompactionPhase::Completed,
+            history_index: compaction.history_index,
+            hidden_range: Some(compaction.changed_from..compaction.after_message_count),
+            after_message_count: Some(compaction.after_message_count),
+            message: None,
+        })
+        .collect()
 }
 
 fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
@@ -2512,13 +2256,19 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
         AgentEvent::MessageUpdate { delta } => apply_delta(state, delta),
         AgentEvent::MessageEnd { message } => {
             state.messages.push(message.clone());
+            state.display_messages.push(message.clone());
             if message.role == Role::Assistant {
                 state.draft = None;
             }
         }
         AgentEvent::MessageAborted => state.draft = None,
         AgentEvent::ToolExecutionStart { call } => {
+            // The library emits ToolExecutionStart only after its protocol
+            // journal is durable. The next active transcript index is now a
+            // safe before-tools fork boundary for snapshots and reconnects.
+            let fork_message_index = state.messages.len();
             let draft = state.draft.get_or_insert_with(AssistantDraft::default);
+            draft.fork_message_index = Some(fork_message_index);
             if !draft
                 .tool_calls
                 .iter()
@@ -2541,6 +2291,14 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
             {
                 current.clone_from(message);
             }
+            if let Some(current) = state
+                .display_messages
+                .iter_mut()
+                .rev()
+                .find(|current| current.role == Role::Assistant)
+            {
+                current.clone_from(message);
+            }
         }
         AgentEvent::UsageUpdate {
             usage,
@@ -2549,6 +2307,15 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
             state.last_usage = Some(*usage);
             state.context_usage = *context_usage;
             state.cumulative_usage += *usage;
+        }
+        AgentEvent::ContextCompactionStarted { .. } => {
+            state.context_compaction = Some(ContextCompactionView {
+                phase: ContextCompactionPhase::Started,
+                history_index: state.display_messages.len(),
+                hidden_range: None,
+                after_message_count: None,
+                message: None,
+            });
         }
         AgentEvent::ContextCompactionCompleted {
             after_message_count,
@@ -2567,14 +2334,34 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
             if let Some(usage) = usage {
                 state.cumulative_usage += *usage;
             }
+            let completed = ContextCompactionView {
+                phase: ContextCompactionPhase::Completed,
+                history_index: state.display_messages.len(),
+                hidden_range: Some(*changed_from..*after_message_count),
+                after_message_count: Some(*after_message_count),
+                message: None,
+            };
+            state.context_compactions.push(completed.clone());
+            state.context_compaction = Some(completed);
+        }
+        AgentEvent::ContextCompactionFailed { message, .. } => {
+            let history_index = state
+                .context_compaction
+                .as_ref()
+                .map_or(state.messages.len(), |compaction| compaction.history_index);
+            state.context_compaction = Some(ContextCompactionView {
+                phase: ContextCompactionPhase::Failed,
+                history_index,
+                hidden_range: None,
+                after_message_count: None,
+                message: Some(message.clone()),
+            });
         }
         AgentEvent::TurnStart { .. }
         | AgentEvent::MessageStart { .. }
         | AgentEvent::ToolExecutionProgress { .. }
         | AgentEvent::ToolExecutionEnd { .. }
         | AgentEvent::ProviderRetry { .. }
-        | AgentEvent::ContextCompactionStarted { .. }
-        | AgentEvent::ContextCompactionFailed { .. }
         | AgentEvent::Error { .. } => {}
     }
 }
@@ -2582,6 +2369,7 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
 fn apply_delta(state: &mut AgentView, delta: &AssistantDelta) {
     let draft = state.draft.get_or_insert_with(AssistantDraft::default);
     match delta {
+        AssistantDelta::Reasoning { delta } => draft.reasoning.push_str(delta),
         AssistantDelta::Text { delta } => draft.text.push_str(delta),
         AssistantDelta::ToolCall {
             index,
@@ -2663,25 +2451,6 @@ pub enum AgentHandleError {
     #[error("invalid askuser answer: {message}")]
     InvalidAskUserAnswer { message: String },
 
-    #[error("session {session_id} is not waiting for plan approval request {approval_id}")]
-    PlanApprovalNotPending {
-        session_id: SessionId,
-        approval_id: PlanApprovalId,
-    },
-
-    #[error("invalid plan approval decision: {message}")]
-    InvalidPlanApprovalDecision { message: String },
-
-    #[error(
-        "plan approval {approval_id} for session {session_id} is stale: expected revision {expected_revision}, current revision is {current_revision}"
-    )]
-    StalePlanApproval {
-        session_id: SessionId,
-        approval_id: PlanApprovalId,
-        expected_revision: u64,
-        current_revision: u64,
-    },
-
     #[error("agent operation for session {session_id} failed: {message}")]
     Operation {
         session_id: SessionId,
@@ -2699,6 +2468,7 @@ mod tests {
         let (events, _) = broadcast::channel(16);
         let (state, _) = watch::channel(AgentView {
             session_id,
+            title: None,
             profile_id: "test".to_owned(),
             agent_profile_id: crate::runtime::DEFAULT_AGENT_PROFILE_ID.to_owned(),
             agent_profile_revision: crate::runtime::DEFAULT_AGENT_PROFILE_REVISION,
@@ -2706,19 +2476,20 @@ mod tests {
             status: AgentStatus::Idle,
             active_run_id: None,
             queued_runs: 0,
-            mode: AgentMode::Default,
             capability_mode: CapabilityMode::FullAccess,
             model: "test-model".to_owned(),
             workspace: None,
             reasoning_effort: None,
             config_revision: 0,
+            display_messages: Vec::new(),
             messages: Vec::new(),
+            context_compactions: Vec::new(),
+            context_compaction: None,
             draft: None,
             last_usage: None,
             context_usage: None,
             cumulative_usage: TokenUsage::default(),
             pending_asks: Vec::new(),
-            pending_plan_approvals: Vec::new(),
             subagents: Vec::new(),
             last_event_sequence: 0,
         });
@@ -2730,6 +2501,72 @@ mod tests {
             events,
             state,
         }
+    }
+
+    #[test]
+    fn restores_the_default_internal_compaction_boundary() {
+        let messages = vec![
+            Message::system(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+                .with_visibility(MessageVisibility::Internal),
+            Message::user("private summary").with_visibility(MessageVisibility::Internal),
+            Message::user("continue"),
+        ];
+
+        assert_eq!(
+            restored_context_compaction(&messages),
+            Some(ContextCompactionView {
+                phase: ContextCompactionPhase::Completed,
+                history_index: 2,
+                hidden_range: Some(0..2),
+                after_message_count: Some(2),
+                message: None,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_replaces_active_context_but_retains_display_history() {
+        let hub = test_hub();
+        let mut state = hub.state.borrow().clone();
+        let visible = vec![
+            Message::user("old question"),
+            Message::assistant(Some(Content::text("old answer")), Vec::new()),
+        ];
+        state.messages.clone_from(&visible);
+        state.display_messages.clone_from(&visible);
+        let replacement = vec![
+            Message::system(DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE)
+                .with_visibility(MessageVisibility::Internal),
+            Message::user("private summary").with_visibility(MessageVisibility::Internal),
+        ];
+
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::ContextCompactionCompleted {
+                trigger: phi::ContextCompactionTrigger::Manual { instructions: None },
+                compactor: "default".to_owned(),
+                before_message_count: visible.len(),
+                after_message_count: replacement.len(),
+                changed_from: 0,
+                replacement: replacement.clone(),
+                summary: "must stay private".to_owned(),
+                usage: None,
+                estimated_context_tokens: 10,
+            },
+        );
+
+        assert_eq!(state.messages, replacement);
+        assert_eq!(state.display_messages, visible);
+        assert_eq!(
+            state.context_compactions,
+            vec![ContextCompactionView {
+                phase: ContextCompactionPhase::Completed,
+                history_index: 2,
+                hidden_range: Some(0..2),
+                after_message_count: Some(2),
+                message: None,
+            }]
+        );
     }
 
     fn notification_event(
@@ -2749,6 +2586,48 @@ mod tests {
                 wake_parent,
             }),
         }
+    }
+
+    #[test]
+    fn reasoning_delta_updates_the_live_assistant_draft() {
+        let hub = test_hub();
+        let mut state = hub.state.borrow().clone();
+
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::MessageStart {
+                message: Message::assistant(None, Vec::new()),
+            },
+        );
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::MessageUpdate {
+                delta: AssistantDelta::Reasoning {
+                    delta: "inspect inputs".to_owned(),
+                },
+            },
+        );
+
+        assert_eq!(
+            state.draft.as_ref().map(|draft| draft.reasoning.as_str()),
+            Some("inspect inputs")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_updates_are_persisted_through_the_actor_metadata_binding() {
+        let store = Arc::new(crate::store::MemoryControlStore::new());
+        let record = SessionRecord::new(SessionId::new(), "default", "test-model", None);
+        store.create_session(record.clone()).await.unwrap();
+        let mut binding = Some(MetadataBinding {
+            record: record.clone(),
+            store: store.clone(),
+        });
+
+        apply_pinned(&mut binding, true).await.unwrap();
+
+        assert!(binding.as_ref().unwrap().record.pinned);
+        assert!(store.get_session(record.id).await.unwrap().unwrap().pinned);
     }
 
     #[test]
@@ -2828,9 +2707,15 @@ mod tests {
         );
         assert_eq!(backlog.len(), 1);
         assert_eq!(hub.state.borrow().queued_runs, 1);
-        let AgentCommand::Prompt { content, .. } = backlog.pop_front().unwrap() else {
+        let AgentCommand::Prompt {
+            content,
+            visibility,
+            ..
+        } = backlog.pop_front().unwrap()
+        else {
             panic!("result notification must queue an internal prompt");
         };
+        assert_eq!(visibility, MessageVisibility::Internal);
         let content = content.as_text().expect("wake prompt should be text");
         assert!(content.contains("subagent_notification"));
         assert!(content.contains("agent-1"));

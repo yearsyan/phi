@@ -1,12 +1,17 @@
 import type {
   AgentProfileResponse,
   AgentProfilesResponse,
+  CreateScheduledTaskRequest,
+  ForkPosition,
   ProviderResponse,
   ProvidersResponse,
   PutAgentProfileRequest,
   PutProviderRequest,
+  ScheduledTask,
+  ScheduledTasksResponse,
   SessionSummary,
   SessionsResponse,
+  WorkspaceBrowseResponse,
 } from '../types/wire.ts';
 import { AuthError } from './token.ts';
 
@@ -36,7 +41,7 @@ async function http<T>(
     }
     throw new Error(`HTTP ${response.status}${detail}`);
   }
-  if (response.status === 204) {
+  if (response.status === 202 || response.status === 204) {
     return undefined as T;
   }
   return (await response.json()) as T;
@@ -44,6 +49,20 @@ async function http<T>(
 
 export function listSessions(authKey: string): Promise<SessionsResponse> {
   return http<SessionsResponse>('/v1/sessions', authKey, { method: 'GET' });
+}
+
+export function browseWorkspace(
+  authKey: string,
+  path?: string,
+): Promise<WorkspaceBrowseResponse> {
+  const params = new URLSearchParams();
+  if (path) params.set('path', path);
+  const query = params.size > 0 ? `?${params.toString()}` : '';
+  return http<WorkspaceBrowseResponse>(
+    `/v1/workspaces/browse${query}`,
+    authKey,
+    { method: 'GET' },
+  );
 }
 
 export function getSession(
@@ -54,6 +73,103 @@ export function getSession(
     `/v1/sessions/${encodeURIComponent(sessionId)}`,
     authKey,
     { method: 'GET' },
+  );
+}
+
+export function setSessionPinned(
+  authKey: string,
+  sessionId: string,
+  pinned: boolean,
+): Promise<SessionSummary> {
+  return http<SessionSummary>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}`,
+    authKey,
+    { method: 'PATCH', body: JSON.stringify({ pinned }) },
+  );
+}
+
+export function deleteSession(
+  authKey: string,
+  sessionId: string,
+): Promise<void> {
+  return http<void>(`/v1/sessions/${encodeURIComponent(sessionId)}`, authKey, {
+    method: 'DELETE',
+  });
+}
+
+export function listScheduledTasks(
+  authKey: string,
+): Promise<ScheduledTasksResponse> {
+  return http<ScheduledTasksResponse>('/v1/scheduled-tasks', authKey, {
+    method: 'GET',
+  });
+}
+
+export function createScheduledTask(
+  authKey: string,
+  body: CreateScheduledTaskRequest,
+): Promise<ScheduledTask> {
+  return http<ScheduledTask>('/v1/scheduled-tasks', authKey, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateScheduledTask(
+  authKey: string,
+  taskId: string,
+  enabled: boolean,
+  expectedRevision: number,
+): Promise<ScheduledTask> {
+  return http<ScheduledTask>(
+    `/v1/scheduled-tasks/${encodeURIComponent(taskId)}`,
+    authKey,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        enabled,
+        expected_revision: expectedRevision,
+      }),
+    },
+  );
+}
+
+export function runScheduledTask(
+  authKey: string,
+  taskId: string,
+): Promise<void> {
+  return http<void>(
+    `/v1/scheduled-tasks/${encodeURIComponent(taskId)}/run`,
+    authKey,
+    { method: 'POST' },
+  );
+}
+
+export function deleteScheduledTask(
+  authKey: string,
+  taskId: string,
+): Promise<void> {
+  return http<void>(
+    `/v1/scheduled-tasks/${encodeURIComponent(taskId)}`,
+    authKey,
+    { method: 'DELETE' },
+  );
+}
+
+export function forkSession(
+  authKey: string,
+  sessionId: string,
+  messageIndex: number,
+  position: ForkPosition = 'after',
+): Promise<SessionSummary> {
+  const body =
+    position === 'after'
+      ? { message_index: messageIndex }
+      : { message_index: messageIndex, position };
+  return http<SessionSummary>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/fork`,
+    authKey,
+    { method: 'POST', body: JSON.stringify(body) },
   );
 }
 
