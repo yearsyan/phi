@@ -10,12 +10,12 @@ use std::{
 
 use futures_util::FutureExt;
 use phi::{
-    Agent, AgentEvent, AgentRunControl, AgentRunOutcome, AssistantDelta, CapabilityMode, Content,
-    ContextCompactionRunOutcome, ContextUsage, DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE,
-    Message, MessageVisibility, ReasoningEffort, Role, SessionSnapshot, SessionStorage,
-    SkillCatalog, SkillDiagnostic, SkillInvocation, SkillMetadata, SubagentEvent,
-    SubagentEventKind, SubagentNotificationKind, SubagentRuntime, SubagentSnapshot, SubagentState,
-    TokenUsage, Workspace,
+    Agent, AgentEvent, AgentMailbox, AgentMailboxDelivery, AgentMailboxSender, AgentRunControl,
+    AgentRunOutcome, AssistantDelta, CapabilityMode, Content, ContextCompactionRunOutcome,
+    ContextUsage, DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE, Message, MessageVisibility,
+    ReasoningEffort, Role, SessionSnapshot, SessionStorage, SkillCatalog, SkillDiagnostic,
+    SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotificationKind,
+    SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage, Workspace,
 };
 use thiserror::Error;
 use tokio::sync::{
@@ -301,6 +301,9 @@ impl AgentHandle {
         let stored_agent_profile = agent_profile.clone();
         let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
         agent.add_mandatory_tool(ask_user_tool);
+        let (parent_mailbox, mailbox) = AgentMailbox::bounded(COMMAND_CAPACITY);
+        agent.set_mailbox(mailbox);
+        let parent_mailbox = Some(parent_mailbox);
         // Subscribe before taking the initial projection so delegation that
         // races construction is either represented by the snapshot, buffered
         // as an event, or both (the projection update is idempotent).
@@ -387,6 +390,7 @@ impl AgentHandle {
                     prompt_slots: actor_prompt_slots,
                     subagents: actor_subagents,
                     subagent_events,
+                    parent_mailbox,
                 },
             ))
             .catch_unwind()
@@ -562,7 +566,7 @@ impl AgentHandle {
         self.commands
             .try_send(AgentCommand::Prompt {
                 run_id,
-                content,
+                content: Some(content),
                 visibility: MessageVisibility::Public,
                 queue_permit,
                 admission: Some(admission),
@@ -905,7 +909,7 @@ enum AgentCommand {
     },
     Prompt {
         run_id: RunId,
-        content: Content,
+        content: Option<Content>,
         visibility: MessageVisibility,
         queue_permit: OwnedSemaphorePermit,
         admission: Option<oneshot::Sender<Result<usize, ()>>>,
@@ -957,6 +961,7 @@ struct ActorRuntime {
     prompt_slots: Arc<Semaphore>,
     subagents: Option<SubagentRuntime>,
     subagent_events: Option<broadcast::Receiver<SubagentEvent>>,
+    parent_mailbox: Option<AgentMailboxSender>,
 }
 
 async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
@@ -969,17 +974,21 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
         prompt_slots,
         subagents,
         mut subagent_events,
+        parent_mailbox,
     } = runtime;
     let mut backlog = VecDeque::new();
     let mut binding: Option<MetadataBinding> = None;
     let mut shutdown_reply = None;
     let mut closing = false;
+    let mut parent_mailbox_wake_queued = false;
+    let mut parent_mailbox_open = parent_mailbox.is_some();
 
     loop {
         let command = match backlog.pop_front() {
             Some(command) => Some(command),
             None => loop {
                 tokio::select! {
+                    biased;
                     command = commands.recv() => break command,
                     event = receive_subagent_event(&mut subagent_events) => {
                         match event {
@@ -988,6 +997,8 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 &hub,
                                 &prompt_slots,
                                 &mut backlog,
+                                parent_mailbox.as_ref(),
+                                &mut parent_mailbox_wake_queued,
                             ),
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 resync_subagents(&hub, subagents.as_ref(), skipped);
@@ -995,6 +1006,22 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                             Err(broadcast::error::RecvError::Closed) => {
                                 subagent_events = None;
                             }
+                        }
+                        if let Some(command) = backlog.pop_front() {
+                            break Some(command);
+                        }
+                    }
+                    wake = receive_parent_mailbox_wake(parent_mailbox.as_ref()),
+                        if parent_mailbox_open && !parent_mailbox_wake_queued => {
+                        if wake {
+                            enqueue_parent_mailbox_wake(
+                                &hub,
+                                &prompt_slots,
+                                &mut backlog,
+                                &mut parent_mailbox_wake_queued,
+                            );
+                        } else {
+                            parent_mailbox_open = false;
                         }
                         if let Some(command) = backlog.pop_front() {
                             break Some(command);
@@ -1030,7 +1057,24 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     .await
                 {
                     Ok(()) => {
-                        hub.initialized(&agent, &record);
+                        let restore_report = match subagents.as_ref() {
+                            Some(runtime) => {
+                                runtime
+                                    .restore_from_history(&agent.session_history().messages)
+                                    .await
+                            }
+                            None => phi::SubagentRestoreReport::default(),
+                        };
+                        hub.initialized(&agent, &record, subagents.as_ref());
+                        for failure in restore_report.failures {
+                            hub.operation_failed(
+                                "subagent_restore",
+                                format!(
+                                    "could not restore subagent {}: {}",
+                                    failure.agent_id, failure.error
+                                ),
+                            );
+                        }
                         binding = Some(MetadataBinding {
                             record,
                             store: control_store,
@@ -1078,11 +1122,20 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 }
 
                 let mut pending_asks = HashMap::new();
-                let mut run = Box::pin(agent.prompt_content_with_visibility_controlled(
-                    content,
-                    visibility,
-                    control.clone(),
-                ));
+                let mailbox_driven = content.is_none();
+                let mut run = Box::pin(async {
+                    match content {
+                        Some(content) => agent
+                            .prompt_content_with_visibility_controlled(
+                                content,
+                                visibility,
+                                control.clone(),
+                            )
+                            .await
+                            .map(Some),
+                        None => agent.prompt_from_mailbox_controlled(control.clone()).await,
+                    }
+                });
                 let result = loop {
                     tokio::select! {
                         biased;
@@ -1110,6 +1163,8 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                     &hub,
                                     &prompt_slots,
                                     &mut backlog,
+                                    parent_mailbox.as_ref(),
+                                    &mut parent_mailbox_wake_queued,
                                 ),
                                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                     resync_subagents(&hub, subagents.as_ref(), skipped);
@@ -1210,6 +1265,20 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     }
                 };
                 drop(run);
+                if mailbox_driven {
+                    parent_mailbox_wake_queued = false;
+                }
+                if parent_mailbox
+                    .as_ref()
+                    .is_some_and(|mailbox| !mailbox.is_running() && mailbox.pending_len() > 0)
+                {
+                    enqueue_parent_mailbox_wake(
+                        &hub,
+                        &prompt_slots,
+                        &mut backlog,
+                        &mut parent_mailbox_wake_queued,
+                    );
+                }
                 cancel_pending_asks(
                     &mut pending_asks,
                     &hub,
@@ -1231,13 +1300,15 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         AgentStatus::Idle
                     };
                     match result {
-                        Ok(AgentRunOutcome::Completed(_)) if stop_requested => {
+                        Ok(Some(AgentRunOutcome::Completed(_))) if stop_requested => {
                             hub.run_stopped(run_id, terminal_status)
                         }
-                        Ok(AgentRunOutcome::Completed(_)) => {
+                        Ok(Some(AgentRunOutcome::Completed(_))) | Ok(None) => {
                             hub.run_completed(run_id, terminal_status)
                         }
-                        Ok(AgentRunOutcome::Stopped) => hub.run_stopped(run_id, terminal_status),
+                        Ok(Some(AgentRunOutcome::Stopped)) => {
+                            hub.run_stopped(run_id, terminal_status)
+                        }
                         Err(error) => hub.run_failed(run_id, error.to_string(), terminal_status),
                     }
                     *active = None;
@@ -1426,11 +1497,20 @@ async fn receive_subagent_event(
     }
 }
 
+async fn receive_parent_mailbox_wake(mailbox: Option<&AgentMailboxSender>) -> bool {
+    match mailbox {
+        Some(mailbox) => mailbox.wait_for_wake().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn handle_subagent_event(
     event: SubagentEvent,
     hub: &EventHub,
     prompt_slots: &Arc<Semaphore>,
     backlog: &mut VecDeque<AgentCommand>,
+    parent_mailbox: Option<&AgentMailboxSender>,
+    parent_mailbox_wake_queued: &mut bool,
 ) {
     let wake_content = subagent_wake_content(&event);
     if matches!(&event.kind, SubagentEventKind::AgentEvent(_)) {
@@ -1445,6 +1525,61 @@ fn handle_subagent_event(
         hub.current_status(),
         AgentStatus::Closing | AgentStatus::Closed
     ) {
+        return;
+    }
+    let content = match parent_mailbox {
+        Some(mailbox) => match mailbox.send_with_visibility(content, MessageVisibility::Internal) {
+            Ok(AgentMailboxDelivery::Queued) => return,
+            Ok(AgentMailboxDelivery::WakeRequired) => {
+                enqueue_parent_mailbox_wake(hub, prompt_slots, backlog, parent_mailbox_wake_queued);
+                return;
+            }
+            Err(error) => {
+                hub.operation_failed(
+                    "subagent_notification",
+                    format!("subagent notification could not reach parent mailbox: {error}"),
+                );
+                return;
+            }
+        },
+        None => Some(content),
+    };
+    let queue_permit = match Arc::clone(prompt_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            hub.operation_failed(
+                "agent_notification",
+                format!(
+                    "Agent notification could not wake the session because the prompt queue is full (capacity {COMMAND_CAPACITY})"
+                ),
+            );
+            return;
+        }
+        Err(TryAcquireError::Closed) => return,
+    };
+    let run_id = RunId::new();
+    hub.run_queued(run_id);
+    backlog.push_back(AgentCommand::Prompt {
+        run_id,
+        content,
+        visibility: MessageVisibility::Internal,
+        queue_permit,
+        admission: None,
+    });
+}
+
+fn enqueue_parent_mailbox_wake(
+    hub: &EventHub,
+    prompt_slots: &Arc<Semaphore>,
+    backlog: &mut VecDeque<AgentCommand>,
+    parent_mailbox_wake_queued: &mut bool,
+) {
+    if *parent_mailbox_wake_queued
+        || matches!(
+            hub.current_status(),
+            AgentStatus::Closing | AgentStatus::Closed
+        )
+    {
         return;
     }
     let queue_permit = match Arc::clone(prompt_slots).try_acquire_owned() {
@@ -1464,11 +1599,12 @@ fn handle_subagent_event(
     hub.run_queued(run_id);
     backlog.push_back(AgentCommand::Prompt {
         run_id,
-        content,
+        content: None,
         visibility: MessageVisibility::Internal,
         queue_permit,
         admission: None,
     });
+    *parent_mailbox_wake_queued = true;
 }
 
 fn resync_subagents(hub: &EventHub, runtime: Option<&SubagentRuntime>, skipped: u64) {
@@ -1865,7 +2001,12 @@ impl EventHub {
         });
     }
 
-    fn initialized(&self, agent: &Agent, record: &SessionRecord) {
+    fn initialized(
+        &self,
+        agent: &Agent,
+        record: &SessionRecord,
+        subagents: Option<&SubagentRuntime>,
+    ) {
         self.publish(RuntimeEventKind::SessionInitialized, |state| {
             state.initialized = true;
             state.status = AgentStatus::Idle;
@@ -1888,6 +2029,12 @@ impl EventHub {
             state.cumulative_usage = agent.cumulative_usage();
             state.draft = None;
             state.pending_asks.clear();
+            state.subagents = subagents
+                .map(SubagentRuntime::snapshots)
+                .unwrap_or_default()
+                .iter()
+                .map(subagent_summary)
+                .collect();
         });
     }
 
@@ -2647,6 +2794,7 @@ mod tests {
                     generation_config: phi::GenerationConfig::default(),
                     output_contract: phi::SubagentOutputContract::Text,
                     isolation: phi::SubagentIsolation::Shared,
+                    run_in_background: true,
                 },
             },
         });
@@ -2676,12 +2824,15 @@ mod tests {
         let mut events = hub.events.subscribe();
         let prompt_slots = Arc::new(Semaphore::new(2));
         let mut backlog = VecDeque::new();
+        let mut mailbox_wake_queued = false;
 
         handle_subagent_event(
             notification_event(1, SubagentNotificationKind::Progress, false),
             &hub,
             &prompt_slots,
             &mut backlog,
+            None,
+            &mut mailbox_wake_queued,
         );
         assert!(backlog.is_empty());
         assert_eq!(hub.state.borrow().queued_runs, 0);
@@ -2704,6 +2855,8 @@ mod tests {
             &hub,
             &prompt_slots,
             &mut backlog,
+            None,
+            &mut mailbox_wake_queued,
         );
         assert_eq!(backlog.len(), 1);
         assert_eq!(hub.state.borrow().queued_runs, 1);
@@ -2716,7 +2869,10 @@ mod tests {
             panic!("result notification must queue an internal prompt");
         };
         assert_eq!(visibility, MessageVisibility::Internal);
-        let content = content.as_text().expect("wake prompt should be text");
+        let content = content
+            .as_ref()
+            .and_then(Content::as_text)
+            .expect("wake prompt should be text");
         assert!(content.contains("subagent_notification"));
         assert!(content.contains("agent-1"));
         assert!(content.contains("result"));
@@ -2728,6 +2884,7 @@ mod tests {
         let mut events = hub.events.subscribe();
         let prompt_slots = Arc::new(Semaphore::new(1));
         let mut backlog = VecDeque::new();
+        let mut mailbox_wake_queued = false;
         handle_subagent_event(
             SubagentEvent {
                 sequence: 7,
@@ -2738,6 +2895,8 @@ mod tests {
             &hub,
             &prompt_slots,
             &mut backlog,
+            None,
+            &mut mailbox_wake_queued,
         );
 
         assert!(matches!(

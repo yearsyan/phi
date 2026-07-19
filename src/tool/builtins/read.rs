@@ -13,7 +13,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use super::{
-    common::{invalid_arguments, io_error, normalize_cwd, resolve_path_for_context},
+    common::{
+        invalid_arguments, io_error, normalize_cwd, resolve_path_for_context_with_internal_roots,
+    },
     truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, truncate_head},
 };
 use crate::{
@@ -40,6 +42,7 @@ pub struct ReadTool {
     max_image_bytes: usize,
     max_pdf_bytes: usize,
     max_notebook_bytes: usize,
+    internal_read_roots: Vec<PathBuf>,
     cache: Arc<Mutex<ReadCache>>,
 }
 
@@ -52,6 +55,7 @@ impl ReadTool {
             max_image_bytes: DEFAULT_IMAGE_MAX_BYTES,
             max_pdf_bytes: DEFAULT_PDF_MAX_BYTES,
             max_notebook_bytes: DEFAULT_NOTEBOOK_MAX_BYTES,
+            internal_read_roots: Vec::new(),
             cache: Arc::new(Mutex::new(ReadCache::default())),
         }
     }
@@ -78,6 +82,11 @@ impl ReadTool {
     /// Sets the largest notebook JSON document accepted by this tool.
     pub fn notebook_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_notebook_bytes = max_bytes.max(1);
+        self
+    }
+
+    pub(crate) fn with_internal_read_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.internal_read_roots.push(root.into());
         self
     }
 }
@@ -207,7 +216,7 @@ impl Tool for ReadTool {
         ToolDefinition::new(
             "read",
             format!(
-                "Read a regular file as UTF-8 text, a PNG/JPEG/GIF/WebP image, a PDF, or a Jupyter notebook. Text BOMs are hidden and CRLF/CR line endings are displayed as LF. Notebook ranges use cells; text ranges use lines. Text/notebook output is truncated to {} lines or {} bytes. Image/PDF signatures are verified before provider-neutral content blocks are returned. Use offset and limit for large text files and notebooks. FIFOs, devices, malformed media, and unsupported binary data are rejected.",
+                "Read the contents of exactly one regular file. Do not pass a directory: this tool never lists directory entries. To inspect a directory or discover files, use a directory-listing or file-search tool instead, or use bash with `ls`, `find`, or `rg --files` when bash is available. Supported files are UTF-8 text, PNG/JPEG/GIF/WebP images, PDFs, and Jupyter notebooks. Text BOMs are hidden and CRLF/CR line endings are displayed as LF. Notebook ranges use cells; text ranges use lines. Text/notebook output is truncated to {} lines or {} bytes. Image/PDF signatures are verified before provider-neutral content blocks are returned. Use offset and limit for large text files and notebooks. FIFOs, devices, malformed media, and unsupported binary data are rejected.",
                 self.max_lines, self.max_bytes,
             ),
             json!({
@@ -215,7 +224,7 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to read (relative to the configured working directory or absolute)"
+                        "description": "Path to exactly one regular file (relative to the configured working directory or absolute); must not be a directory"
                     },
                     "offset": {
                         "type": "integer",
@@ -263,7 +272,13 @@ impl ReadTool {
             return Err(ToolError::new("read limit must be at least 1"));
         }
 
-        let requested_path = resolve_path_for_context(&self.cwd, &arguments.path, context).await?;
+        let requested_path = resolve_path_for_context_with_internal_roots(
+            &self.cwd,
+            &arguments.path,
+            context,
+            &self.internal_read_roots,
+        )
+        .await?;
         let metadata = match tokio::fs::metadata(&requested_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -271,6 +286,12 @@ impl ReadTool {
             }
             Err(error) => return Err(io_error("could not inspect", &requested_path, error)),
         };
+        if metadata.is_dir() {
+            return Err(ToolError::new(format!(
+                "could not read {}: path is a directory; read accepts exactly one regular file and cannot list directory entries. Use a directory-listing or file-search tool instead, or use bash with `ls`, `find`, or `rg --files` when bash is available",
+                requested_path.display()
+            )));
+        }
         if !metadata.is_file() {
             return Err(ToolError::new(format!(
                 "could not read {}: path is not a regular file",
@@ -1503,6 +1524,25 @@ mod tests {
     use super::*;
     use crate::tool::ToolCancellation;
 
+    #[test]
+    fn definition_explicitly_excludes_directories_and_routes_discovery() {
+        let definition = ReadTool::new("/workspace").definition();
+
+        assert!(
+            definition
+                .description
+                .starts_with("Read the contents of exactly one regular file.")
+        );
+        assert!(definition.description.contains("Do not pass a directory"));
+        assert!(definition.description.contains("`rg --files`"));
+        assert!(
+            definition.parameters["properties"]["path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("must not be a directory")
+        );
+    }
+
     #[tokio::test]
     async fn reads_ranges_and_reports_continuation() {
         let directory = tempdir().unwrap();
@@ -1594,6 +1634,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.content, "[File is empty.]");
+    }
+
+    #[tokio::test]
+    async fn directory_error_routes_to_a_directory_listing_tool() {
+        let directory = tempdir().unwrap();
+        tokio::fs::create_dir(directory.path().join("src"))
+            .await
+            .unwrap();
+
+        let error = ReadTool::new(directory.path())
+            .execute(json!({ "path": "src" }))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("path is a directory"));
+        assert!(message.contains("cannot list directory entries"));
+        assert!(message.contains("`ls`"));
+        assert!(message.contains("`rg --files`"));
     }
 
     #[tokio::test]

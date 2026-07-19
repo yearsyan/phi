@@ -24,9 +24,14 @@ pub fn classify_bash_arguments_concurrency(arguments: &Value) -> bool {
     let Some(object) = arguments.as_object() else {
         return false;
     };
+    if object.keys().any(|key| {
+        key != "command" && key != "description" && key != "timeout" && key != "run_in_background"
+    }) {
+        return false;
+    }
     if object
-        .keys()
-        .any(|key| key != "command" && key != "timeout" && key != "run_in_background")
+        .get("description")
+        .is_some_and(|value| !value.is_string())
     {
         return false;
     }
@@ -453,9 +458,11 @@ mod tests {
 
     #[test]
     fn validates_the_bash_argument_shape() {
-        assert!(classify_bash_arguments_concurrency(
-            &json!({ "command": "git status", "timeout": 1.5 })
-        ));
+        assert!(classify_bash_arguments_concurrency(&json!({
+            "command": "git status",
+            "description": "Show working tree status",
+            "timeout": 1.5
+        })));
         assert!(classify_bash_arguments_concurrency(&json!({
             "command": "git status",
             "run_in_background": false

@@ -55,12 +55,13 @@ pub use subagent::{
     ConfiguredSubagentBuildRequest, DEFAULT_MAX_SUBAGENT_MESSAGE_BYTES, DEFAULT_MAX_SUBAGENTS,
     DEFAULT_SUBAGENT_EVENT_CAPACITY, DEFAULT_SUBAGENT_MAILBOX_CAPACITY, EffectiveSubagentConfig,
     MAX_SUBAGENT_OUTPUT_FIELD_BYTES, MAX_SUBAGENT_OUTPUT_FIELDS, QueuedSubagentMessage,
-    SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest, SubagentConfig, SubagentError,
-    SubagentEvent, SubagentEventKind, SubagentFactory, SubagentFactoryError, SubagentIsolation,
-    SubagentNotification, SubagentNotificationKind, SubagentNotificationSource,
+    SpawnAgentRequest, SpawnedSubagent, SubagentBuildRequest, SubagentCompletion, SubagentConfig,
+    SubagentError, SubagentEvent, SubagentEventKind, SubagentFactory, SubagentFactoryError,
+    SubagentIsolation, SubagentNotification, SubagentNotificationKind, SubagentNotificationSource,
     SubagentOutputContract, SubagentResource, SubagentResourceDisposition,
-    SubagentResourceFinalization, SubagentResourceInfo, SubagentRunOutcome, SubagentRuntime,
-    SubagentSnapshot, SubagentState, SubagentType, ValidatedSubagentOutput,
+    SubagentResourceFinalization, SubagentResourceInfo, SubagentRestoreFailure,
+    SubagentRestoreReport, SubagentRunOutcome, SubagentRuntime, SubagentSnapshot, SubagentState,
+    SubagentType, ValidatedSubagentOutput,
 };
 pub use tool::builtins::{
     BashTool, BuiltinTools, DEFAULT_BASH_TIMEOUT, DEFAULT_MAX_BYTES, DEFAULT_MAX_EDIT_BYTES,

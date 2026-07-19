@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Barrier,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -14,9 +14,10 @@ use futures_util::{StreamExt, stream};
 use phi::{
     Agent, AgentEvent, AssistantDelta, AssistantMessage, CapabilityMode, Content,
     ContextCompactionError, ContextCompactionPlan, ContextCompactionRequest, ContextCompactor,
-    InMemorySessionStorage, LlmProvider, Message, ProviderError, ProviderEvent,
+    InMemorySessionStorage, LlmProvider, Message, MessageVisibility, ProviderError, ProviderEvent,
     ProviderEventStream, ProviderRequest, ProviderResponse, Role, SessionSnapshot, SessionStorage,
-    SkillCatalog, TokenUsage, Tool, ToolCall, ToolDefinition, ToolError, ToolOutput, Workspace,
+    SkillCatalog, TokenUsage, Tool, ToolCall, ToolDefinition, ToolEffect, ToolError,
+    ToolExecutionContext, ToolOutput, Workspace,
 };
 use phi_daemon::{
     api::AppState,
@@ -106,7 +107,13 @@ enum ProviderScript {
     AskUser,
     ToolCall,
     PanickingToolCall,
+    BackgroundNotification {
+        observed: Arc<AtomicBool>,
+    },
     Subagent,
+    SubagentSafeBoundary {
+        observed_in_parent_turn: Arc<AtomicBool>,
+    },
 }
 
 #[derive(Clone)]
@@ -238,6 +245,35 @@ impl LlmProvider for ScriptedProvider {
                     usage: None,
                 }))]))
             }
+            ProviderScript::BackgroundNotification { observed } => {
+                let notification_seen = request.messages.iter().any(|message| {
+                    message.role == Role::User
+                        && message.visibility == MessageVisibility::Internal
+                        && message
+                            .text_content()
+                            .is_some_and(|text| text.contains("<task_notification>"))
+                });
+                if notification_seen {
+                    observed.store(true, Ordering::SeqCst);
+                    return immediate_stream(call);
+                }
+                let started = request.messages.iter().any(|message| {
+                    message.role == Role::Tool
+                        && message.tool_call_id.as_deref() == Some("delayed-notification-call")
+                });
+                if started {
+                    immediate_stream(call)
+                } else {
+                    Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                        message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                            "delayed-notification-call",
+                            "delayed_notification",
+                            json!({}),
+                        )]),
+                        usage: None,
+                    }))]))
+                }
+            }
             ProviderScript::Subagent => {
                 let is_parent = request.tools.iter().any(|tool| tool.name == "spawn_agent");
                 if is_parent {
@@ -261,7 +297,8 @@ impl LlmProvider for ScriptedProvider {
                                 "spawn_agent",
                                 json!({
                                     "description": "observer test child",
-                                    "prompt": "report status and finish"
+                                    "prompt": "report status and finish",
+                                    "run_in_background": true
                                 }),
                             )]),
                             usage: None,
@@ -298,6 +335,59 @@ impl LlmProvider for ScriptedProvider {
                         }))]))
                     }
                 }
+            }
+            ProviderScript::SubagentSafeBoundary {
+                observed_in_parent_turn,
+            } => {
+                let is_parent = request.tools.iter().any(|tool| tool.name == "spawn_agent");
+                if !is_parent {
+                    return immediate_stream(call);
+                }
+                let spawned = request.messages.iter().any(|message| {
+                    message.role == Role::Tool
+                        && message.tool_call_id.as_deref() == Some("spawn-boundary-child")
+                });
+                if !spawned {
+                    return Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                        message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                            "spawn-boundary-child",
+                            "spawn_agent",
+                            json!({
+                                "description": "safe-boundary child",
+                                "prompt": "finish immediately",
+                                "run_in_background": true
+                            }),
+                        )]),
+                        usage: None,
+                    }))]));
+                }
+                let notification_seen = request.messages.iter().any(|message| {
+                    message.role == Role::User
+                        && message.visibility == MessageVisibility::Internal
+                        && message
+                            .text_content()
+                            .is_some_and(|text| text.contains("<subagent_notification>"))
+                });
+                if notification_seen {
+                    observed_in_parent_turn.store(true, Ordering::SeqCst);
+                    return immediate_stream(call);
+                }
+                let waited = request.messages.iter().any(|message| {
+                    message.role == Role::Tool
+                        && message.tool_call_id.as_deref() == Some("boundary-wait")
+                });
+                assert!(
+                    !waited,
+                    "notification missed the next protocol-safe boundary"
+                );
+                Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "boundary-wait",
+                        "blocking_tool",
+                        json!({}),
+                    )]),
+                    usage: None,
+                }))]))
             }
             ProviderScript::Immediate
             | ProviderScript::PauseAtAgentEnd { .. }
@@ -346,6 +436,45 @@ impl Tool for BlockingTool {
         self.started.notify_one();
         self.release.notified().await;
         Ok(ToolOutput::success("tool completed"))
+    }
+}
+
+#[derive(Clone)]
+struct DelayedNotificationTool {
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for DelayedNotificationTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "delayed_notification",
+            "Schedules a deterministic test notification",
+            json!({ "type": "object" }),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Internal
+    }
+
+    async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::new("test tool requires execution context"))
+    }
+
+    async fn execute_with_context(
+        &self,
+        _arguments: serde_json::Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let release = Arc::clone(&self.release);
+        tokio::spawn(async move {
+            release.notified().await;
+            let _ = context.notify_agent(
+                "<task_notification>\n<task_id>test-task</task_id>\n<status>completed</status>\n</task_notification>",
+            );
+        });
+        Ok(ToolOutput::success("notification scheduled"))
     }
 }
 
@@ -413,6 +542,7 @@ struct TestFactory {
     provider_calls: Arc<AtomicUsize>,
     builds: Arc<AtomicUsize>,
     tool: Option<BlockingTool>,
+    notification_tool_release: Option<Arc<Notify>>,
     context_compactor: Option<Arc<dyn ContextCompactor>>,
     default_workspace: Option<Workspace>,
 }
@@ -424,6 +554,7 @@ impl TestFactory {
             provider_calls: Arc::new(AtomicUsize::new(0)),
             builds: Arc::new(AtomicUsize::new(0)),
             tool: None,
+            notification_tool_release: None,
             context_compactor: None,
             default_workspace: None,
         }
@@ -431,6 +562,11 @@ impl TestFactory {
 
     fn with_tool(mut self, tool: BlockingTool) -> Self {
         self.tool = Some(tool);
+        self
+    }
+
+    fn with_notification_tool(mut self, release: Arc<Notify>) -> Self {
+        self.notification_tool_release = Some(release);
         self
     }
 
@@ -491,6 +627,11 @@ impl AgentFactory for TestFactory {
         }
         if let Some(tool) = self.tool.clone() {
             builder = builder.tool(tool);
+        }
+        if let Some(release) = &self.notification_tool_release {
+            builder = builder.tool(DelayedNotificationTool {
+                release: Arc::clone(release),
+            });
         }
         if let Some(compactor) = &self.context_compactor {
             builder = builder.shared_context_compactor(Arc::clone(compactor));
@@ -1960,6 +2101,232 @@ async fn receive_command_response(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for command response {request_id}"))
+}
+
+#[tokio::test]
+async fn background_tool_notification_wakes_an_idle_agent_without_subagents() {
+    let notification_release = Arc::new(Notify::new());
+    let observed = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(
+        TestFactory::new(ProviderScript::BackgroundNotification {
+            observed: Arc::clone(&observed),
+        })
+        .with_notification_tool(Arc::clone(&notification_release)),
+    );
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        Arc::clone(&factory),
+    );
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    assert!(handle.subagents().is_none());
+    let mut events = handle.subscribe();
+    let queued = handle
+        .enqueue_prompt(Content::text("schedule a background notification"))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_run_completed(&mut events, queued.run_id),
+    )
+    .await
+    .expect("the originating run did not complete");
+    assert!(!observed.load(Ordering::SeqCst));
+    assert_eq!(factory.provider_calls.load(Ordering::SeqCst), 2);
+
+    // Release the background work only after the actor is idle. The generic
+    // Agent mailbox must wake the daemon even though subagents are disabled.
+    notification_release.notify_one();
+    let mailbox_run_id = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut started = None;
+        loop {
+            let event = events.recv().await.expect("runtime event channel closed");
+            match event.kind {
+                RuntimeEventKind::RunStarted { run_id } if run_id != queued.run_id => {
+                    started = Some(run_id);
+                }
+                RuntimeEventKind::RunCompleted { run_id } if run_id != queued.run_id => {
+                    assert_eq!(started, Some(run_id));
+                    break run_id;
+                }
+                RuntimeEventKind::RunFailed { run_id, message } if run_id != queued.run_id => {
+                    panic!("mailbox-driven run failed: {message}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the background notification did not wake the idle actor");
+
+    assert_ne!(mailbox_run_id, queued.run_id);
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(factory.provider_calls.load(Ordering::SeqCst), 3);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn background_subagent_result_joins_the_active_parent_turn_at_a_safe_boundary() {
+    let blocking_started = Arc::new(Notify::new());
+    let blocking_release = Arc::new(Notify::new());
+    let observed_in_parent_turn = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(
+        TestFactory::new(ProviderScript::SubagentSafeBoundary {
+            observed_in_parent_turn: Arc::clone(&observed_in_parent_turn),
+        })
+        .with_tool(BlockingTool {
+            started: Arc::clone(&blocking_started),
+            release: Arc::clone(&blocking_release),
+        }),
+    );
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        factory,
+    )
+    .with_subagents_enabled(true);
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let mut events = handle.subscribe();
+    let queued = handle
+        .enqueue_prompt(Content::text("delegate in background"))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), blocking_started.notified())
+        .await
+        .expect("parent did not enter the boundary tool");
+    let mut run_starts = 0;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            match event.kind {
+                RuntimeEventKind::RunStarted { .. } => run_starts += 1,
+                RuntimeEventKind::Subagent(phi::SubagentEvent {
+                    kind:
+                        phi::SubagentEventKind::Notification(phi::SubagentNotification {
+                            kind: phi::SubagentNotificationKind::Result,
+                            wake_parent: true,
+                            ..
+                        }),
+                    ..
+                }) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("background child did not publish its terminal notification");
+    blocking_release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            match event.kind {
+                RuntimeEventKind::RunStarted { .. } => run_starts += 1,
+                RuntimeEventKind::RunCompleted { run_id } if run_id == queued.run_id => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("parent run did not complete after receiving child result");
+    assert!(observed_in_parent_turn.load(Ordering::SeqCst));
+    assert_eq!(
+        run_starts, 1,
+        "notification must not start a second parent run"
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stopped_parent_run_requeues_an_unconsumed_background_result() {
+    let blocking_started = Arc::new(Notify::new());
+    let blocking_release = Arc::new(Notify::new());
+    let observed_after_stop = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(
+        TestFactory::new(ProviderScript::SubagentSafeBoundary {
+            observed_in_parent_turn: Arc::clone(&observed_after_stop),
+        })
+        .with_tool(BlockingTool {
+            started: Arc::clone(&blocking_started),
+            release: Arc::clone(&blocking_release),
+        }),
+    );
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        factory,
+    )
+    .with_subagents_enabled(true);
+    let prepared = service.prepare_session(PROFILE).await.unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let mut events = handle.subscribe();
+    let queued = handle
+        .enqueue_prompt(Content::text("stop after the child finishes"))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), blocking_started.notified())
+        .await
+        .expect("parent did not enter the boundary tool");
+    let mut run_starts = 0;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            match event.kind {
+                RuntimeEventKind::RunStarted { .. } => run_starts += 1,
+                RuntimeEventKind::Subagent(phi::SubagentEvent {
+                    kind:
+                        phi::SubagentEventKind::Notification(phi::SubagentNotification {
+                            kind: phi::SubagentNotificationKind::Result,
+                            wake_parent: true,
+                            ..
+                        }),
+                    ..
+                }) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("background child did not finish before the stop");
+
+    handle.stop(queued.run_id).unwrap();
+    blocking_release.notify_one();
+    let mut original_stopped = false;
+    let mut mailbox_run_completed = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !original_stopped || !mailbox_run_completed {
+            let event = events.recv().await.unwrap();
+            match event.kind {
+                RuntimeEventKind::RunStarted { .. } => run_starts += 1,
+                RuntimeEventKind::RunStopped { run_id } if run_id == queued.run_id => {
+                    original_stopped = true;
+                }
+                RuntimeEventKind::RunCompleted { run_id } if run_id != queued.run_id => {
+                    mailbox_run_completed = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("pending child result did not wake a replacement parent run");
+
+    assert!(observed_after_stop.load(Ordering::SeqCst));
+    assert_eq!(
+        run_starts, 2,
+        "exactly one mailbox-driven run must be added"
+    );
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]

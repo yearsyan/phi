@@ -1,5 +1,7 @@
 //! Model-facing tools for [`crate::subagent::SubagentRuntime`].
 
+use std::time::Instant;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -9,9 +11,9 @@ use crate::{
     subagent::{
         ConfiguredSpawnAgentRequest, MAX_SUBAGENT_OUTPUT_FIELD_BYTES, MAX_SUBAGENT_OUTPUT_FIELDS,
         SubagentIsolation, SubagentNotificationKind, SubagentNotificationSource,
-        SubagentOutputContract, SubagentRuntime, SubagentType,
+        SubagentOutputContract, SubagentRunOutcome, SubagentRuntime, SubagentType,
     },
-    tool::{CapabilityMode, Tool, ToolConcurrency, ToolEffect, ToolOutput},
+    tool::{CapabilityMode, Tool, ToolConcurrency, ToolEffect, ToolExecutionContext, ToolOutput},
     types::{GenerationConfig, ReasoningEffort, ToolDefinition},
 };
 
@@ -70,6 +72,141 @@ struct SpawnAgentInput {
     output_contract: Option<SubagentOutputContract>,
     #[serde(default)]
     isolation: Option<SubagentIsolation>,
+    #[serde(default)]
+    run_in_background: bool,
+}
+
+impl SpawnAgentTool {
+    async fn execute_spawn(
+        &self,
+        arguments: Value,
+        context: Option<ToolExecutionContext>,
+    ) -> Result<ToolOutput, ToolError> {
+        let input: SpawnAgentInput = parse(arguments, SPAWN_AGENT_TOOL_NAME)?;
+        let generation_config =
+            (input.model.is_some() || input.reasoning_effort.is_some()).then(|| GenerationConfig {
+                model: input.model,
+                reasoning_effort: input.reasoning_effort,
+                ..GenerationConfig::default()
+            });
+        let description = input.description;
+        let run_in_background = input.run_in_background;
+        let started_at = Instant::now();
+        let spawned = self
+            .runtime
+            .spawn_configured(ConfiguredSpawnAgentRequest {
+                description: description.clone(),
+                prompt: input.prompt,
+                agent_type: input.subagent_type,
+                capability_mode: input.capability_mode,
+                generation_config,
+                output_contract: input.output_contract,
+                isolation: input.isolation,
+                run_in_background,
+            })
+            .await
+            .map_err(|error| ToolError::new(error.to_string()))?;
+
+        if run_in_background {
+            return Ok(ToolOutput::success(format!(
+                "Agent launched successfully.\nagent_id: {}\nThe task is running in the background; its terminal notification will be delivered automatically.",
+                spawned.agent_id
+            ))
+            .with_metadata(json!({
+                "subagent_tool": SPAWN_AGENT_TOOL_NAME,
+                "version": 1,
+                "parent_id": self.runtime.parent_id(),
+                "agent_id": spawned.agent_id,
+                "delivery_id": spawned.delivery_id,
+                "description": description,
+                "status": "async_launched",
+                "effective_config": spawned.effective_config,
+            })));
+        }
+
+        let completion = match context {
+            Some(context) => {
+                tokio::select! {
+                    result = self.runtime.wait_for_completion(
+                        &spawned.agent_id,
+                        &spawned.delivery_id,
+                    ) => result,
+                    _ = context.cancelled() => {
+                        let _ = self.runtime.close(
+                            &spawned.agent_id,
+                            "foreground subagent cancelled with parent tool call",
+                        ).await;
+                        return Err(ToolError::new("foreground subagent execution was cancelled"));
+                    }
+                }
+            }
+            None => {
+                self.runtime
+                    .wait_for_completion(&spawned.agent_id, &spawned.delivery_id)
+                    .await
+            }
+        }
+        .map_err(|error| ToolError::new(error.to_string()))?;
+
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_tool_uses = self
+            .runtime
+            .snapshot(&spawned.agent_id)
+            .map(|snapshot| {
+                snapshot
+                    .messages
+                    .iter()
+                    .map(|message| message.tool_calls.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+
+        let metadata = json!({
+            "subagent_tool": SPAWN_AGENT_TOOL_NAME,
+            "version": 1,
+            "parent_id": self.runtime.parent_id(),
+            "agent_id": completion.agent_id,
+            "delivery_id": completion.delivery_id,
+            "description": description,
+            "status": match &completion.outcome {
+                SubagentRunOutcome::Completed { .. } => "completed",
+                SubagentRunOutcome::Stopped => "stopped",
+                SubagentRunOutcome::Failed { .. } => "failed",
+            },
+            "effective_config": &spawned.effective_config,
+            "validated_output": &completion.validated_output,
+            "outcome": &completion.outcome,
+            "total_tool_uses": total_tool_uses,
+            "duration_ms": duration_ms,
+        });
+        Ok(match completion.outcome {
+            SubagentRunOutcome::Completed { text, usage, .. } => {
+                let text = if text.is_empty() {
+                    "(Subagent completed but returned no output.)".to_owned()
+                } else {
+                    text
+                };
+                let content = if matches!(
+                    spawned.effective_config.agent_type,
+                    SubagentType::Explore | SubagentType::Plan
+                ) {
+                    text
+                } else {
+                    format!(
+                        "{text}\n\nagent_id: {} (use send_agent_message with this ID to continue the agent)\n<usage>total_tokens: {}\ntool_uses: {total_tool_uses}\nduration_ms: {duration_ms}</usage>",
+                        spawned.agent_id, usage.total_tokens,
+                    )
+                };
+                ToolOutput::success(content).with_metadata(metadata)
+            }
+            SubagentRunOutcome::Stopped => {
+                ToolOutput::error("Subagent stopped.").with_metadata(metadata)
+            }
+            SubagentRunOutcome::Failed { error } => {
+                ToolOutput::error(format!("Subagent failed: {error}")).with_metadata(metadata)
+            }
+        })
+    }
 }
 
 #[async_trait]
@@ -77,7 +214,7 @@ impl Tool for SpawnAgentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             SPAWN_AGENT_TOOL_NAME,
-            "Start a configured child agent for an independent, self-contained task. Returns immediately with a stable agent_id. explore and plan are read-only roles; capability_mode can further restrict but never widen a role or the parent runtime ceiling. worktree isolation requires host support and never silently falls back to a shared workspace. The child persists after its first result so you may send follow-up messages; close it explicitly when no longer needed.",
+            "Run a configured child agent for an independent, self-contained task. By default this waits and returns the child's final result. Set run_in_background=true to return immediately with a stable agent_id; a terminal notification will be delivered automatically. explore and plan are read-only, one-shot roles; capability_mode can further restrict but never widen a role or the parent runtime ceiling. Completed general children release their live runtime resources and can later be resumed by agent_id from their sidechain transcript.",
             json!({
                 "type": "object",
                 "properties": {
@@ -140,6 +277,11 @@ impl Tool for SpawnAgentTool {
                         "type": "string",
                         "enum": ["shared", "worktree"],
                         "default": "shared"
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Return immediately and deliver the terminal result asynchronously"
                     }
                 },
                 "required": ["description", "prompt"],
@@ -178,40 +320,19 @@ impl Tool for SpawnAgentTool {
     }
 
     fn concurrency(&self, _arguments: &Value) -> ToolConcurrency {
-        ToolConcurrency::Exclusive
+        ToolConcurrency::Safe
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, ToolError> {
-        let input: SpawnAgentInput = parse(arguments, SPAWN_AGENT_TOOL_NAME)?;
-        let generation_config =
-            (input.model.is_some() || input.reasoning_effort.is_some()).then(|| GenerationConfig {
-                model: input.model,
-                reasoning_effort: input.reasoning_effort,
-                ..GenerationConfig::default()
-            });
-        let spawned = self
-            .runtime
-            .spawn_configured(ConfiguredSpawnAgentRequest {
-                description: input.description,
-                prompt: input.prompt,
-                agent_type: input.subagent_type,
-                capability_mode: input.capability_mode,
-                generation_config,
-                output_contract: input.output_contract,
-                isolation: input.isolation,
-            })
-            .await
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        Ok(ToolOutput::success(format!(
-            "Started subagent {} (delivery {}).",
-            spawned.agent_id, spawned.delivery_id
-        ))
-        .with_metadata(json!({
-            "agent_id": spawned.agent_id,
-            "delivery_id": spawned.delivery_id,
-            "state": "starting",
-            "effective_config": spawned.effective_config,
-        })))
+        self.execute_spawn(arguments, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_spawn(arguments, Some(context)).await
     }
 }
 
@@ -237,7 +358,7 @@ impl Tool for SendAgentMessageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             SEND_AGENT_MESSAGE_TOOL_NAME,
-            "Send a follow-up or steering message to an existing child agent. Delivery is queued and occurs at a model/tool protocol-safe boundary; it does not corrupt an active provider stream.",
+            "Send a follow-up or steering message to an existing general child agent. Delivery is queued and occurs at a model/tool protocol-safe boundary; a completed child resumes from its sidechain transcript. One-shot explore and plan children cannot be continued.",
             json!({
                 "type": "object",
                 "properties": {
@@ -356,6 +477,7 @@ impl Tool for CloseAgentTool {
             format!("Closed subagent {}.", closed.agent_id)
         })
         .with_metadata(json!({
+            "parent_id": self.runtime.parent_id(),
             "agent_id": closed.agent_id,
             "state": "closed",
             "already_closed": closed.already_closed
@@ -429,7 +551,10 @@ impl Tool for NotifyParentTool {
     async fn execute(&self, arguments: Value) -> Result<ToolOutput, ToolError> {
         let input: NotifyParentInput = parse(arguments, NOTIFY_PARENT_TOOL_NAME)?;
         let kind = SubagentNotificationKind::from(input.kind);
-        let wake_parent = kind.wakes_parent();
+        let wake_parent = self
+            .runtime
+            .notification_wakes_parent(&self.agent_id, &kind)
+            .map_err(|error| ToolError::new(error.to_string()))?;
         let delivery_id = self
             .runtime
             .notify(
@@ -463,10 +588,37 @@ mod tests {
     use super::*;
     use crate::{
         Agent,
+        provider::{LlmProvider, ProviderEventStream},
         subagent::{SubagentBuildRequest, SubagentConfig, SubagentFactory, SubagentFactoryError},
+        types::{AssistantMessage, ProviderEvent, ProviderResponse},
     };
 
     struct PendingFactory;
+
+    struct ImmediateProvider;
+
+    impl LlmProvider for ImmediateProvider {
+        fn stream(&self, _request: crate::ProviderRequest) -> ProviderEventStream {
+            Box::pin(futures_util::stream::iter([Ok(ProviderEvent::Done(
+                ProviderResponse {
+                    message: AssistantMessage::text("foreground child result"),
+                    usage: None,
+                },
+            ))]))
+        }
+    }
+
+    struct ImmediateFactory;
+
+    #[async_trait]
+    impl SubagentFactory for ImmediateFactory {
+        async fn build(
+            &self,
+            _request: SubagentBuildRequest,
+        ) -> Result<Agent, SubagentFactoryError> {
+            Ok(Agent::builder(ImmediateProvider).build())
+        }
+    }
 
     #[async_trait]
     impl SubagentFactory for PendingFactory {
@@ -495,6 +647,11 @@ mod tests {
             definition.parameters["properties"]["capability_mode"]["enum"],
             json!(["read_only", "workspace_edit", "full_access"])
         );
+        assert_eq!(
+            definition.parameters["properties"]["run_in_background"]["default"],
+            Value::Bool(false)
+        );
+        assert_eq!(tool.concurrency(&json!({})), ToolConcurrency::Safe);
 
         let output = tool
             .execute(json!({
@@ -508,7 +665,8 @@ mod tests {
                     "type": "json",
                     "required_fields": ["summary"]
                 },
-                "isolation": "worktree"
+                "isolation": "worktree",
+                "run_in_background": true
             }))
             .await
             .unwrap();
@@ -532,6 +690,46 @@ mod tests {
         assert_eq!(
             metadata["effective_config"]["isolation"],
             Value::String("worktree".to_owned())
+        );
+        assert_eq!(
+            metadata["status"],
+            Value::String("async_launched".to_owned())
+        );
+        assert_eq!(metadata["parent_id"], "tool-parent");
+        runtime.shutdown("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn spawn_tool_is_foreground_by_default_and_returns_the_child_result() {
+        let runtime = SubagentRuntime::new(
+            "foreground-tool-parent",
+            Arc::new(ImmediateFactory),
+            SubagentConfig::default(),
+        );
+        let tool = SpawnAgentTool::new(runtime.clone());
+        let output = tool
+            .execute(json!({
+                "description": "answer directly",
+                "prompt": "produce the result"
+            }))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.starts_with("foreground child result"));
+        assert!(output.content.contains("use send_agent_message"));
+        assert!(output.content.contains("tool_uses: 0"));
+        assert!(output.content.contains("duration_ms:"));
+        let metadata = output.metadata.unwrap();
+        assert_eq!(metadata["status"], "completed");
+        assert_eq!(metadata["parent_id"], "foreground-tool-parent");
+        assert_eq!(
+            metadata["effective_config"]["run_in_background"],
+            Value::Bool(false)
+        );
+        let agent_id = metadata["agent_id"].as_str().unwrap();
+        assert_eq!(
+            runtime.snapshot(agent_id).unwrap().state,
+            crate::SubagentState::Idle
         );
         runtime.shutdown("test complete").await;
     }

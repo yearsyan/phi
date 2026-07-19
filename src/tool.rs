@@ -261,6 +261,8 @@ impl ToolProgress {
 }
 
 pub(crate) type ProgressReporter = Arc<dyn Fn(ToolProgress) + Send + Sync>;
+pub(crate) type AgentNotificationReporter =
+    Arc<dyn Fn(Content) -> Result<(), ToolError> + Send + Sync>;
 
 /// Per-invocation services available to every tool.
 ///
@@ -274,6 +276,7 @@ pub struct ToolExecutionContext {
     visible_tool_results: Arc<HashSet<String>>,
     progress: Option<ProgressReporter>,
     progress_active: Arc<AtomicBool>,
+    agent_notification: Option<AgentNotificationReporter>,
     workspace: Option<Workspace>,
     capability_mode: CapabilityMode,
 }
@@ -286,6 +289,7 @@ impl ToolExecutionContext {
             visible_tool_results: Arc::new(HashSet::new()),
             progress: None,
             progress_active: Arc::new(AtomicBool::new(true)),
+            agent_notification: None,
             workspace: None,
             capability_mode: CapabilityMode::default(),
         }
@@ -303,6 +307,7 @@ impl ToolExecutionContext {
             visible_tool_results,
             progress,
             progress_active: Arc::new(AtomicBool::new(true)),
+            agent_notification: None,
             workspace: None,
             capability_mode: CapabilityMode::default(),
         }
@@ -315,6 +320,14 @@ impl ToolExecutionContext {
     ) -> Self {
         self.workspace = workspace;
         self.capability_mode = capability_mode;
+        self
+    }
+
+    pub(crate) fn with_agent_notification(
+        mut self,
+        agent_notification: Option<AgentNotificationReporter>,
+    ) -> Self {
+        self.agent_notification = agent_notification;
         self
     }
 
@@ -355,11 +368,32 @@ impl ToolExecutionContext {
         }
     }
 
+    /// Queues an internal follow-up message for the owning Agent.
+    ///
+    /// Managed background work may call this after the originating tool call
+    /// has returned. Delivery is bounded by the Agent mailbox and joins an
+    /// active run only at a provider/tool protocol-safe boundary. When the
+    /// Agent is idle, its host must supervise the mailbox wake signal and start
+    /// a mailbox-driven run.
+    pub fn notify_agent(&self, content: impl Into<Content>) -> Result<(), ToolError> {
+        let notify = self.agent_notification.as_ref().ok_or_else(|| {
+            ToolError::new("the owning Agent does not have a notification mailbox")
+        })?;
+        notify(content.into())
+    }
+
+    /// Returns whether the owning Agent installed a background notification
+    /// mailbox for this invocation.
+    pub fn can_notify_agent(&self) -> bool {
+        self.agent_notification.is_some()
+    }
+
     pub(crate) fn finish(&self) {
         self.progress_active.store(false, Ordering::Release);
         // Context clones may have been handed to helper tasks. Once the tool
-        // invocation returns, tell those helpers to stop and suppress any
-        // late progress events.
+        // invocation returns, cancel ordinary cooperative work and suppress
+        // late progress. The bounded Agent notification reporter deliberately
+        // remains usable by explicitly managed background work.
         self.cancellation.cancel();
     }
 }

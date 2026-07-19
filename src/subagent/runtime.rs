@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{
     Agent, AgentMailbox, AgentMailboxSendError, AgentMailboxSender, AgentRunControl,
+    InMemorySessionStorage, SessionSnapshot, SessionStorage, Workspace,
     tool::CapabilityMode,
     types::{
         AgentEvent, AgentRunOutcome as CoreAgentRunOutcome, Content, ContextUsage,
@@ -22,8 +23,10 @@ use crate::{
     },
 };
 
-/// Default maximum number of non-closed children owned by one runtime.
-pub const DEFAULT_MAX_SUBAGENTS: usize = 4;
+/// Default maximum number of live children owned by one runtime.
+///
+/// Completed, resumable sidechain records do not consume this quota.
+pub const DEFAULT_MAX_SUBAGENTS: usize = 10;
 /// Default number of parent-to-child messages that may wait for one child.
 pub const DEFAULT_SUBAGENT_MAILBOX_CAPACITY: usize = 32;
 /// Default maximum UTF-8 byte length of a prompt or notification.
@@ -177,10 +180,17 @@ pub struct EffectiveSubagentConfig {
     pub generation_config: GenerationConfig,
     pub output_contract: SubagentOutputContract,
     pub isolation: SubagentIsolation,
+    /// Matches an ordinary Agent tool: foreground is the default,
+    /// while background execution returns immediately and later wakes the
+    /// parent with a terminal notification.
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct SubagentConfig {
+    /// Maximum number of children in `Starting`, `Running`, or `Closing` state.
+    /// Completed resumable records do not consume this quota.
     pub max_agents: usize,
     pub mailbox_capacity: usize,
     pub max_message_bytes: usize,
@@ -339,6 +349,26 @@ pub trait SubagentFactory: Send + Sync {
             ));
         }
         self.build(request.base).await.map(BuiltSubagent::new)
+    }
+
+    /// Rebuilds an agent whose previous invocation has completed and whose
+    /// transcript will be attached by the runtime immediately afterwards.
+    ///
+    /// Shared-workspace factories can normally use the default implementation.
+    /// Worktree-aware hosts must override this method so a resume never creates
+    /// a fresh isolated checkout or silently falls back to the parent workspace.
+    async fn resume_configured(
+        &self,
+        request: ConfiguredSubagentBuildRequest,
+        persisted_workspace: Option<Workspace>,
+    ) -> Result<BuiltSubagent, SubagentFactoryError> {
+        if request.effective_config.isolation == SubagentIsolation::Worktree {
+            return Err(SubagentFactoryError::new(format!(
+                "subagent factory cannot resume worktree child at {:?}",
+                persisted_workspace.map(|workspace| workspace.root().to_owned())
+            )));
+        }
+        self.build_configured(request).await
     }
 }
 
@@ -540,6 +570,7 @@ pub struct ConfiguredSpawnAgentRequest {
     pub generation_config: Option<GenerationConfig>,
     pub output_contract: Option<SubagentOutputContract>,
     pub isolation: Option<SubagentIsolation>,
+    pub run_in_background: bool,
 }
 
 impl ConfiguredSpawnAgentRequest {
@@ -552,6 +583,7 @@ impl ConfiguredSpawnAgentRequest {
             generation_config: None,
             output_contract: None,
             isolation: None,
+            run_in_background: false,
         }
     }
 
@@ -579,6 +611,11 @@ impl ConfiguredSpawnAgentRequest {
         self.isolation = Some(isolation);
         self
     }
+
+    pub fn run_in_background(mut self, run_in_background: bool) -> Self {
+        self.run_in_background = run_in_background;
+        self
+    }
 }
 
 impl From<SpawnAgentRequest> for ConfiguredSpawnAgentRequest {
@@ -591,6 +628,7 @@ impl From<SpawnAgentRequest> for ConfiguredSpawnAgentRequest {
             generation_config: request.generation_config,
             output_contract: None,
             isolation: None,
+            run_in_background: false,
         }
     }
 }
@@ -600,6 +638,28 @@ pub struct SpawnedSubagent {
     pub agent_id: String,
     pub delivery_id: String,
     pub effective_config: EffectiveSubagentConfig,
+}
+
+/// Terminal result returned to a foreground `spawn_agent` invocation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SubagentCompletion {
+    pub agent_id: String,
+    pub delivery_id: String,
+    pub outcome: SubagentRunOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_output: Option<ValidatedSubagentOutput>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubagentRestoreReport {
+    pub restored: Vec<String>,
+    pub failures: Vec<SubagentRestoreFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentRestoreFailure {
+    pub agent_id: String,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +692,8 @@ pub enum SubagentError {
     MessageTooLong { actual: usize, maximum: usize },
     #[error("invalid subagent configuration: {message}")]
     InvalidConfiguration { message: String },
+    #[error("subagent transcript persistence failed: {message}")]
+    Persistence { message: String },
 }
 
 #[derive(Clone)]
@@ -649,11 +711,15 @@ struct RuntimeInner {
     events: broadcast::Sender<SubagentEvent>,
     next_sequence: AtomicU64,
     shutting_down: AtomicBool,
+    storage: Arc<dyn SessionStorage>,
 }
 
 struct SubagentEntry {
     agent_id: String,
     prebuild_messages: mpsc::Sender<PendingMessage>,
+    prebuild_receiver: Mutex<Option<mpsc::Receiver<PendingMessage>>>,
+    build_request: ConfiguredSubagentBuildRequest,
+    worker_started: AtomicBool,
     mailbox: Mutex<Option<AgentMailboxSender>>,
     delivery_ids: Mutex<VecDeque<String>>,
     close: watch::Sender<Option<String>>,
@@ -665,6 +731,9 @@ struct SubagentEntry {
     closed_event_emitted: AtomicBool,
     resource: Mutex<Option<Arc<dyn SubagentResource>>>,
     resource_finalized: AtomicBool,
+    wake_parent: AtomicBool,
+    foreground_delivery_id: Option<String>,
+    completion: watch::Sender<Option<SubagentCompletion>>,
 }
 
 #[derive(Clone, Debug)]
@@ -679,6 +748,24 @@ impl SubagentRuntime {
         factory: Arc<dyn SubagentFactory>,
         config: SubagentConfig,
     ) -> Self {
+        Self::with_storage(
+            parent_id,
+            factory,
+            config,
+            Arc::new(InMemorySessionStorage::new()),
+        )
+    }
+
+    /// Creates a runtime whose child transcripts use the supplied sidechain
+    /// storage. A daemon should pass the same durable store used for root
+    /// sessions; child IDs are namespaced and remain absent from its control
+    /// plane/session registry.
+    pub fn with_storage(
+        parent_id: impl Into<String>,
+        factory: Arc<dyn SubagentFactory>,
+        config: SubagentConfig,
+        storage: Arc<dyn SessionStorage>,
+    ) -> Self {
         let config = config.normalized();
         let (events, _) = broadcast::channel(config.event_capacity);
         Self {
@@ -692,10 +779,13 @@ impl SubagentRuntime {
                 events,
                 next_sequence: AtomicU64::new(0),
                 shutting_down: AtomicBool::new(false),
+                storage,
             }),
         }
     }
 
+    /// Stable owner scope used to prevent a forked parent transcript from
+    /// adopting the source session's child sidechains.
     pub fn parent_id(&self) -> &str {
         &self.inner.parent_id
     }
@@ -768,6 +858,242 @@ impl SubagentRuntime {
         snapshots
     }
 
+    /// Reconstructs resumable child records from durable parent tool-result
+    /// metadata. No child Agent is built and no prompt is replayed: a later
+    /// [`Self::send_message`] rebuilds the child and attaches its sidechain
+    /// transcript before accepting the follow-up.
+    pub async fn restore_from_history(&self, messages: &[Message]) -> SubagentRestoreReport {
+        let mut spawn_arguments = HashMap::<String, (String, bool)>::new();
+        let mut close_arguments = HashMap::<String, String>::new();
+        let mut candidates = HashMap::<String, (String, String, EffectiveSubagentConfig)>::new();
+        let mut closed = HashSet::new();
+
+        for message in messages {
+            for call in &message.tool_calls {
+                match call.name.as_str() {
+                    crate::tool::subagent::SPAWN_AGENT_TOOL_NAME => {
+                        let description = call.arguments["description"]
+                            .as_str()
+                            .unwrap_or("restored subagent")
+                            .to_owned();
+                        let run_in_background = call.arguments["run_in_background"]
+                            .as_bool()
+                            .unwrap_or(false);
+                        spawn_arguments.insert(call.id.clone(), (description, run_in_background));
+                    }
+                    crate::tool::subagent::CLOSE_AGENT_TOOL_NAME => {
+                        if let Some(agent_id) = call.arguments["agent_id"].as_str() {
+                            close_arguments.insert(call.id.clone(), agent_id.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(metadata) = message.tool_result_metadata.as_ref() else {
+                continue;
+            };
+            let Some(agent_id) = metadata["agent_id"].as_str() else {
+                continue;
+            };
+            if metadata["parent_id"]
+                .as_str()
+                .is_some_and(|parent_id| parent_id != self.parent_id())
+            {
+                continue;
+            }
+            let tool_call_id = message.tool_call_id.as_deref();
+            let is_close_record = tool_call_id
+                .and_then(|id| close_arguments.get(id))
+                .is_some_and(|closed_id| closed_id == agent_id);
+            if metadata["state"] == "closed" && is_close_record {
+                closed.insert(agent_id.to_owned());
+                continue;
+            }
+            let is_spawn_record = metadata["subagent_tool"]
+                == crate::tool::subagent::SPAWN_AGENT_TOOL_NAME
+                || tool_call_id.is_some_and(|id| spawn_arguments.contains_key(id));
+            if !is_spawn_record {
+                continue;
+            }
+            let Some(effective) = metadata.get("effective_config") else {
+                continue;
+            };
+            let mut effective_config =
+                match serde_json::from_value::<EffectiveSubagentConfig>(effective.clone()) {
+                    Ok(config) => config,
+                    Err(_) => continue,
+                };
+            let fallback = tool_call_id.and_then(|id| spawn_arguments.get(id));
+            let description = metadata["description"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| fallback.map(|(description, _)| description.clone()))
+                .unwrap_or_else(|| "restored subagent".to_owned());
+            if metadata["effective_config"]
+                .get("run_in_background")
+                .is_none()
+            {
+                effective_config.run_in_background = fallback
+                    .map(|(_, run_in_background)| *run_in_background)
+                    .unwrap_or(false);
+            }
+            let delivery_id = metadata["delivery_id"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| new_id("delivery"));
+            candidates.insert(
+                agent_id.to_owned(),
+                (description, delivery_id, effective_config),
+            );
+        }
+
+        let mut report = SubagentRestoreReport::default();
+        for (agent_id, (description, delivery_id, mut effective_config)) in candidates {
+            if closed.contains(&agent_id) || read_lock(&self.inner.agents).contains_key(&agent_id) {
+                continue;
+            }
+            if !valid_agent_id(&agent_id) {
+                report.failures.push(SubagentRestoreFailure {
+                    agent_id,
+                    error: "invalid persisted subagent ID".to_owned(),
+                });
+                continue;
+            }
+            effective_config.capability_mode = effective_config
+                .capability_mode
+                .safest(effective_config.agent_type.default_capability_mode())
+                .safest(self.capability_ceiling());
+            effective_config.output_contract = match effective_config.output_contract.normalized() {
+                Ok(contract) => contract,
+                Err(error) => {
+                    report
+                        .failures
+                        .push(SubagentRestoreFailure { agent_id, error });
+                    continue;
+                }
+            };
+
+            let session_id = subagent_session_id(&agent_id);
+            let persisted = match self.inner.storage.load(&session_id).await {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    report.failures.push(SubagentRestoreFailure {
+                        agent_id,
+                        error: "sidechain transcript is missing; original work was not replayed"
+                            .to_owned(),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    report.failures.push(SubagentRestoreFailure {
+                        agent_id,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            let (message_sender, message_receiver) =
+                mpsc::channel(self.inner.config.mailbox_capacity);
+            let (close, _) = watch::channel(None);
+            let (state_watch, _) = watch::channel(SubagentState::Idle);
+            let (completion, _) = watch::channel(None);
+            let build_request = ConfiguredSubagentBuildRequest {
+                base: SubagentBuildRequest {
+                    parent_id: self.inner.parent_id.clone(),
+                    agent_id: agent_id.clone(),
+                    description: description.clone(),
+                    generation_config: effective_config.generation_config.clone(),
+                    allow_nested_subagents: false,
+                },
+                effective_config: effective_config.clone(),
+            };
+            let resource = if effective_config.isolation == SubagentIsolation::Worktree {
+                persisted
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| SubagentResourceInfo {
+                        kind: "git_worktree".to_owned(),
+                        location: Some(workspace.root().display().to_string()),
+                    })
+            } else {
+                None
+            };
+            let snapshot = SubagentSnapshot {
+                parent_id: self.inner.parent_id.clone(),
+                agent_id: agent_id.clone(),
+                description: description.clone(),
+                effective_config: effective_config.clone(),
+                state: SubagentState::Idle,
+                active_run: None,
+                messages: persisted.messages,
+                draft: None,
+                cumulative_usage: persisted.cumulative_usage,
+                context_usage: None,
+                last_outcome: None,
+                validated_output: None,
+                resource,
+                resource_finalization: None,
+                last_sequence: 0,
+            };
+            let entry = Arc::new(SubagentEntry {
+                agent_id: agent_id.clone(),
+                prebuild_messages: message_sender,
+                prebuild_receiver: Mutex::new(Some(message_receiver)),
+                build_request,
+                worker_started: AtomicBool::new(false),
+                mailbox: Mutex::new(None),
+                delivery_ids: Mutex::new(VecDeque::new()),
+                close,
+                state: AtomicU8::new(SubagentState::Idle.as_u8()),
+                state_watch,
+                send_close_lock: Mutex::new(()),
+                active_control: Mutex::new(None),
+                snapshot: RwLock::new(snapshot),
+                closed_event_emitted: AtomicBool::new(false),
+                resource: Mutex::new(None),
+                resource_finalized: AtomicBool::new(false),
+                wake_parent: AtomicBool::new(true),
+                foreground_delivery_id: None,
+                completion,
+            });
+            let inserted = {
+                let _spawn_guard = mutex_lock(&self.inner.spawn_lock);
+                let mut agents = write_lock(&self.inner.agents);
+                if agents.contains_key(&agent_id) {
+                    false
+                } else {
+                    agents.insert(agent_id.clone(), Arc::clone(&entry));
+                    true
+                }
+            };
+            if !inserted {
+                continue;
+            }
+            self.publish(
+                &entry,
+                SubagentEventKind::Spawned {
+                    description,
+                    initial_delivery_id: delivery_id,
+                    effective_config,
+                },
+            );
+            self.publish(
+                &entry,
+                SubagentEventKind::StateChanged {
+                    state: SubagentState::Idle,
+                },
+            );
+            report.restored.push(agent_id);
+        }
+        report.restored.sort_unstable();
+        report
+            .failures
+            .sort_unstable_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        report
+    }
+
     pub async fn spawn(
         &self,
         request: SpawnAgentRequest,
@@ -817,13 +1143,25 @@ impl SubagentRuntime {
             generation_config,
             output_contract,
             isolation: request.isolation.unwrap_or_default(),
+            run_in_background: request.run_in_background,
         };
 
         let (message_sender, message_receiver) = mpsc::channel(self.inner.config.mailbox_capacity);
         let (close, _) = watch::channel(None);
         let (state_watch, _) = watch::channel(SubagentState::Starting);
+        let (completion, _) = watch::channel(None);
         let agent_id = self.reserve_agent_id()?;
         let initial_delivery_id = new_id("delivery");
+        let build_request = ConfiguredSubagentBuildRequest {
+            base: SubagentBuildRequest {
+                parent_id: self.inner.parent_id.clone(),
+                agent_id: agent_id.clone(),
+                description: request.description.clone(),
+                generation_config: effective_config.generation_config.clone(),
+                allow_nested_subagents: false,
+            },
+            effective_config: effective_config.clone(),
+        };
         let snapshot = SubagentSnapshot {
             parent_id: self.inner.parent_id.clone(),
             agent_id: agent_id.clone(),
@@ -843,7 +1181,10 @@ impl SubagentRuntime {
         };
         let entry = Arc::new(SubagentEntry {
             agent_id: agent_id.clone(),
-            prebuild_messages: message_sender,
+            prebuild_messages: message_sender.clone(),
+            prebuild_receiver: Mutex::new(Some(message_receiver)),
+            build_request,
+            worker_started: AtomicBool::new(false),
             mailbox: Mutex::new(None),
             delivery_ids: Mutex::new(VecDeque::from([initial_delivery_id.clone()])),
             close,
@@ -855,7 +1196,19 @@ impl SubagentRuntime {
             closed_event_emitted: AtomicBool::new(false),
             resource: Mutex::new(None),
             resource_finalized: AtomicBool::new(false),
+            wake_parent: AtomicBool::new(request.run_in_background),
+            foreground_delivery_id: (!request.run_in_background)
+                .then(|| initial_delivery_id.clone()),
+            completion,
         });
+        message_sender
+            .try_send(PendingMessage {
+                delivery_id: initial_delivery_id.clone(),
+                message: request.prompt,
+            })
+            .map_err(|_| SubagentError::QueueFull {
+                agent_id: agent_id.clone(),
+            })?;
         write_lock(&self.inner.agents).insert(agent_id.clone(), entry.clone());
         drop(spawn_guard);
 
@@ -870,28 +1223,39 @@ impl SubagentRuntime {
             },
         );
 
-        let build_request = ConfiguredSubagentBuildRequest {
-            base: SubagentBuildRequest {
-                parent_id: self.inner.parent_id.clone(),
-                agent_id: agent_id.clone(),
-                description: request.description,
-                generation_config: effective_config.generation_config.clone(),
-                allow_nested_subagents: false,
-            },
-            effective_config: effective_config.clone(),
-        };
-        let initial = PendingMessage {
-            delivery_id: initial_delivery_id.clone(),
-            message: request.prompt,
-        };
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            let worker =
-                runtime.run_worker(entry.clone(), build_request, message_receiver, initial);
-            if AssertUnwindSafe(worker).catch_unwind().await.is_err() {
-                runtime.finish_after_panic(&entry).await;
+        // Persist the sidechain identity before the factory can allocate a
+        // worktree or the child can execute tools. A daemon crash after the
+        // background tool result is saved can therefore restore the child ID
+        // without replaying the original prompt.
+        let mut seed = match SessionSnapshot::new(subagent_session_id(&agent_id), Vec::new()) {
+            Ok(seed) => seed,
+            Err(error) => {
+                let message = format!("failed to create subagent sidechain: {error}");
+                entry.wake_parent.store(false, Ordering::Release);
+                self.record_failed(&entry, "storage", &initial_delivery_id, message.clone());
+                self.finish_closed(
+                    &entry,
+                    message.clone(),
+                    SubagentResourceDisposition::RuntimeFailed,
+                )
+                .await;
+                return Err(SubagentError::Persistence { message });
             }
-        });
+        };
+        seed.capability_mode = effective_config.capability_mode;
+        if let Err(error) = self.inner.storage.save(&seed).await {
+            let message = format!("failed to persist subagent sidechain: {error}");
+            entry.wake_parent.store(false, Ordering::Release);
+            self.record_failed(&entry, "storage", &initial_delivery_id, message.clone());
+            self.finish_closed(
+                &entry,
+                message.clone(),
+                SubagentResourceDisposition::RuntimeFailed,
+            )
+            .await;
+            return Err(SubagentError::Persistence { message });
+        }
+        self.ensure_worker(&entry);
 
         Ok(SpawnedSubagent {
             agent_id,
@@ -908,6 +1272,17 @@ impl SubagentRuntime {
         let message = message.into();
         self.validate_text(&message)?;
         let entry = self.entry(agent_id)?;
+        if matches!(
+            read_lock(&entry.snapshot).effective_config.agent_type,
+            SubagentType::Explore | SubagentType::Plan
+        ) {
+            return Err(SubagentError::InvalidConfiguration {
+                message: format!(
+                    "subagent {agent_id:?} is a one-shot explore/plan child and cannot be continued"
+                ),
+            });
+        }
+        let _spawn_guard = mutex_lock(&self.inner.spawn_lock);
         let _coordination = mutex_lock(&entry.send_close_lock);
         if matches!(
             entry.state(),
@@ -917,11 +1292,20 @@ impl SubagentRuntime {
                 agent_id: agent_id.to_owned(),
             });
         }
+        let resumed_from_idle = entry.state() == SubagentState::Idle;
+        if resumed_from_idle {
+            self.ensure_active_capacity()?;
+            entry.set_state(SubagentState::Starting);
+        }
+        // A completed sidechain resumes as a background task: its
+        // eventual terminal result is delivered to the parent asynchronously.
+        entry.wake_parent.store(true, Ordering::Release);
         let delivery_id = new_id("delivery");
-        if let Some(mailbox) = mutex_lock(&entry.mailbox).as_ref() {
+        let delivery = if let Some(mailbox) = mutex_lock(&entry.mailbox).as_ref() {
             mailbox
                 .send(Content::text(message))
-                .map_err(|error| map_mailbox_error(agent_id, error))?;
+                .map(|_| ())
+                .map_err(|error| map_mailbox_error(agent_id, error))
         } else {
             entry
                 .prebuild_messages
@@ -936,15 +1320,32 @@ impl SubagentRuntime {
                     mpsc::error::TrySendError::Closed(_) => SubagentError::Closed {
                         agent_id: agent_id.to_owned(),
                     },
-                })?;
+                })
+        };
+        if let Err(error) = delivery {
+            if resumed_from_idle {
+                entry.set_state(SubagentState::Idle);
+            }
+            return Err(error);
         }
         mutex_lock(&entry.delivery_ids).push_back(delivery_id.clone());
+        drop(_coordination);
+        drop(_spawn_guard);
+        if resumed_from_idle {
+            self.publish(
+                &entry,
+                SubagentEventKind::StateChanged {
+                    state: SubagentState::Starting,
+                },
+            );
+        }
         self.publish(
             &entry,
             SubagentEventKind::MessageQueued {
                 delivery_id: delivery_id.clone(),
             },
         );
+        self.ensure_worker(&entry);
         Ok(QueuedSubagentMessage {
             agent_id: agent_id.to_owned(),
             delivery_id,
@@ -989,6 +1390,7 @@ impl SubagentRuntime {
             }
         };
         if !already_closed {
+            self.ensure_worker(&entry);
             entry.wait_closed().await;
         }
         Ok(CloseSubagentResult {
@@ -1035,7 +1437,7 @@ impl SubagentRuntime {
             });
         }
         let delivery_id = new_id("delivery");
-        let wake_parent = kind.wakes_parent();
+        let wake_parent = kind.wakes_parent() && entry.wake_parent.load(Ordering::Acquire);
         self.publish(
             &entry,
             SubagentEventKind::Notification(SubagentNotification {
@@ -1049,253 +1451,400 @@ impl SubagentRuntime {
         Ok(delivery_id)
     }
 
-    async fn run_worker(
+    pub fn notification_wakes_parent(
         &self,
-        entry: Arc<SubagentEntry>,
-        build_request: ConfiguredSubagentBuildRequest,
-        mut message_receiver: mpsc::Receiver<PendingMessage>,
-        initial: PendingMessage,
-    ) {
-        let mut close_receiver = entry.close.subscribe();
-        let build = self.inner.factory.build_configured(build_request);
-        tokio::pin!(build);
-        let built = tokio::select! {
-            biased;
-            _ = wait_for_close(&mut close_receiver) => {
-                self.finish_closed(
-                    &entry,
-                    close_reason(&close_receiver),
-                    SubagentResourceDisposition::Closed,
-                ).await;
-                return;
-            }
-            result = &mut build => match result {
-                Ok(built) => built,
-                Err(error) => {
-                    let message = format!("failed to build subagent: {error}");
-                    self.record_failed(&entry, "build", message.clone());
-                    self.finish_closed(
-                        &entry,
-                        message,
-                        SubagentResourceDisposition::RuntimeFailed,
-                    ).await;
-                    return;
-                }
-            }
-        };
-        let BuiltSubagent {
-            mut agent,
-            resource,
-        } = built;
-        if let Some(resource) = resource {
-            *mutex_lock(&entry.resource) = Some(Arc::clone(&resource));
-            let info = resource.info();
-            write_lock(&entry.snapshot).resource = Some(info);
+        agent_id: &str,
+        kind: &SubagentNotificationKind,
+    ) -> Result<bool, SubagentError> {
+        let entry = self.entry(agent_id)?;
+        Ok(kind.wakes_parent() && entry.wake_parent.load(Ordering::Acquire))
+    }
+
+    /// Waits for the initial foreground invocation to reach a terminal result.
+    /// Background spawns intentionally reject this operation: their result is
+    /// delivered through the runtime event stream instead.
+    pub async fn wait_for_completion(
+        &self,
+        agent_id: &str,
+        delivery_id: &str,
+    ) -> Result<SubagentCompletion, SubagentError> {
+        let entry = self.entry(agent_id)?;
+        if entry.foreground_delivery_id.as_deref() != Some(delivery_id) {
+            return Err(SubagentError::InvalidConfiguration {
+                message: format!(
+                    "delivery {delivery_id:?} is not the foreground invocation for subagent {agent_id:?}"
+                ),
+            });
         }
-
-        agent.add_mandatory_tool(crate::tool::subagent::NotifyParentTool::new(
-            self.clone(),
-            entry.agent_id.clone(),
-        ));
-        let weak_runtime = Arc::downgrade(&self.inner);
-        let weak_entry = Arc::downgrade(&entry);
-        agent.subscribe(move |event| {
-            forward_agent_event(&weak_runtime, &weak_entry, event);
-        });
-
-        // During construction messages wait in a small pre-build channel.
-        // Switch atomically to Agent's mailbox so messages sent while a run is
-        // active are injected at the next protocol-safe boundary.
-        let (mailbox_sender, mailbox_receiver) =
-            AgentMailbox::bounded(self.inner.config.mailbox_capacity.saturating_add(1));
-        agent.set_mailbox(mailbox_receiver);
-        let setup_failure = {
-            let _coordination = mutex_lock(&entry.send_close_lock);
-            if matches!(
-                entry.state(),
-                SubagentState::Closing | SubagentState::Closed
-            ) {
-                mailbox_sender.close();
-                Some((
-                    close_reason(&close_receiver),
-                    SubagentResourceDisposition::Closed,
-                    false,
-                ))
-            } else if mailbox_sender.send(Content::text(initial.message)).is_err() {
-                Some((
-                    "failed to queue initial subagent prompt".to_owned(),
-                    SubagentResourceDisposition::RuntimeFailed,
-                    false,
-                ))
-            } else {
-                let mut failure = None;
-                while let Ok(pending) = message_receiver.try_recv() {
-                    let _delivery_id = pending.delivery_id;
-                    if mailbox_sender.send(Content::text(pending.message)).is_err() {
-                        failure = Some((
-                            "subagent mailbox transfer failed".to_owned(),
-                            SubagentResourceDisposition::RuntimeFailed,
-                            true,
-                        ));
+        let mut completion = entry.completion.subscribe();
+        loop {
+            let ready = { completion.borrow_and_update().clone() };
+            if let Some(result) = ready
+                && result.delivery_id == delivery_id
+            {
+                let mut state = entry.state_watch.subscribe();
+                while matches!(
+                    *state.borrow_and_update(),
+                    SubagentState::Starting | SubagentState::Running
+                ) {
+                    if state.changed().await.is_err() {
                         break;
                     }
                 }
-                if failure.is_none() {
-                    *mutex_lock(&entry.mailbox) = Some(mailbox_sender.clone());
-                }
-                failure
+                return Ok(result);
             }
-        };
-        if let Some((reason, disposition, record_failure)) = setup_failure {
-            if record_failure {
-                self.record_failed(&entry, "mailbox", reason.clone());
-            }
-            self.finish_closed(&entry, reason, disposition).await;
-            return;
-        }
-
-        self.transition_operational(&entry, SubagentState::Idle);
-        loop {
-            let wake = tokio::select! {
-                biased;
-                _ = wait_for_close(&mut close_receiver) => false,
-                wake = mailbox_sender.wait_for_wake() => wake,
-            };
-            if !wake || close_receiver.borrow().is_some() {
-                self.finish_closed(
-                    &entry,
-                    close_reason(&close_receiver),
-                    SubagentResourceDisposition::Closed,
-                )
-                .await;
-                return;
-            }
-            let run_id = new_id("run");
-            let delivery_id = {
-                // A sender holds this lock through both mailbox acceptance and
-                // delivery-id bookkeeping, so wake cannot expose a synthetic
-                // ID for a message whose real ID is still being recorded.
-                let _coordination = mutex_lock(&entry.send_close_lock);
-                mutex_lock(&entry.delivery_ids)
-                    .front()
-                    .cloned()
-                    .unwrap_or_else(|| new_id("delivery"))
-            };
-            {
-                let mut snapshot = write_lock(&entry.snapshot);
-                snapshot.active_run = Some(ActiveSubagentRun {
-                    run_id: run_id.clone(),
-                    delivery_id,
+            if completion.changed().await.is_err() {
+                return Err(SubagentError::Closed {
+                    agent_id: agent_id.to_owned(),
                 });
-                snapshot.draft = None;
-                snapshot.validated_output = None;
             }
-            self.transition_operational(&entry, SubagentState::Running);
-            let control = AgentRunControl::new();
-            *mutex_lock(&entry.active_control) = Some(control.clone());
-            let run = agent.prompt_from_mailbox_controlled(control.clone());
-            tokio::pin!(run);
-
-            let outcome = tokio::select! {
-                biased;
-                _ = wait_for_close(&mut close_receiver) => {
-                    control.stop();
-                    (&mut run).await
-                }
-                outcome = &mut run => outcome,
-            };
-            *mutex_lock(&entry.active_control) = None;
-            write_lock(&entry.snapshot).active_run = None;
-
-            if close_receiver.borrow().is_some() {
-                self.finish_closed(
-                    &entry,
-                    close_reason(&close_receiver),
-                    SubagentResourceDisposition::Closed,
-                )
-                .await;
-                return;
-            }
-            match outcome {
-                Ok(Some(CoreAgentRunOutcome::Completed(run))) => {
-                    let text = run.text().unwrap_or_default().to_owned();
-                    let output_contract = read_lock(&entry.snapshot)
-                        .effective_config
-                        .output_contract
-                        .clone();
-                    match output_contract.validate_output(&text) {
-                        Ok(output) => {
-                            let outcome = SubagentRunOutcome::Completed {
-                                text: text.clone(),
-                                turns: run.turns,
-                                usage: run.run_usage,
-                            };
-                            {
-                                let mut snapshot = write_lock(&entry.snapshot);
-                                snapshot.last_outcome = Some(outcome.clone());
-                                snapshot.validated_output = Some(output.clone());
-                            }
-                            self.publish(&entry, SubagentEventKind::OutputValidated { output });
-                            self.publish(
-                                &entry,
-                                SubagentEventKind::RunFinished {
-                                    run_id: run_id.clone(),
-                                    outcome,
-                                },
-                            );
-                            let _ = self.notify(
-                                &entry.agent_id,
-                                SubagentNotificationKind::Result,
-                                if text.is_empty() {
-                                    "Subagent completed without a textual result.".to_owned()
-                                } else {
-                                    text
-                                },
-                                SubagentNotificationSource::Runtime,
-                            );
-                        }
-                        Err(error) => {
-                            self.record_failed(
-                                &entry,
-                                &run_id,
-                                format!("output contract violation: {error}"),
-                            );
-                        }
-                    }
-                }
-                Ok(Some(CoreAgentRunOutcome::Stopped)) => {
-                    let outcome = SubagentRunOutcome::Stopped;
-                    {
-                        let mut snapshot = write_lock(&entry.snapshot);
-                        snapshot.last_outcome = Some(outcome.clone());
-                        snapshot.validated_output = None;
-                    }
-                    self.publish(&entry, SubagentEventKind::RunFinished { run_id, outcome });
-                }
-                Ok(None) => {
-                    self.transition_operational(&entry, SubagentState::Idle);
-                    continue;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    self.record_failed(&entry, &run_id, message);
-                }
-            }
-            // Retain only IDs for mailbox messages that were not durably
-            // committed. The coordination lock pairs this with send_message.
-            {
-                let _coordination = mutex_lock(&entry.send_close_lock);
-                let pending = mailbox_sender.pending_len();
-                let mut delivery_ids = mutex_lock(&entry.delivery_ids);
-                while delivery_ids.len() > pending {
-                    delivery_ids.pop_front();
-                }
-            }
-            self.transition_operational(&entry, SubagentState::Idle);
         }
     }
 
-    fn record_failed(&self, entry: &Arc<SubagentEntry>, run_id: &str, message: String) {
+    async fn run_worker(
+        &self,
+        entry: Arc<SubagentEntry>,
+        mut message_receiver: mpsc::Receiver<PendingMessage>,
+    ) {
+        let mut close_receiver = entry.close.subscribe();
+        loop {
+            let pending = tokio::select! {
+                biased;
+                _ = wait_for_close(&mut close_receiver) => None,
+                pending = message_receiver.recv() => pending,
+            };
+            let Some(first) = pending else {
+                self.finish_closed(
+                    &entry,
+                    close_reason(&close_receiver),
+                    SubagentResourceDisposition::Closed,
+                )
+                .await;
+                return;
+            };
+            let delivery_id = first.delivery_id.clone();
+            let session_id = subagent_session_id(&entry.agent_id);
+            let persisted = tokio::select! {
+                biased;
+                _ = wait_for_close(&mut close_receiver) => {
+                    self.finish_closed(
+                        &entry,
+                        close_reason(&close_receiver),
+                        SubagentResourceDisposition::Closed,
+                    ).await;
+                    return;
+                }
+                loaded = self.inner.storage.load(&session_id) => loaded,
+            };
+            let persisted = match persisted {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    self.record_failed(
+                        &entry,
+                        "storage",
+                        &delivery_id,
+                        format!("failed to load subagent transcript: {error}"),
+                    );
+                    self.finish_failed_cycle(&entry, &mut message_receiver);
+                    continue;
+                }
+            };
+
+            let build_request = entry.build_request.clone();
+            let build = async {
+                match persisted
+                    .as_ref()
+                    .filter(|snapshot| !snapshot.messages.is_empty())
+                {
+                    Some(snapshot) => {
+                        self.inner
+                            .factory
+                            .resume_configured(build_request, snapshot.workspace.clone())
+                            .await
+                    }
+                    None => self.inner.factory.build_configured(build_request).await,
+                }
+            };
+            tokio::pin!(build);
+            let built = tokio::select! {
+                biased;
+                _ = wait_for_close(&mut close_receiver) => {
+                    self.finish_closed(
+                        &entry,
+                        close_reason(&close_receiver),
+                        SubagentResourceDisposition::Closed,
+                    ).await;
+                    return;
+                }
+                result = &mut build => result,
+            };
+            let BuiltSubagent {
+                mut agent,
+                resource,
+            } = match built {
+                Ok(built) => built,
+                Err(error) => {
+                    self.record_failed(
+                        &entry,
+                        "build",
+                        &delivery_id,
+                        format!("failed to build subagent: {error}"),
+                    );
+                    self.finish_failed_cycle(&entry, &mut message_receiver);
+                    continue;
+                }
+            };
+            if let Some(resource) = resource {
+                let mut current = mutex_lock(&entry.resource);
+                if current.is_none() {
+                    let info = resource.info();
+                    write_lock(&entry.snapshot).resource = Some(info);
+                    *current = Some(resource);
+                }
+            }
+
+            agent.add_mandatory_tool(crate::tool::subagent::NotifyParentTool::new(
+                self.clone(),
+                entry.agent_id.clone(),
+            ));
+            let weak_runtime = Arc::downgrade(&self.inner);
+            let weak_entry = Arc::downgrade(&entry);
+            agent.subscribe(move |event| {
+                forward_agent_event(&weak_runtime, &weak_entry, event);
+            });
+            let attached = {
+                let attach = agent.attach_session(session_id, Arc::clone(&self.inner.storage));
+                tokio::pin!(attach);
+                tokio::select! {
+                    biased;
+                    _ = wait_for_close(&mut close_receiver) => {
+                        self.finish_closed(
+                            &entry,
+                            close_reason(&close_receiver),
+                            SubagentResourceDisposition::Closed,
+                        ).await;
+                        return;
+                    }
+                    result = &mut attach => result,
+                }
+            };
+            if let Err(error) = attached {
+                self.record_failed(
+                    &entry,
+                    "storage",
+                    &delivery_id,
+                    format!("failed to attach subagent transcript: {error}"),
+                );
+                self.finish_failed_cycle(&entry, &mut message_receiver);
+                continue;
+            }
+            // A persisted snapshot may predate a parent capability downgrade.
+            // The immutable effective config is the live authority boundary.
+            agent.set_capability_mode_in_memory(
+                entry.build_request.effective_config.capability_mode,
+            );
+
+            // Switch atomically from the bounded pre-build queue to the Agent
+            // mailbox. Messages arriving during provider/tool work then join at
+            // the next complete protocol boundary.
+            let (mailbox_sender, mailbox_receiver) =
+                AgentMailbox::bounded(self.inner.config.mailbox_capacity.saturating_add(1));
+            agent.set_mailbox(mailbox_receiver);
+            let setup_failure = {
+                let _coordination = mutex_lock(&entry.send_close_lock);
+                if matches!(
+                    entry.state(),
+                    SubagentState::Closing | SubagentState::Closed
+                ) {
+                    Some(close_reason(&close_receiver))
+                } else if mailbox_sender.send(Content::text(first.message)).is_err() {
+                    Some("failed to queue subagent prompt".to_owned())
+                } else {
+                    let mut failure = None;
+                    while let Ok(pending) = message_receiver.try_recv() {
+                        if mailbox_sender.send(Content::text(pending.message)).is_err() {
+                            failure = Some("subagent mailbox transfer failed".to_owned());
+                            break;
+                        }
+                    }
+                    if failure.is_none() {
+                        *mutex_lock(&entry.mailbox) = Some(mailbox_sender.clone());
+                    }
+                    failure
+                }
+            };
+            if let Some(message) = setup_failure {
+                mailbox_sender.close();
+                self.record_failed(&entry, "mailbox", &delivery_id, message);
+                self.finish_failed_cycle(&entry, &mut message_receiver);
+                continue;
+            }
+
+            loop {
+                let run_id = new_id("run");
+                let active_delivery_id = {
+                    let _coordination = mutex_lock(&entry.send_close_lock);
+                    mutex_lock(&entry.delivery_ids)
+                        .front()
+                        .cloned()
+                        .unwrap_or_else(|| delivery_id.clone())
+                };
+                {
+                    let mut snapshot = write_lock(&entry.snapshot);
+                    snapshot.active_run = Some(ActiveSubagentRun {
+                        run_id: run_id.clone(),
+                        delivery_id: active_delivery_id.clone(),
+                    });
+                    snapshot.draft = None;
+                    snapshot.validated_output = None;
+                }
+                self.transition_operational(&entry, SubagentState::Running);
+                let control = AgentRunControl::new();
+                *mutex_lock(&entry.active_control) = Some(control.clone());
+                let run = agent.prompt_from_mailbox_controlled(control.clone());
+                tokio::pin!(run);
+
+                let outcome = tokio::select! {
+                    biased;
+                    _ = wait_for_close(&mut close_receiver) => {
+                        control.stop();
+                        (&mut run).await
+                    }
+                    outcome = &mut run => outcome,
+                };
+                *mutex_lock(&entry.active_control) = None;
+                write_lock(&entry.snapshot).active_run = None;
+
+                if close_receiver.borrow().is_some() {
+                    self.finish_closed(
+                        &entry,
+                        close_reason(&close_receiver),
+                        SubagentResourceDisposition::Closed,
+                    )
+                    .await;
+                    return;
+                }
+                match outcome {
+                    Ok(Some(CoreAgentRunOutcome::Completed(run))) => {
+                        let text = run.text().unwrap_or_default().to_owned();
+                        let output_contract = read_lock(&entry.snapshot)
+                            .effective_config
+                            .output_contract
+                            .clone();
+                        match output_contract.validate_output(&text) {
+                            Ok(output) => {
+                                let outcome = SubagentRunOutcome::Completed {
+                                    text: text.clone(),
+                                    turns: run.turns,
+                                    usage: run.run_usage,
+                                };
+                                {
+                                    let mut snapshot = write_lock(&entry.snapshot);
+                                    snapshot.last_outcome = Some(outcome.clone());
+                                    snapshot.validated_output = Some(output.clone());
+                                }
+                                self.publish(
+                                    &entry,
+                                    SubagentEventKind::OutputValidated {
+                                        output: output.clone(),
+                                    },
+                                );
+                                self.publish(
+                                    &entry,
+                                    SubagentEventKind::RunFinished {
+                                        run_id: run_id.clone(),
+                                        outcome: outcome.clone(),
+                                    },
+                                );
+                                self.complete_foreground(
+                                    &entry,
+                                    &active_delivery_id,
+                                    outcome,
+                                    Some(output),
+                                );
+                                let _ = self.notify(
+                                    &entry.agent_id,
+                                    SubagentNotificationKind::Result,
+                                    if text.is_empty() {
+                                        "Subagent completed without a textual result.".to_owned()
+                                    } else {
+                                        text
+                                    },
+                                    SubagentNotificationSource::Runtime,
+                                );
+                            }
+                            Err(error) => {
+                                self.record_failed(
+                                    &entry,
+                                    &run_id,
+                                    &active_delivery_id,
+                                    format!("output contract violation: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(CoreAgentRunOutcome::Stopped)) => {
+                        let outcome = SubagentRunOutcome::Stopped;
+                        {
+                            let mut snapshot = write_lock(&entry.snapshot);
+                            snapshot.last_outcome = Some(outcome.clone());
+                            snapshot.validated_output = None;
+                        }
+                        self.publish(
+                            &entry,
+                            SubagentEventKind::RunFinished {
+                                run_id,
+                                outcome: outcome.clone(),
+                            },
+                        );
+                        self.complete_foreground(&entry, &active_delivery_id, outcome, None);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_failed(&entry, &run_id, &active_delivery_id, error.to_string());
+                    }
+                }
+
+                let continue_with_live_agent = {
+                    let _coordination = mutex_lock(&entry.send_close_lock);
+                    let pending = mailbox_sender.pending_len();
+                    let mut delivery_ids = mutex_lock(&entry.delivery_ids);
+                    while delivery_ids.len() > pending {
+                        delivery_ids.pop_front();
+                    }
+                    if pending == 0 {
+                        delivery_ids.clear();
+                        *mutex_lock(&entry.mailbox) = None;
+                        mailbox_sender.close();
+                        entry.set_state(SubagentState::Idle);
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if continue_with_live_agent {
+                    continue;
+                }
+                self.publish(
+                    &entry,
+                    SubagentEventKind::StateChanged {
+                        state: SubagentState::Idle,
+                    },
+                );
+                break;
+            }
+            // Dropping the rebuilt Agent releases its provider, tool registry,
+            // compactor, and mailbox. The durable sidechain remains resumable.
+        }
+    }
+
+    fn record_failed(
+        &self,
+        entry: &Arc<SubagentEntry>,
+        run_id: &str,
+        delivery_id: &str,
+        message: String,
+    ) {
         let outcome = SubagentRunOutcome::Failed {
             error: message.clone(),
         };
@@ -1308,15 +1857,83 @@ impl SubagentRuntime {
             entry,
             SubagentEventKind::RunFinished {
                 run_id: run_id.to_owned(),
-                outcome,
+                outcome: outcome.clone(),
             },
         );
+        self.complete_foreground(entry, delivery_id, outcome, None);
         let _ = self.notify(
             &entry.agent_id,
             SubagentNotificationKind::Failed,
             message,
             SubagentNotificationSource::Runtime,
         );
+    }
+
+    fn complete_foreground(
+        &self,
+        entry: &Arc<SubagentEntry>,
+        delivery_id: &str,
+        outcome: SubagentRunOutcome,
+        validated_output: Option<ValidatedSubagentOutput>,
+    ) {
+        if entry.foreground_delivery_id.as_deref() != Some(delivery_id)
+            || entry.completion.borrow().is_some()
+        {
+            return;
+        }
+        entry.completion.send_replace(Some(SubagentCompletion {
+            agent_id: entry.agent_id.clone(),
+            delivery_id: delivery_id.to_owned(),
+            outcome,
+            validated_output,
+        }));
+    }
+
+    fn finish_failed_cycle(
+        &self,
+        entry: &Arc<SubagentEntry>,
+        message_receiver: &mut mpsc::Receiver<PendingMessage>,
+    ) {
+        let became_idle = {
+            let _coordination = mutex_lock(&entry.send_close_lock);
+            mutex_lock(&entry.delivery_ids).pop_front();
+            if message_receiver.is_empty() {
+                entry.set_state(SubagentState::Idle);
+                true
+            } else {
+                false
+            }
+        };
+        if became_idle {
+            self.publish(
+                entry,
+                SubagentEventKind::StateChanged {
+                    state: SubagentState::Idle,
+                },
+            );
+        }
+    }
+
+    fn ensure_worker(&self, entry: &Arc<SubagentEntry>) {
+        if entry
+            .worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(receiver) = mutex_lock(&entry.prebuild_receiver).take() else {
+            entry.worker_started.store(false, Ordering::Release);
+            return;
+        };
+        let runtime = self.clone();
+        let entry = Arc::clone(entry);
+        tokio::spawn(async move {
+            let worker = runtime.run_worker(Arc::clone(&entry), receiver);
+            if AssertUnwindSafe(worker).catch_unwind().await.is_err() {
+                runtime.finish_after_panic(&entry).await;
+            }
+        });
     }
 
     fn transition_operational(&self, entry: &Arc<SubagentEntry>, state: SubagentState) {
@@ -1330,7 +1947,12 @@ impl SubagentRuntime {
 
     async fn finish_after_panic(&self, entry: &Arc<SubagentEntry>) {
         let message = "subagent worker panicked".to_owned();
-        self.record_failed(entry, "worker", message.clone());
+        let delivery_id = mutex_lock(&entry.delivery_ids)
+            .front()
+            .cloned()
+            .or_else(|| entry.foreground_delivery_id.clone())
+            .unwrap_or_else(|| new_id("delivery"));
+        self.record_failed(entry, "worker", &delivery_id, message.clone());
         self.finish_closed(entry, message, SubagentResourceDisposition::RuntimeFailed)
             .await;
     }
@@ -1364,13 +1986,25 @@ impl SubagentRuntime {
             snapshot.active_run = None;
             snapshot.draft = None;
         }
+        if entry.completion.borrow().is_none()
+            && let Some(delivery_id) = entry.foreground_delivery_id.as_deref()
+        {
+            self.complete_foreground(
+                entry,
+                delivery_id,
+                SubagentRunOutcome::Failed {
+                    error: reason.clone(),
+                },
+                None,
+            );
+        }
         if !entry.closed_event_emitted.swap(true, Ordering::AcqRel) {
             self.publish(
                 entry,
                 SubagentEventKind::Closed {
                     delivery_id: new_id("delivery"),
                     reason,
-                    wake_parent: true,
+                    wake_parent: entry.wake_parent.load(Ordering::Acquire),
                 },
             );
         }
@@ -1417,10 +2051,7 @@ impl SubagentRuntime {
 
     fn reserve_agent_id(&self) -> Result<String, SubagentError> {
         let agents = read_lock(&self.inner.agents);
-        let active = agents
-            .values()
-            .filter(|entry| entry.state() != SubagentState::Closed)
-            .count();
+        let active = active_agent_count(&agents);
         if active >= self.inner.config.max_agents {
             return Err(SubagentError::LimitReached {
                 limit: self.inner.config.max_agents,
@@ -1432,6 +2063,16 @@ impl SubagentRuntime {
                 return Ok(candidate);
             }
         }
+    }
+
+    fn ensure_active_capacity(&self) -> Result<(), SubagentError> {
+        let agents = read_lock(&self.inner.agents);
+        if active_agent_count(&agents) >= self.inner.config.max_agents {
+            return Err(SubagentError::LimitReached {
+                limit: self.inner.config.max_agents,
+            });
+        }
+        Ok(())
     }
 
     fn entry(&self, agent_id: &str) -> Result<Arc<SubagentEntry>, SubagentError> {
@@ -1615,6 +2256,28 @@ fn new_id(prefix: &str) -> String {
     )
 }
 
+fn subagent_session_id(agent_id: &str) -> String {
+    format!("subagent:{agent_id}")
+}
+
+fn valid_agent_id(agent_id: &str) -> bool {
+    agent_id.strip_prefix("agent_").is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn active_agent_count(agents: &HashMap<String, Arc<SubagentEntry>>) -> usize {
+    agents
+        .values()
+        .filter(|entry| {
+            matches!(
+                entry.state(),
+                SubagentState::Starting | SubagentState::Running | SubagentState::Closing
+            )
+        })
+        .count()
+}
+
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1643,7 +2306,7 @@ mod tests {
         provider::{LlmProvider, ProviderEventStream},
         types::{
             AssistantMessage, Message, ProviderEvent, ProviderRequest, ProviderResponse, Role,
-            TokenUsage,
+            TokenUsage, ToolCall,
         },
     };
     use tokio::sync::{Barrier, Notify};
@@ -1697,6 +2360,45 @@ mod tests {
 
     struct ProviderFactory {
         state: Arc<ProviderState>,
+    }
+
+    #[derive(Default)]
+    struct RecordingState {
+        requests: Mutex<Vec<ProviderRequest>>,
+        calls: AtomicUsize,
+        builds: AtomicUsize,
+    }
+
+    struct RecordingProvider {
+        state: Arc<RecordingState>,
+    }
+
+    impl LlmProvider for RecordingProvider {
+        fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
+            mutex_lock(&self.state.requests).push(request);
+            let call = self.state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(futures_util::stream::iter([Ok(ProviderEvent::Done(
+                response(&format!("recorded response {call}")),
+            ))]))
+        }
+    }
+
+    struct RecordingFactory {
+        state: Arc<RecordingState>,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for RecordingFactory {
+        async fn build(
+            &self,
+            _request: SubagentBuildRequest,
+        ) -> Result<Agent, SubagentFactoryError> {
+            self.state.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Agent::builder(RecordingProvider {
+                state: Arc::clone(&self.state),
+            })
+            .build())
+        }
     }
 
     #[async_trait]
@@ -1995,6 +2697,401 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn completed_children_release_live_capacity_and_resume_from_sidechain() {
+        let state = Arc::new(RecordingState::default());
+        let runtime = SubagentRuntime::new(
+            "parent-resume",
+            Arc::new(RecordingFactory {
+                state: Arc::clone(&state),
+            }),
+            SubagentConfig {
+                max_agents: 1,
+                ..SubagentConfig::default()
+            },
+        );
+
+        let first = runtime
+            .spawn(SpawnAgentRequest::new("first", "initial sidechain prompt"))
+            .await
+            .unwrap();
+        let completion = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.wait_for_completion(&first.agent_id, &first.delivery_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            completion.outcome,
+            SubagentRunOutcome::Completed { ref text, .. } if text == "recorded response 1"
+        ));
+        wait_for_state(&runtime, &first.agent_id, SubagentState::Idle).await;
+
+        // max_agents now bounds live work, not completed resumable records.
+        let second = runtime
+            .spawn(SpawnAgentRequest::new("second", "another task"))
+            .await
+            .unwrap();
+        runtime
+            .wait_for_completion(&second.agent_id, &second.delivery_id)
+            .await
+            .unwrap();
+        wait_for_state(&runtime, &second.agent_id, SubagentState::Idle).await;
+
+        runtime
+            .send_message(&first.agent_id, "follow up from the parent")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.calls.load(Ordering::SeqCst) >= 3
+                    && runtime.snapshot(&first.agent_id).unwrap().state == SubagentState::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resumed sidechain did not finish");
+
+        {
+            let requests = mutex_lock(&state.requests);
+            let resumed = &requests[2];
+            assert!(resumed.messages.iter().any(|message| {
+                message.role == Role::User
+                    && message.text_content() == Some("initial sidechain prompt")
+            }));
+            assert!(resumed.messages.iter().any(|message| {
+                message.role == Role::Assistant
+                    && message.text_content() == Some("recorded response 1")
+            }));
+            assert!(resumed.messages.iter().any(|message| {
+                message.role == Role::User
+                    && message.text_content() == Some("follow up from the parent")
+            }));
+        }
+        assert_eq!(state.builds.load(Ordering::SeqCst), 3);
+        runtime.shutdown("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn durable_parent_metadata_restores_a_completed_sidechain_without_replay() {
+        let storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new());
+        let initial_state = Arc::new(RecordingState::default());
+        let initial_runtime = SubagentRuntime::with_storage(
+            "parent-before-restart",
+            Arc::new(RecordingFactory {
+                state: Arc::clone(&initial_state),
+            }),
+            SubagentConfig::default(),
+            Arc::clone(&storage),
+        );
+        let spawned = initial_runtime
+            .spawn(SpawnAgentRequest::new("durable child", "original work"))
+            .await
+            .unwrap();
+        initial_runtime
+            .wait_for_completion(&spawned.agent_id, &spawned.delivery_id)
+            .await
+            .unwrap();
+        wait_for_state(&initial_runtime, &spawned.agent_id, SubagentState::Idle).await;
+        let effective_config = initial_runtime
+            .snapshot(&spawned.agent_id)
+            .unwrap()
+            .effective_config;
+        initial_runtime.shutdown("simulated daemon restart").await;
+
+        let call_id = "spawn-call-restored";
+        let parent_history = vec![
+            Message::assistant(
+                None,
+                vec![ToolCall::new(
+                    call_id,
+                    crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    serde_json::json!({
+                        "description": "durable child",
+                        "prompt": "original work"
+                    }),
+                )],
+            ),
+            Message::tool_result_content(
+                call_id,
+                Content::text("recorded response 1"),
+                false,
+                Some(serde_json::json!({
+                    "subagent_tool": crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    "version": 1,
+                    "agent_id": spawned.agent_id.clone(),
+                    "delivery_id": spawned.delivery_id.clone(),
+                    "description": "durable child",
+                    "status": "completed",
+                    "effective_config": effective_config,
+                })),
+            ),
+        ];
+
+        let resumed_state = Arc::new(RecordingState::default());
+        let resumed_runtime = SubagentRuntime::with_storage(
+            "parent-after-restart",
+            Arc::new(RecordingFactory {
+                state: Arc::clone(&resumed_state),
+            }),
+            SubagentConfig::default(),
+            storage,
+        );
+        let report = resumed_runtime.restore_from_history(&parent_history).await;
+        assert_eq!(report.restored, vec![spawned.agent_id.clone()]);
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            resumed_runtime.snapshot(&spawned.agent_id).unwrap().state,
+            SubagentState::Idle
+        );
+
+        resumed_runtime
+            .send_message(&spawned.agent_id, "continue after restart")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if resumed_state.calls.load(Ordering::SeqCst) == 1
+                    && resumed_runtime.snapshot(&spawned.agent_id).unwrap().state
+                        == SubagentState::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restored child did not resume");
+        {
+            let requests = mutex_lock(&resumed_state.requests);
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].messages.iter().any(|message| {
+                message.role == Role::User && message.text_content() == Some("original work")
+            }));
+            assert!(requests[0].messages.iter().any(|message| {
+                message.role == Role::User
+                    && message.text_content() == Some("continue after restart")
+            }));
+        }
+        resumed_runtime.shutdown("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn forked_parent_history_cannot_adopt_the_source_sidechain() {
+        let storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new());
+        let source_state = Arc::new(RecordingState::default());
+        let source_runtime = SubagentRuntime::with_storage(
+            "source-parent",
+            Arc::new(RecordingFactory {
+                state: Arc::clone(&source_state),
+            }),
+            SubagentConfig::default(),
+            Arc::clone(&storage),
+        );
+        let spawned = source_runtime
+            .spawn(SpawnAgentRequest::new("source child", "source work"))
+            .await
+            .unwrap();
+        source_runtime
+            .wait_for_completion(&spawned.agent_id, &spawned.delivery_id)
+            .await
+            .unwrap();
+        wait_for_state(&source_runtime, &spawned.agent_id, SubagentState::Idle).await;
+        let effective_config = source_runtime
+            .snapshot(&spawned.agent_id)
+            .unwrap()
+            .effective_config;
+        source_runtime.shutdown("source actor stopped").await;
+
+        let call_id = "source-spawn-call";
+        let inherited_history = vec![
+            Message::assistant(
+                None,
+                vec![ToolCall::new(
+                    call_id,
+                    crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    serde_json::json!({
+                        "description": "source child",
+                        "prompt": "source work"
+                    }),
+                )],
+            ),
+            Message::tool_result_content(
+                call_id,
+                Content::text("recorded response 1"),
+                false,
+                Some(serde_json::json!({
+                    "subagent_tool": crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    "version": 1,
+                    "parent_id": "source-parent",
+                    "agent_id": spawned.agent_id,
+                    "delivery_id": spawned.delivery_id,
+                    "description": "source child",
+                    "status": "completed",
+                    "effective_config": effective_config,
+                })),
+            ),
+        ];
+        let fork_runtime = SubagentRuntime::with_storage(
+            "fork-parent",
+            Arc::new(RecordingFactory {
+                state: Arc::new(RecordingState::default()),
+            }),
+            SubagentConfig::default(),
+            storage,
+        );
+        let report = fork_runtime.restore_from_history(&inherited_history).await;
+        assert!(report.restored.is_empty());
+        assert!(report.failures.is_empty());
+        assert!(fork_runtime.snapshots().is_empty());
+        fork_runtime.shutdown("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn durable_seed_restores_identity_without_replaying_an_uncommitted_prompt() {
+        let storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new());
+        let entered = Arc::new(Notify::new());
+        let initial_runtime = SubagentRuntime::with_storage(
+            "parent-before-early-restart",
+            Arc::new(PendingFactory {
+                entered: Arc::clone(&entered),
+            }),
+            SubagentConfig::default(),
+            Arc::clone(&storage),
+        );
+        let spawned = initial_runtime
+            .spawn_configured(
+                ConfiguredSpawnAgentRequest::new("durable seed", "not yet committed")
+                    .run_in_background(true),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("subagent factory was not entered");
+        let effective_config = initial_runtime
+            .snapshot(&spawned.agent_id)
+            .unwrap()
+            .effective_config;
+        let persisted = storage
+            .load(&subagent_session_id(&spawned.agent_id))
+            .await
+            .unwrap()
+            .expect("spawn must persist a sidechain seed before building");
+        assert!(persisted.messages.is_empty());
+        initial_runtime
+            .shutdown("simulated crash before first checkpoint")
+            .await;
+
+        let call_id = "spawn-call-seeded";
+        let parent_history = vec![
+            Message::assistant(
+                None,
+                vec![ToolCall::new(
+                    call_id,
+                    crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    serde_json::json!({
+                        "description": "durable seed",
+                        "prompt": "not yet committed",
+                        "run_in_background": true
+                    }),
+                )],
+            ),
+            Message::tool_result_content(
+                call_id,
+                Content::text("Agent launched successfully."),
+                false,
+                Some(serde_json::json!({
+                    "subagent_tool": crate::tool::subagent::SPAWN_AGENT_TOOL_NAME,
+                    "version": 1,
+                    "agent_id": spawned.agent_id.clone(),
+                    "delivery_id": spawned.delivery_id.clone(),
+                    "description": "durable seed",
+                    "status": "async_launched",
+                    "effective_config": effective_config,
+                })),
+            ),
+        ];
+
+        let resumed_state = Arc::new(RecordingState::default());
+        let resumed_runtime = SubagentRuntime::with_storage(
+            "parent-after-early-restart",
+            Arc::new(RecordingFactory {
+                state: Arc::clone(&resumed_state),
+            }),
+            SubagentConfig::default(),
+            storage,
+        );
+        let report = resumed_runtime.restore_from_history(&parent_history).await;
+        assert_eq!(report.restored, vec![spawned.agent_id.clone()]);
+        assert!(report.failures.is_empty());
+
+        resumed_runtime
+            .send_message(&spawned.agent_id, "explicitly continue after restart")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if resumed_state.calls.load(Ordering::SeqCst) == 1
+                    && resumed_runtime.snapshot(&spawned.agent_id).unwrap().state
+                        == SubagentState::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seeded child did not accept an explicit continuation");
+        {
+            let requests = mutex_lock(&resumed_state.requests);
+            assert_eq!(requests.len(), 1);
+            assert!(!requests[0].messages.iter().any(|message| {
+                message.role == Role::User && message.text_content() == Some("not yet committed")
+            }));
+            assert!(requests[0].messages.iter().any(|message| {
+                message.role == Role::User
+                    && message.text_content() == Some("explicitly continue after restart")
+            }));
+        }
+        resumed_runtime.shutdown("test complete").await;
+    }
+
+    #[tokio::test]
+    async fn explore_and_plan_children_are_one_shot() {
+        for agent_type in [SubagentType::Explore, SubagentType::Plan] {
+            let state = Arc::new(RecordingState::default());
+            let runtime = SubagentRuntime::new(
+                format!("one-shot-{agent_type:?}"),
+                Arc::new(RecordingFactory { state }),
+                SubagentConfig::default(),
+            );
+            let spawned = runtime
+                .spawn_configured(
+                    ConfiguredSpawnAgentRequest::new("one shot", "inspect once")
+                        .agent_type(agent_type),
+                )
+                .await
+                .unwrap();
+            runtime
+                .wait_for_completion(&spawned.agent_id, &spawned.delivery_id)
+                .await
+                .unwrap();
+            wait_for_state(&runtime, &spawned.agent_id, SubagentState::Idle).await;
+
+            let error = runtime
+                .send_message(&spawned.agent_id, "try to continue")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SubagentError::InvalidConfiguration { message }
+                    if message.contains("one-shot explore/plan")
+            ));
+            runtime.shutdown("test complete").await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_spawns_cannot_exceed_the_limit() {
         let runtime = pending_runtime(1);
@@ -2053,7 +3150,9 @@ mod tests {
         let runtime = pending_runtime(1);
         let mut events = runtime.subscribe();
         let spawned = runtime
-            .spawn(SpawnAgentRequest::new("notify", "wait"))
+            .spawn_configured(
+                ConfiguredSpawnAgentRequest::new("notify", "wait").run_in_background(true),
+            )
             .await
             .unwrap();
         let _spawned = events.recv().await.unwrap();

@@ -103,11 +103,20 @@ impl BuiltinTools {
 
     pub(crate) fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(6);
+        let bash_registry = self
+            .bash
+            .then(|| BashTaskRegistry::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES));
         if self.read {
-            tools.push(Arc::new(ReadTool::new(self.workspace.root())));
+            let read = bash_registry.as_ref().map_or_else(
+                || ReadTool::new(self.workspace.root()),
+                |registry| {
+                    ReadTool::new(self.workspace.root())
+                        .with_internal_read_root(registry.output_root())
+                },
+            );
+            tools.push(Arc::new(read));
         }
-        if self.bash {
-            let registry = BashTaskRegistry::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        if let Some(registry) = bash_registry {
             tools.push(Arc::new(
                 BashTool::new(self.workspace.root()).task_registry(registry.clone()),
             ));
@@ -127,7 +136,8 @@ impl BuiltinTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolEffect;
+    use crate::{CapabilityMode, ToolEffect, ToolExecutionContext};
+    use serde_json::json;
 
     #[test]
     fn supports_selective_tool_sets() {
@@ -172,5 +182,52 @@ mod tests {
             .map(|tool| tool.definition().name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["bash", "bash_task_output", "bash_task_stop"]);
+    }
+
+    #[tokio::test]
+    async fn read_can_access_the_shared_internal_background_output_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = BuiltinTools::none(workspace.path())
+            .with_read()
+            .with_bash()
+            .into_tools();
+        let bash = tools
+            .iter()
+            .find(|tool| tool.definition().name == "bash")
+            .unwrap();
+        let task_output = tools
+            .iter()
+            .find(|tool| tool.definition().name == "bash_task_output")
+            .unwrap();
+        let read = tools
+            .iter()
+            .find(|tool| tool.definition().name == "read")
+            .unwrap();
+
+        let started = bash
+            .execute(json!({
+                "command": "printf 'background file\\n'",
+                "run_in_background": true
+            }))
+            .await
+            .unwrap();
+        let metadata = started.metadata.as_ref().unwrap();
+        let task_id = metadata["task_id"].as_str().unwrap();
+        let output_file = metadata["output_file"].as_str().unwrap();
+        task_output
+            .execute(json!({ "task_id": task_id, "timeout": 2_000 }))
+            .await
+            .unwrap();
+
+        let context = ToolExecutionContext::detached("read-background-output")
+            .with_workspace_policy(
+                Some(Workspace::new(workspace.path())),
+                CapabilityMode::ReadOnly,
+            );
+        let output = read
+            .execute_with_context(json!({ "path": output_file }), context)
+            .await
+            .unwrap();
+        assert!(output.content.contains("background file"));
     }
 }

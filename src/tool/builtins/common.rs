@@ -47,6 +47,15 @@ pub(super) async fn resolve_path_for_context(
     raw_path: &str,
     context: Option<&ToolExecutionContext>,
 ) -> Result<PathBuf, ToolError> {
+    resolve_path_for_context_with_internal_roots(cwd, raw_path, context, &[]).await
+}
+
+pub(super) async fn resolve_path_for_context_with_internal_roots(
+    cwd: &Path,
+    raw_path: &str,
+    context: Option<&ToolExecutionContext>,
+    internal_read_roots: &[PathBuf],
+) -> Result<PathBuf, ToolError> {
     let path = resolve_path(cwd, raw_path)?;
     let Some(context) = context else {
         return Ok(path);
@@ -62,14 +71,21 @@ pub(super) async fn resolve_path_for_context(
         .await
         .map_err(|error| io_error("could not canonicalize workspace", workspace.root(), error))?;
     let canonical_target = canonical_mutation_key(&path).await;
-    if !canonical_target.starts_with(&canonical_workspace) {
-        return Err(ToolError::new(format!(
-            "path {} is outside the configured workspace {}",
-            path.display(),
-            workspace.root().display()
-        )));
+    if canonical_target.starts_with(&canonical_workspace) {
+        return Ok(path);
     }
-    Ok(path)
+    for root in internal_read_roots {
+        if let Ok(canonical_root) = tokio::fs::canonicalize(root).await
+            && canonical_target.starts_with(canonical_root)
+        {
+            return Ok(path);
+        }
+    }
+    Err(ToolError::new(format!(
+        "path {} is outside the configured workspace {}",
+        path.display(),
+        workspace.root().display()
+    )))
 }
 
 fn home_dir() -> Option<PathBuf> {

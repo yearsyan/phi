@@ -13,7 +13,7 @@ use crate::{
         ContextCompactionOutcome, ContextCompactionRequest, ContextCompactionRunOutcome,
         ContextCompactionTrigger, ContextCompactor, estimate_messages_tokens,
     },
-    error::{AgentError, ContextCompactionError, HookError, McpError, ProviderError},
+    error::{AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError},
     hook::{Hook, HookRegistry, LlmResponseContext, TurnEndContext, TurnStartContext},
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
     provider::LlmProvider,
@@ -38,7 +38,7 @@ const INTERRUPTED_TOOL_RESULT: &str =
     "tool execution was interrupted before its result was persisted";
 const UNKNOWN_TOOL_RESULT: &str = "tool execution outcome is unknown; it may have produced side effects and will not be retried automatically";
 pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
-pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 10;
 pub const DEFAULT_AGENT_MAILBOX_CAPACITY: usize = 32;
 
 /// Result of adding a message to an [`AgentMailbox`].
@@ -78,6 +78,19 @@ impl AgentMailboxSender {
         &self,
         content: impl Into<Content>,
     ) -> Result<AgentMailboxDelivery, AgentMailboxSendError> {
+        self.send_with_visibility(content, MessageVisibility::Public)
+    }
+
+    /// Adds a message with explicit transcript visibility.
+    ///
+    /// Daemon-owned coordination messages use this entry point so they can join
+    /// an active run at a protocol-safe boundary without becoming public
+    /// conversation history. Ordinary callers should normally use [`Self::send`].
+    pub fn send_with_visibility(
+        &self,
+        content: impl Into<Content>,
+        visibility: MessageVisibility,
+    ) -> Result<AgentMailboxDelivery, AgentMailboxSendError> {
         let mut state = self.inner.lock_state();
         if state.closed {
             return Err(AgentMailboxSendError::Closed);
@@ -88,7 +101,10 @@ impl AgentMailboxSender {
             });
         }
 
-        state.pending.push_back(content.into());
+        state.pending.push_back(MailboxMessage {
+            content: content.into(),
+            visibility,
+        });
         let delivery = if state.running {
             AgentMailboxDelivery::Queued
         } else {
@@ -173,6 +189,12 @@ impl AgentMailbox {
         Self::bounded(DEFAULT_AGENT_MAILBOX_CAPACITY)
     }
 
+    fn sender(&self) -> AgentMailboxSender {
+        AgentMailboxSender {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     fn begin_run(&self) -> MailboxRunGuard {
         let mut state = self.inner.lock_state();
         debug_assert!(!state.running, "agent mailbox run started twice");
@@ -222,7 +244,7 @@ impl AgentMailboxInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn claim_pending_locked(state: &mut AgentMailboxState) -> Vec<Content> {
+    fn claim_pending_locked(state: &mut AgentMailboxState) -> Vec<MailboxMessage> {
         let contents = state.pending.drain(..).collect::<Vec<_>>();
         state.in_flight = state.in_flight.saturating_add(contents.len());
         contents
@@ -239,10 +261,16 @@ impl AgentMailboxInner {
 
 #[derive(Debug, Default)]
 struct AgentMailboxState {
-    pending: VecDeque<Content>,
+    pending: VecDeque<MailboxMessage>,
     in_flight: usize,
     running: bool,
     closed: bool,
+}
+
+#[derive(Debug)]
+struct MailboxMessage {
+    content: Content,
+    visibility: MessageVisibility,
 }
 
 struct MailboxRunGuard {
@@ -293,12 +321,12 @@ impl Drop for MailboxRunGuard {
 
 struct MailboxBatch {
     inner: Arc<AgentMailboxInner>,
-    contents: Vec<Content>,
+    contents: Vec<MailboxMessage>,
     resolved: bool,
 }
 
 impl MailboxBatch {
-    fn new(inner: Arc<AgentMailboxInner>, contents: Vec<Content>) -> Self {
+    fn new(inner: Arc<AgentMailboxInner>, contents: Vec<MailboxMessage>) -> Self {
         Self {
             inner,
             contents,
@@ -322,8 +350,8 @@ impl Drop for MailboxBatch {
         let mut state = self.inner.lock_state();
         state.in_flight = state.in_flight.saturating_sub(self.contents.len());
         if !state.closed {
-            for content in self.contents.drain(..).rev() {
-                state.pending.push_front(content);
+            for message in self.contents.drain(..).rev() {
+                state.pending.push_front(message);
             }
         }
         let wake = !state.closed && !state.running && !state.pending.is_empty();
@@ -1387,15 +1415,21 @@ impl Agent {
 
             checkpoint = AgentCheckpoint::capture(self);
 
-            if turn_end.message.tool_calls.is_empty() {
-                let pending = mailbox_run
-                    .as_mut()
-                    .and_then(MailboxRunGuard::claim_pending_or_finish);
-                if let Some(batch) = pending {
-                    self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
-                        .await?;
-                    continue;
+            let terminal_turn = turn_end.message.tool_calls.is_empty();
+            let pending = mailbox_run.as_mut().and_then(|mailbox| {
+                if terminal_turn {
+                    mailbox.claim_pending_or_finish()
+                } else {
+                    mailbox.claim_pending()
                 }
+            });
+            if let Some(batch) = pending {
+                self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
+                    .await?;
+                continue;
+            }
+
+            if terminal_turn {
                 self.emit_agent_end();
                 return Ok(AgentRunOutcome::Completed(AgentRun {
                     final_message,
@@ -1417,8 +1451,10 @@ impl Agent {
         let messages = batch
             .contents
             .iter()
-            .cloned()
-            .map(Message::user_content)
+            .map(|mailbox_message| {
+                Message::user_content(mailbox_message.content.clone())
+                    .with_visibility(mailbox_message.visibility)
+            })
             .collect::<Vec<_>>();
         self.messages.extend(messages.iter().cloned());
         self.session_history.append_active(&messages);
@@ -2009,6 +2045,19 @@ impl Agent {
                 listener(&event);
             }
         });
+        let agent_notification = self.mailbox.as_ref().map(|mailbox| {
+            let sender = mailbox.sender();
+            Arc::new(move |content: Content| {
+                sender
+                    .send_with_visibility(content, MessageVisibility::Internal)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "could not queue Agent background notification: {error}"
+                        ))
+                    })
+            }) as crate::tool::AgentNotificationReporter
+        });
         ToolExecutionContext::new(
             call.id.clone(),
             control.tool_cancellation(),
@@ -2016,6 +2065,7 @@ impl Agent {
             Some(progress),
         )
         .with_workspace_policy(self.workspace.clone(), capability_mode)
+        .with_agent_notification(agent_notification)
     }
 
     fn hook_failure(&self, error: HookError) -> AgentError {
@@ -2090,10 +2140,9 @@ impl ToolBatchPermissions {
         tools: &HashMap<String, Arc<dyn Tool>>,
     ) -> bool {
         calls.iter().any(|call| {
-            tools.get(&call.name).is_none_or(|tool| {
-                tool.effect_for(&call.arguments) == ToolEffect::Internal
-                    || tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive
-            })
+            tools
+                .get(&call.name)
+                .is_none_or(|tool| tool.concurrency(&call.arguments) == ToolConcurrency::Exclusive)
         })
     }
 }
@@ -2879,6 +2928,15 @@ mod tests {
 
         fn effect(&self) -> ToolEffect {
             self.effect
+        }
+
+        fn concurrency(&self, _arguments: &serde_json::Value) -> ToolConcurrency {
+            match self.effect {
+                ToolEffect::ReadOnly | ToolEffect::Internal => ToolConcurrency::Safe,
+                ToolEffect::WorkspaceWrite | ToolEffect::ExternalSideEffect => {
+                    ToolConcurrency::Exclusive
+                }
+            }
         }
 
         async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
@@ -4436,6 +4494,7 @@ mod tests {
         }
 
         assert_eq!(run_probe(ToolEffect::ReadOnly, 2).await, 2);
+        assert_eq!(run_probe(ToolEffect::Internal, 2).await, 2);
         assert_eq!(run_probe(ToolEffect::ExternalSideEffect, 2).await, 1);
     }
 
@@ -4981,7 +5040,9 @@ mod tests {
         assert_eq!(emitted, 1);
 
         assert_eq!(
-            sender.send("follow-up from idle").unwrap(),
+            sender
+                .send_with_visibility("follow-up from idle", MessageVisibility::Internal)
+                .unwrap(),
             AgentMailboxDelivery::WakeRequired
         );
         let resumed = agent.prompt_from_mailbox().await.unwrap().unwrap();
@@ -4989,6 +5050,10 @@ mod tests {
         assert_eq!(
             resumed.new_messages[0].text_content(),
             Some("follow-up from idle")
+        );
+        assert_eq!(
+            resumed.new_messages[0].visibility,
+            MessageVisibility::Internal
         );
         assert!(agent.prompt_from_mailbox().await.unwrap().is_none());
         let requests = requests.lock().unwrap();

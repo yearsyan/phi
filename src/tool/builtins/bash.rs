@@ -30,6 +30,7 @@ use crate::{
 };
 
 const MAX_TIMEOUT_SECONDS: f64 = 2_147_483_647_f64 / 1_000_f64;
+const MAX_BASH_OUTPUT_BYTES: u64 = 5 * 1_024 * 1_024 * 1_024;
 pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(not(test))]
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
@@ -113,7 +114,12 @@ impl BashTool {
         Ok(())
     }
 
-    fn start_background(&self, arguments: ResolvedBashArguments) -> Result<ToolOutput, ToolError> {
+    async fn start_background(
+        &self,
+        arguments: ResolvedBashArguments,
+        description: String,
+        notification_context: Option<ToolExecutionContext>,
+    ) -> Result<ToolOutput, ToolError> {
         // The running task must not retain its management registry. Otherwise
         // the registry owns the JoinHandle while the task owns the registry,
         // preventing Agent drop from cancelling an orphaned command.
@@ -123,20 +129,49 @@ impl BashTool {
         };
         let task_registry = self.task_registry.clone();
         let registry_for_run = task_registry.downgrade();
-        let task_id = task_registry.spawn(move |task_id| {
-            let registry_for_output = registry_for_run.clone();
-            let output_task_id = task_id.clone();
-            let observer: OutputObserver = Arc::new(move |chunk| {
-                registry_for_output.append_output(&output_task_id, chunk);
-            });
-            async move { tool.run_foreground(arguments, Some(observer)).await }
-        })?;
+        let completion_notification = notification_context
+            .as_ref()
+            .is_some_and(ToolExecutionContext::can_notify_agent);
+        let notification_context =
+            notification_context.filter(|context| context.can_notify_agent());
+        let started = task_registry
+            .spawn(
+                description.clone(),
+                notification_context,
+                move |task_id, output_path, output_file| {
+                    let registry_for_output = registry_for_run.clone();
+                    let output_task_id = task_id.clone();
+                    let observer: OutputObserver = Arc::new(move |chunk| {
+                        registry_for_output.append_output(&output_task_id, chunk);
+                    });
+                    async move {
+                        tool.run_foreground(
+                            arguments,
+                            Some(observer),
+                            Some((output_file, output_path)),
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+        let notification_note = if completion_notification {
+            "You will receive a task_notification when it finishes. Do not poll; use read on output_file after that notification."
+        } else {
+            "This host has no automatic completion mailbox. Use the deprecated bash_task_output compatibility tool if you must wait for completion."
+        };
         Ok(ToolOutput::success(format!(
-            "Background bash task started: {task_id}\nUse bash_task_output to inspect it or bash_task_stop to stop it."
+            "Background command running with task ID: {}\nOutput is being written to: {}\n{notification_note}\nUse bash_task_stop to stop it.",
+            started.task_id,
+            started.output_path.display(),
         ))
         .with_metadata(json!({
-            "task_id": task_id,
+            "task_id": started.task_id,
             "status": "running",
+            "task_type": "local_bash",
+            "description": description,
+            "output_file": started.output_path,
+            "completion_notification": completion_notification,
         })))
     }
 
@@ -144,6 +179,7 @@ impl BashTool {
         &self,
         arguments: ResolvedBashArguments,
         observer: Option<OutputObserver>,
+        persisted_output: Option<(File, PathBuf)>,
     ) -> Result<ToolOutput, ToolError> {
         self.validate_cwd().await?;
 
@@ -178,7 +214,12 @@ impl BashTool {
         let max_lines = self.max_lines;
         let max_bytes = self.max_bytes;
         let collector = tokio::spawn(async move {
-            let mut accumulator = BashOutputAccumulator::new(max_lines, max_bytes);
+            let mut accumulator = persisted_output.map_or_else(
+                || BashOutputAccumulator::new(max_lines, max_bytes),
+                |(file, path)| {
+                    BashOutputAccumulator::with_full_output(max_lines, max_bytes, file, path)
+                },
+            );
             collect_output(receiver, &mut accumulator, observer.as_ref()).await?;
             accumulator.finish().await
         });
@@ -224,12 +265,36 @@ impl BashTool {
             }
         }
     }
+
+    async fn execute_inner(
+        &self,
+        arguments: serde_json::Value,
+        notification_context: Option<ToolExecutionContext>,
+    ) -> Result<ToolOutput, ToolError> {
+        let arguments: BashArguments =
+            serde_json::from_value(arguments).map_err(|error| invalid_arguments("bash", error))?;
+        let description = task_description(arguments.description.as_deref(), &arguments.command);
+        let resolved = ResolvedBashArguments {
+            command: arguments.command,
+            timeout: resolve_timeout(arguments.timeout, self.default_timeout)?,
+        };
+        if arguments.run_in_background {
+            // Fail obvious configuration errors synchronously instead of
+            // returning an id for a task that can never start.
+            self.validate_cwd().await?;
+            self.start_background(resolved, description, notification_context)
+                .await
+        } else {
+            self.run_foreground(resolved, None, None).await
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BashArguments {
     command: String,
+    description: Option<String>,
     timeout: Option<f64>,
     #[serde(default)]
     run_in_background: bool,
@@ -260,7 +325,7 @@ impl Tool for BashTool {
         ToolDefinition::new(
             "bash",
             format!(
-                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. The optional timeout is measured in seconds and overrides the configured default{}. Set run_in_background=true for a long-running command, then inspect or stop it with bash_task_output and bash_task_stop.",
+                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. The optional timeout is measured in seconds and overrides the configured default{}. Set run_in_background=true only when the result is not needed immediately. A background call returns task_id and output_file immediately; when the Agent host supports notifications, wait for task_notification instead of polling, then use read on output_file. Use bash_task_stop to stop it. bash_task_output is a deprecated compatibility fallback.",
                 self.max_lines,
                 self.max_bytes,
                 self.default_timeout.map_or_else(
@@ -275,6 +340,10 @@ impl Tool for BashTool {
                         "type": "string",
                         "description": "Shell command to execute"
                     },
+                    "description": {
+                        "type": "string",
+                        "description": "Short active-voice description of what the command does"
+                    },
                     "timeout": {
                         "type": "number",
                         "exclusiveMinimum": 0,
@@ -283,7 +352,7 @@ impl Tool for BashTool {
                     "run_in_background": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Start the command as a managed background task and return immediately"
+                        "description": "Run as a managed background task, return task_id and output_file immediately, and use read after the completion notification"
                     }
                 },
                 "required": ["command"],
@@ -293,20 +362,7 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let arguments: BashArguments =
-            serde_json::from_value(arguments).map_err(|error| invalid_arguments("bash", error))?;
-        let resolved = ResolvedBashArguments {
-            command: arguments.command,
-            timeout: resolve_timeout(arguments.timeout, self.default_timeout)?,
-        };
-        if arguments.run_in_background {
-            // Fail obvious configuration errors synchronously instead of
-            // returning an id for a task that can never start.
-            self.validate_cwd().await?;
-            self.start_background(resolved)
-        } else {
-            self.run_foreground(resolved, None).await
-        }
+        self.execute_inner(arguments, None).await
     }
 
     async fn execute_with_context(
@@ -323,7 +379,7 @@ impl Tool for BashTool {
         } else {
             "Command started"
         }));
-        let execution = self.execute(arguments);
+        let execution = self.execute_inner(arguments, Some(context.clone()));
         tokio::pin!(execution);
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         heartbeat.tick().await;
@@ -352,6 +408,23 @@ impl Tool for BashTool {
             })),
         );
         result
+    }
+}
+
+fn task_description(description: Option<&str>, command: &str) -> String {
+    let source = description
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .unwrap_or_else(|| command.trim());
+    let mut characters = source.chars();
+    let mut concise = characters.by_ref().take(200).collect::<String>();
+    if characters.next().is_some() {
+        concise.push('…');
+    }
+    if concise.is_empty() {
+        "background command".to_owned()
+    } else {
+        concise
     }
 }
 
@@ -604,6 +677,9 @@ struct BashOutputAccumulator {
     tail: Vec<u8>,
     full_output: Option<File>,
     full_output_path: Option<PathBuf>,
+    full_output_limit: u64,
+    full_output_bytes_written: u64,
+    full_output_capped: bool,
 }
 
 impl BashOutputAccumulator {
@@ -619,6 +695,39 @@ impl BashOutputAccumulator {
             tail: Vec::new(),
             full_output: None,
             full_output_path: None,
+            full_output_limit: MAX_BASH_OUTPUT_BYTES,
+            full_output_bytes_written: 0,
+            full_output_capped: false,
+        }
+    }
+
+    fn with_full_output(
+        max_lines: usize,
+        max_bytes: usize,
+        full_output: File,
+        full_output_path: PathBuf,
+    ) -> Self {
+        Self::with_full_output_limit(
+            max_lines,
+            max_bytes,
+            full_output,
+            full_output_path,
+            MAX_BASH_OUTPUT_BYTES,
+        )
+    }
+
+    fn with_full_output_limit(
+        max_lines: usize,
+        max_bytes: usize,
+        full_output: File,
+        full_output_path: PathBuf,
+        full_output_limit: u64,
+    ) -> Self {
+        Self {
+            full_output: Some(full_output),
+            full_output_path: Some(full_output_path),
+            full_output_limit,
+            ..Self::new(max_lines, max_bytes)
         }
     }
 
@@ -635,8 +744,8 @@ impl BashOutputAccumulator {
         self.tail.extend_from_slice(chunk);
         self.trim_tail();
 
-        if let Some(file) = &mut self.full_output {
-            file.write_all(chunk).await?;
+        if self.full_output.is_some() {
+            self.append_full_output(chunk).await?;
         } else {
             self.prefix.extend_from_slice(chunk);
             if self.is_truncated() {
@@ -646,12 +755,53 @@ impl BashOutputAccumulator {
         Ok(())
     }
 
+    async fn append_full_output(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if self.full_output_capped || chunk.is_empty() {
+            return Ok(());
+        }
+        let cap_label = if self.full_output_limit == MAX_BASH_OUTPUT_BYTES {
+            "5GB".to_owned()
+        } else {
+            format!("{} bytes", self.full_output_limit)
+        };
+        let cap_note = format!("\n[output truncated: exceeded {cap_label} disk cap]\n");
+        let note_bytes = cap_note.as_bytes();
+        let note_len = u64::try_from(note_bytes.len())
+            .unwrap_or(u64::MAX)
+            .min(self.full_output_limit);
+        let data_limit = self.full_output_limit.saturating_sub(note_len);
+        let remaining = data_limit.saturating_sub(self.full_output_bytes_written);
+        let write_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
+        let file = self
+            .full_output
+            .as_mut()
+            .expect("full output file is configured");
+        if write_len > 0 {
+            file.write_all(&chunk[..write_len]).await?;
+            self.full_output_bytes_written = self
+                .full_output_bytes_written
+                .saturating_add(u64::try_from(write_len).unwrap_or(u64::MAX));
+        }
+        if write_len < chunk.len() {
+            file.write_all(&note_bytes[..usize::try_from(note_len).unwrap_or(note_bytes.len())])
+                .await?;
+            self.full_output_capped = true;
+        }
+        Ok(())
+    }
+
     async fn finish(mut self) -> io::Result<BashOutputSnapshot> {
         if let Some(file) = &mut self.full_output {
             file.flush().await?;
         }
         let truncated = self.is_truncated();
-        let source = if truncated { &self.tail } else { &self.prefix };
+        let source = if truncated || self.full_output_path.is_some() {
+            &self.tail
+        } else {
+            &self.prefix
+        };
         let decoded = String::from_utf8_lossy(source);
         let mut truncation = truncate_tail(&decoded, self.max_lines, self.max_bytes);
         truncation.total_lines = self.total_lines();
@@ -694,17 +844,16 @@ impl BashOutputAccumulator {
         for _ in 0..10 {
             let path =
                 std::env::temp_dir().join(format!("phi-bash-{:016x}.log", fastrand::u64(..)));
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .await
-            {
-                Ok(mut file) => {
-                    file.write_all(&self.prefix).await?;
-                    self.prefix.clear();
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path).await {
+                Ok(file) => {
+                    let prefix = std::mem::take(&mut self.prefix);
                     self.full_output = Some(file);
                     self.full_output_path = Some(path);
+                    self.append_full_output(&prefix).await?;
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -788,10 +937,14 @@ fn format_exit_status(status: ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     use tempfile::tempdir;
 
     use super::*;
     use crate::tool::builtins::bash_task::{BashTaskOutputTool, BashTaskStopTool};
+    use crate::types::Content;
 
     fn task_id(output: &ToolOutput) -> String {
         output.metadata.as_ref().unwrap()["task_id"]
@@ -800,10 +953,19 @@ mod tests {
             .to_owned()
     }
 
+    fn task_output_text(output: &ToolOutput) -> &str {
+        output
+            .content
+            .split_once("<output>\n")
+            .and_then(|(_, output)| output.rsplit_once("\n</output>"))
+            .map(|(output, _)| output)
+            .unwrap_or_default()
+    }
+
     async fn wait_for_terminal(output_tool: &BashTaskOutputTool, task_id: &str) -> ToolOutput {
         for _ in 0..100 {
             let output = output_tool
-                .execute(json!({ "task_id": task_id }))
+                .execute(json!({ "task_id": task_id, "timeout": 2_000 }))
                 .await
                 .unwrap();
             if output.metadata.as_ref().unwrap()["status"] != "running" {
@@ -914,7 +1076,38 @@ mod tests {
             tokio::fs::read_to_string(path).await.unwrap(),
             "one\ntwo\nthree\n"
         );
+        #[cfg(unix)]
+        assert_eq!(
+            tokio::fs::metadata(path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_output_obeys_its_disk_cap() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("capped.output");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut accumulator =
+            BashOutputAccumulator::with_full_output_limit(200, 1_024, file, path.clone(), 96);
+
+        accumulator.append(&[b'x'; 200]).await.unwrap();
+        accumulator.finish().await.unwrap();
+
+        let output = tokio::fs::read(&path).await.unwrap();
+        assert!(output.len() <= 96);
+        assert!(String::from_utf8_lossy(&output).contains("output truncated"));
     }
 
     #[tokio::test]
@@ -937,22 +1130,96 @@ mod tests {
         let mut saw_live_output = false;
         for _ in 0..50 {
             let output = output_tool
-                .execute(json!({ "task_id": task_id }))
+                .execute(json!({ "task_id": task_id, "block": false }))
                 .await
                 .unwrap();
             saw_live_output |= output.content.contains("started");
             if output.metadata.as_ref().unwrap()["status"] != "running" {
                 assert_eq!(output.metadata.as_ref().unwrap()["status"], "completed");
+                assert!(
+                    output
+                        .content
+                        .contains("<retrieval_status>success</retrieval_status>")
+                );
+                assert!(output.content.contains("<status>completed</status>"));
                 assert!(output.content.contains("started"));
                 assert!(output.content.contains("finished"));
                 assert!(saw_live_output);
                 return;
             }
+            assert!(
+                output
+                    .content
+                    .contains("<retrieval_status>not_ready</retrieval_status>")
+            );
+            assert!(output.content.contains("<status>running</status>"));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         let _ = stop_tool.execute(json!({ "task_id": task_id })).await;
         panic!("background task did not finish in time");
+    }
+
+    #[tokio::test]
+    async fn background_task_writes_a_readable_file_and_notifies_after_tool_completion() {
+        let directory = tempdir().unwrap();
+        let tool = BashTool::new(directory.path()).without_timeout();
+        let (notifications, mut notification_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<Content>();
+        let context = ToolExecutionContext::detached("background-call").with_agent_notification(
+            Some(Arc::new(move |content| {
+                notifications
+                    .send(content)
+                    .map_err(|_| ToolError::new("notification receiver closed"))
+            })),
+        );
+
+        let started = tool
+            .execute_with_context(
+                json!({
+                    "command": "sleep 0.05; printf 'notification output\\n'",
+                    "description": "Generate notification output",
+                    "run_in_background": true
+                }),
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        context.finish();
+
+        assert!(started.content.contains("Do not poll"));
+        let output_file = started.metadata.as_ref().unwrap()["output_file"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let notification =
+            tokio::time::timeout(Duration::from_secs(2), notification_receiver.recv())
+                .await
+                .expect("background task did not notify")
+                .expect("notification channel closed");
+        let notification = notification.as_text().expect("notification should be text");
+        assert!(notification.contains("<task_notification>"));
+        assert!(notification.contains("<task_type>local_bash</task_type>"));
+        assert!(notification.contains("<status>completed</status>"));
+        assert!(notification.contains("Generate notification output"));
+        assert!(notification.contains(&output_file));
+        assert_eq!(
+            tokio::fs::read_to_string(&output_file).await.unwrap(),
+            "notification output\n"
+        );
+        #[cfg(unix)]
+        {
+            let output_metadata = tokio::fs::metadata(&output_file).await.unwrap();
+            assert_eq!(output_metadata.permissions().mode() & 0o777, 0o600);
+            let directory_metadata = tokio::fs::metadata(
+                std::path::Path::new(&output_file)
+                    .parent()
+                    .expect("output file has a parent directory"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(directory_metadata.permissions().mode() & 0o777, 0o700);
+        }
     }
 
     #[cfg(unix)]
@@ -1029,23 +1296,30 @@ mod tests {
             .await
             .unwrap();
         let task_id = task_id(&started_output);
+        let mut saw_ready = false;
         for _ in 0..50 {
             let output = output_tool
-                .execute(json!({ "task_id": task_id }))
+                .execute(json!({ "task_id": task_id, "block": false }))
                 .await
                 .unwrap();
-            if output.content.contains("ready") {
+            if task_output_text(&output).contains("ready") {
+                saw_ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(saw_ready, "background task did not expose its live output");
 
         let stopped = stop_tool
             .execute(json!({ "task_id": task_id }))
             .await
             .unwrap();
         assert_eq!(stopped.metadata.as_ref().unwrap()["status"], "stopped");
-        assert!(stopped.content.contains("ready"));
+        assert!(
+            stopped.content.contains("ready"),
+            "stopped output was: {}",
+            stopped.content
+        );
         let stopped_again = stop_tool
             .execute(json!({ "task_id": task_id }))
             .await
@@ -1074,12 +1348,9 @@ mod tests {
         let output = wait_for_terminal(&output_tool, &task_id).await;
 
         assert_eq!(output.metadata.as_ref().unwrap()["exit_code"], 0);
-        assert!(output.content.starts_with("two\nthree"));
-        let path = output
-            .content
-            .split("Full output: ")
-            .nth(1)
-            .and_then(|value| value.strip_suffix(']'))
+        assert!(task_output_text(&output).starts_with("two\nthree"));
+        let path = output.metadata.as_ref().unwrap()["output_file"]
+            .as_str()
             .unwrap();
         assert_eq!(
             tokio::fs::read_to_string(path).await.unwrap(),
@@ -1107,11 +1378,10 @@ mod tests {
         let mut child_pid = None;
         for _ in 0..100 {
             let output = output_tool
-                .execute(json!({ "task_id": task_id }))
+                .execute(json!({ "task_id": task_id, "block": false }))
                 .await
                 .unwrap();
-            if let Ok(pid) = output
-                .content
+            if let Ok(pid) = task_output_text(&output)
                 .lines()
                 .next()
                 .unwrap_or_default()

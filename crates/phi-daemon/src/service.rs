@@ -7,7 +7,8 @@ use phi::{
     GenerationConfig, InMemorySessionStorage, Message, ReasoningEffort, Role, SessionSnapshot,
     SessionStorage, SkillCatalog, SkillsConfig, StorageError, SubagentBuildRequest, SubagentConfig,
     SubagentFactory, SubagentFactoryError, SubagentIsolation, SubagentOutputContract,
-    SubagentRuntime, SubagentTools, SubagentType, Workspace,
+    SubagentResource, SubagentResourceDisposition, SubagentResourceFinalization,
+    SubagentResourceInfo, SubagentRuntime, SubagentTools, SubagentType, Workspace,
 };
 use thiserror::Error;
 use tokio::{
@@ -71,27 +72,40 @@ struct DaemonSubagentFactory {
     worktrees: Option<WorktreeManager>,
 }
 
+#[derive(Debug)]
+struct RecoveredWorktreeResource {
+    location: String,
+}
+
 #[async_trait]
-impl SubagentFactory for DaemonSubagentFactory {
-    async fn build(&self, request: SubagentBuildRequest) -> Result<Agent, SubagentFactoryError> {
-        let configured = ConfiguredSubagentBuildRequest {
-            effective_config: phi::EffectiveSubagentConfig {
-                agent_type: SubagentType::General,
-                capability_mode: self.capability_ceiling,
-                generation_config: request.generation_config.clone(),
-                output_contract: SubagentOutputContract::Text,
-                isolation: SubagentIsolation::Shared,
-            },
-            base: request,
-        };
-        self.build_configured(configured)
-            .await
-            .map(|built| built.agent)
+impl SubagentResource for RecoveredWorktreeResource {
+    fn info(&self) -> SubagentResourceInfo {
+        SubagentResourceInfo {
+            kind: "git_worktree".to_owned(),
+            location: Some(self.location.clone()),
+        }
     }
 
-    async fn build_configured(
+    async fn finalize(
+        &self,
+        _disposition: SubagentResourceDisposition,
+    ) -> Result<SubagentResourceFinalization, SubagentFactoryError> {
+        Ok(SubagentResourceFinalization {
+            preserved: true,
+            location: Some(self.location.clone()),
+            message: Some(
+                "recovered worktree was preserved because its original base revision is unavailable"
+                    .to_owned(),
+            ),
+        })
+    }
+}
+
+impl DaemonSubagentFactory {
+    async fn build_child(
         &self,
         request: ConfiguredSubagentBuildRequest,
+        persisted_workspace: Option<Workspace>,
     ) -> Result<BuiltSubagent, SubagentFactoryError> {
         if request.base.allow_nested_subagents {
             return Err(SubagentFactoryError::new(
@@ -109,27 +123,38 @@ impl SubagentFactory for DaemonSubagentFactory {
             .generation_config
             .reasoning_effort
             .or(self.reasoning_effort);
+        let resumed_worktree = if request.effective_config.isolation == SubagentIsolation::Worktree
+        {
+            persisted_workspace
+                .as_ref()
+                .map(|workspace| workspace.root().display().to_string())
+        } else {
+            None
+        };
         let mut prepared_worktree = None;
-        let workspace = match request.effective_config.isolation {
-            SubagentIsolation::Shared => self.workspace.clone(),
-            SubagentIsolation::Worktree => {
-                let workspace = self.workspace.as_ref().ok_or_else(|| {
-                    SubagentFactoryError::new(
-                        "worktree isolation requires a parent session workspace",
-                    )
-                })?;
-                let manager = self.worktrees.as_ref().ok_or_else(|| {
-                    SubagentFactoryError::new(
-                        "worktree isolation is not configured for this daemon",
-                    )
-                })?;
-                let prepared = manager
-                    .create(workspace, &self.parent_id, &request.base.agent_id)
-                    .await?;
-                let child_workspace = prepared.workspace().clone();
-                prepared_worktree = Some(prepared);
-                Some(child_workspace)
-            }
+        let workspace = match persisted_workspace {
+            Some(workspace) => Some(workspace),
+            None => match request.effective_config.isolation {
+                SubagentIsolation::Shared => self.workspace.clone(),
+                SubagentIsolation::Worktree => {
+                    let workspace = self.workspace.as_ref().ok_or_else(|| {
+                        SubagentFactoryError::new(
+                            "worktree isolation requires a parent session workspace",
+                        )
+                    })?;
+                    let manager = self.worktrees.as_ref().ok_or_else(|| {
+                        SubagentFactoryError::new(
+                            "worktree isolation is not configured for this daemon",
+                        )
+                    })?;
+                    let prepared = manager
+                        .create(workspace, &self.parent_id, &request.base.agent_id)
+                        .await?;
+                    let child_workspace = prepared.workspace().clone();
+                    prepared_worktree = Some(prepared);
+                    Some(child_workspace)
+                }
+            },
         };
         let profile = AgentProfile {
             agent_profile_id: self.agent_profile.agent_profile_id.clone(),
@@ -159,6 +184,8 @@ impl SubagentFactory for DaemonSubagentFactory {
                 let mut child = BuiltSubagent::new(built.agent);
                 if let Some(prepared) = prepared_worktree {
                     child = child.with_resource(prepared.adopt_resource());
+                } else if let Some(location) = resumed_worktree {
+                    child = child.with_resource(Arc::new(RecoveredWorktreeResource { location }));
                 }
                 Ok(child)
             }
@@ -169,6 +196,48 @@ impl SubagentFactory for DaemonSubagentFactory {
                 Err(SubagentFactoryError::new(error.to_string()))
             }
         }
+    }
+}
+
+#[async_trait]
+impl SubagentFactory for DaemonSubagentFactory {
+    async fn build(&self, request: SubagentBuildRequest) -> Result<Agent, SubagentFactoryError> {
+        let configured = ConfiguredSubagentBuildRequest {
+            effective_config: phi::EffectiveSubagentConfig {
+                agent_type: SubagentType::General,
+                capability_mode: self.capability_ceiling,
+                generation_config: request.generation_config.clone(),
+                output_contract: SubagentOutputContract::Text,
+                isolation: SubagentIsolation::Shared,
+                run_in_background: false,
+            },
+            base: request,
+        };
+        self.build_configured(configured)
+            .await
+            .map(|built| built.agent)
+    }
+
+    async fn build_configured(
+        &self,
+        request: ConfiguredSubagentBuildRequest,
+    ) -> Result<BuiltSubagent, SubagentFactoryError> {
+        self.build_child(request, None).await
+    }
+
+    async fn resume_configured(
+        &self,
+        request: ConfiguredSubagentBuildRequest,
+        persisted_workspace: Option<Workspace>,
+    ) -> Result<BuiltSubagent, SubagentFactoryError> {
+        if request.effective_config.isolation == SubagentIsolation::Worktree
+            && persisted_workspace.is_none()
+        {
+            return Err(SubagentFactoryError::new(
+                "persisted worktree child has no workspace binding",
+            ));
+        }
+        self.build_child(request, persisted_workspace).await
     }
 }
 
@@ -943,7 +1012,12 @@ impl ApplicationService {
             workspace: built.agent.workspace().cloned(),
             worktrees: self.subagent_worktrees.clone(),
         });
-        let runtime = SubagentRuntime::new(session_id.to_string(), child_factory, config);
+        let runtime = SubagentRuntime::with_storage(
+            session_id.to_string(),
+            child_factory,
+            config,
+            Arc::clone(&self.session_storage),
+        );
         let SubagentTools {
             spawn_agent,
             send_agent_message,
@@ -1131,8 +1205,7 @@ fn subagent_prompt_overlay(
     };
     let output = match &config.output_contract {
         SubagentOutputContract::Text => {
-            "Return a textual result. Use notify_parent for blockers or the final result."
-                .to_owned()
+            "Return a textual result as your final assistant response.".to_owned()
         }
         SubagentOutputContract::Json { required_fields } if required_fields.is_empty() => {
             "Return valid JSON as the final response.".to_owned()
@@ -1142,11 +1215,16 @@ fn subagent_prompt_overlay(
             required_fields.join(", ")
         ),
     };
+    let delivery = if config.run_in_background {
+        "This task is running in the background. You may use notify_parent for progress or a blocker; the runtime automatically delivers your final response."
+    } else {
+        "This task is running in the foreground. Return the result directly; do not send a duplicate final notify_parent message."
+    };
     let workspace = workspace
         .map(|workspace| format!("{:?}", workspace.root()))
         .unwrap_or_else(|| "not configured".to_owned());
     format!(
-        "# Subagent Role\n{role}\n\n# Effective Child Policy\n- Capability mode: {:?}\n- Isolation: {:?}\n- Child workspace: {workspace}\n- The capability and workspace boundaries are runtime-enforced and cannot be widened by instructions.\n\n# Output Contract\n{output}",
+        "# Subagent Role\n{role}\n\n# Effective Child Policy\n- Capability mode: {:?}\n- Isolation: {:?}\n- Child workspace: {workspace}\n- The capability and workspace boundaries are runtime-enforced and cannot be widened by instructions.\n\n# Delivery\n{delivery}\n\n# Output Contract\n{output}",
         config.capability_mode, config.isolation,
     )
 }
