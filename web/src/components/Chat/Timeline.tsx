@@ -2,6 +2,7 @@ import {
   type ComponentPropsWithRef,
   forwardRef,
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -62,7 +63,14 @@ export function Timeline({
 }: TimelineProps) {
   const { t } = useI18n();
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const [atBottom, setAtBottom] = useState(true);
+  const followFrameRef = useRef<number | null>(null);
+  const followingTailRef = useRef(true);
+  const previousBottomInsetRef = useRef(bottomInset);
+  const previousConversationKeyRef = useRef(conversationKey);
+  const [followingTail, setFollowingTail] = useState(true);
+  const [scrollerElement, setScrollerElement] = useState<HTMLElement | null>(
+    null,
+  );
   const [rangeState, setRangeState] = useState<{
     conversationKey: string | undefined;
     range: ListRange;
@@ -76,36 +84,149 @@ export function Timeline({
       ? rangeState.range
       : null;
 
+  const cancelScheduledFollow = useCallback(() => {
+    if (followFrameRef.current !== null) {
+      cancelAnimationFrame(followFrameRef.current);
+      followFrameRef.current = null;
+    }
+  }, []);
+
+  const pauseFollowingTail = useCallback(() => {
+    followingTailRef.current = false;
+    cancelScheduledFollow();
+    setFollowingTail(false);
+  }, [cancelScheduledFollow]);
+
+  const resumeFollowingTail = useCallback(() => {
+    followingTailRef.current = true;
+    setFollowingTail(true);
+  }, []);
+
+  const scheduleFollowTail = useCallback(() => {
+    if (!followingTailRef.current) {
+      return;
+    }
+
+    cancelScheduledFollow();
+    followFrameRef.current = requestAnimationFrame(() => {
+      followFrameRef.current = null;
+      if (followingTailRef.current) {
+        virtuosoRef.current?.autoscrollToBottom();
+      }
+    });
+  }, [cancelScheduledFollow]);
+
   const followOutput = useCallback(
-    (isAtBottom: boolean) => (isAtBottom ? 'auto' : false),
+    () => (followingTailRef.current ? 'auto' : false),
     [],
   );
 
   const jumpToBottom = useCallback(() => {
+    resumeFollowingTail();
     virtuosoRef.current?.scrollTo({
       top: Number.MAX_SAFE_INTEGER,
       behavior: 'smooth',
     });
-  }, []);
+  }, [resumeFollowingTail]);
 
-  const jumpToItem = useCallback((index: number) => {
-    virtuosoRef.current?.scrollToIndex({
-      index,
-      align: 'start',
-      behavior: 'smooth',
-    });
-  }, []);
+  const jumpToItem = useCallback(
+    (index: number) => {
+      pauseFollowingTail();
+      virtuosoRef.current?.scrollToIndex({
+        index,
+        align: 'start',
+        behavior: 'smooth',
+      });
+    },
+    [pauseFollowingTail],
+  );
 
   const handleRangeChanged = useCallback(
     (range: ListRange) => setRangeState({ conversationKey, range }),
     [conversationKey],
   );
 
-  useLayoutEffect(() => {
-    if (atBottom && bottomInset > 0) {
-      virtuosoRef.current?.autoscrollToBottom();
+  const handleAtBottomStateChange = useCallback(
+    (isAtBottom: boolean) => {
+      if (isAtBottom) {
+        resumeFollowingTail();
+      }
+    },
+    [resumeFollowingTail],
+  );
+
+  const handleScrollerRef = useCallback(
+    (scroller: HTMLElement | Window | null) => {
+      setScrollerElement(scroller instanceof HTMLElement ? scroller : null);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (scrollerElement === null) {
+      return;
     }
-  }, [atBottom, bottomInset]);
+
+    let pointerActive = false;
+    let previousScrollTop = scrollerElement.scrollTop;
+
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) {
+        pauseFollowingTail();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isUpwardScrollKey(event)) {
+        pauseFollowingTail();
+      }
+    };
+    const handlePointerDown = () => {
+      pointerActive = true;
+      previousScrollTop = scrollerElement.scrollTop;
+    };
+    const handleScroll = () => {
+      const nextScrollTop = scrollerElement.scrollTop;
+      if (pointerActive && nextScrollTop < previousScrollTop - 1) {
+        pauseFollowingTail();
+      }
+      previousScrollTop = nextScrollTop;
+    };
+    const handlePointerEnd = () => {
+      pointerActive = false;
+    };
+
+    scrollerElement.addEventListener('wheel', handleWheel, { passive: true });
+    scrollerElement.addEventListener('keydown', handleKeyDown);
+    scrollerElement.addEventListener('pointerdown', handlePointerDown);
+    scrollerElement.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('pointerup', handlePointerEnd);
+    window.addEventListener('pointercancel', handlePointerEnd);
+
+    return () => {
+      scrollerElement.removeEventListener('wheel', handleWheel);
+      scrollerElement.removeEventListener('keydown', handleKeyDown);
+      scrollerElement.removeEventListener('pointerdown', handlePointerDown);
+      scrollerElement.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('pointerup', handlePointerEnd);
+      window.removeEventListener('pointercancel', handlePointerEnd);
+    };
+  }, [pauseFollowingTail, scrollerElement]);
+
+  useLayoutEffect(() => {
+    if (previousConversationKeyRef.current !== conversationKey) {
+      previousConversationKeyRef.current = conversationKey;
+      resumeFollowingTail();
+    }
+  }, [conversationKey, resumeFollowingTail]);
+
+  useLayoutEffect(() => {
+    if (previousBottomInsetRef.current !== bottomInset) {
+      previousBottomInsetRef.current = bottomInset;
+      scheduleFollowTail();
+    }
+  }, [bottomInset, scheduleFollowTail]);
+
+  useEffect(() => cancelScheduledFollow, [cancelScheduledFollow]);
 
   return (
     <div className={styles.viewport}>
@@ -119,8 +240,10 @@ export function Timeline({
         ref={virtuosoRef}
         data={virtualItems}
         className={styles.scroller}
+        scrollerRef={handleScrollerRef}
         followOutput={followOutput}
-        atBottomStateChange={setAtBottom}
+        atBottomStateChange={handleAtBottomStateChange}
+        totalListHeightChanged={scheduleFollowTail}
         rangeChanged={handleRangeChanged}
         atBottomThreshold={80}
         defaultItemHeight={120}
@@ -141,7 +264,7 @@ export function Timeline({
           )
         }
       />
-      {!atBottom && items.length > 0 && (
+      {!followingTail && items.length > 0 && (
         <button
           type="button"
           className={styles.jumpButton}
@@ -243,5 +366,14 @@ function isActivityRow(item: TimelineItem | undefined): boolean {
     item?.kind === 'tool' ||
     item?.kind === 'tool-batch' ||
     item?.kind === 'status'
+  );
+}
+
+function isUpwardScrollKey(event: KeyboardEvent): boolean {
+  return (
+    event.key === 'ArrowUp' ||
+    event.key === 'PageUp' ||
+    event.key === 'Home' ||
+    (event.key === ' ' && event.shiftKey)
   );
 }
