@@ -1,0 +1,23 @@
+/node_modules
+/oh_modules
+/local.properties
+# DevEco auto-signing writes local certificate paths and encrypted passwords
+# here. Start from build-profile.template.json5 on each development machine.
+/build-profile.json5
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+**/BuildProfile.ets
+**/oh-package-lock.json5
+/package.json
+/package-lock.json
+
+**/src/main/resources/rawfile/flutter_assets/
+**/libs/**/libapp.so
+**/libs/**/libflutter.so
+**/libs/**/libvmservice_snapshot.so
