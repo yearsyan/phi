@@ -245,13 +245,6 @@ class S {
 
   /* ------------------------------ settings ------------------------------- */
   String get daemonConnection => _t('Daemon connection', 'Daemon 连接');
-  String get daemonConnectionDescription => _t(
-    'The app talks to a phi daemon over HTTP(S) for REST and '
-        'WebSocket for session streaming. Transports are '
-        'pluggable; direct connection is used here.',
-    '应用通过 HTTP(S) 访问 daemon 的 REST 接口，通过 WebSocket 接收会话流。'
-        '通信层是可插拔的，当前使用直连。',
-  );
   String get daemonUrl => _t('Daemon URL', 'Daemon 地址');
   String get authKey => _t('Auth key', '密钥');
   String get authKeyHint => _t(
@@ -284,6 +277,43 @@ class S {
   String connectedSessions(int count) => _t(
     'Connected — $count session(s) on daemon.',
     '连接成功，daemon 上有 $count 个会话。',
+  );
+
+  /* ------------------------------- machines ------------------------------ */
+  String get machines => _t('Machines', '机器');
+  String machinesCount(int count) => _t('Machines ($count)', '机器（$count）');
+  String get manageMachines => _t('Manage machines', '管理机器');
+  String get addMachine => _t('Add machine', '添加机器');
+  String get editMachine => _t('Edit machine', '编辑机器');
+  String get switchMachine => _t('Switch machine', '切换机器');
+  String get noMachinesYet => _t('No machines configured', '尚未配置机器');
+  String get noMachinesHint => _t(
+    'Add a machine manually or scan the QR code printed by phi-daemon.',
+    '手动添加机器，或扫描 phi-daemon 打印的二维码。',
+  );
+  String get machineName => _t('Name (optional)', '名称（可选）');
+  String get machineNameHint =>
+      _t('Defaults to the host, e.g. 192.0.2.10', '默认为主机名，如 192.0.2.10');
+  String get activeMachine => _t('Active', '当前使用');
+  String get setActive => _t('Set active', '设为当前');
+  String get deleteMachineTitle => _t('Delete machine?', '删除机器？');
+  String deleteMachineBody(String name) =>
+      _t('“$name” will be removed from this device.', '“$name”将从此设备移除。');
+  String get deleteActiveMachineHint => _t(
+    'This is the active machine; the app will become unconfigured.',
+    '这是当前使用的机器，删除后应用将回到未配置状态。',
+  );
+  String get machineSaved => _t('Machine saved', '机器已保存');
+  String get machineDeleted => _t('Machine deleted', '机器已删除');
+  String get machineUrlKeyRequired =>
+      _t('URL and auth key are required.', '地址和密钥必填。');
+  String get selfSignedBadge => _t('self-signed', '自签名');
+  String get daemonConnectionDescription => _t(
+    'The app talks to a phi daemon over HTTP(S) for REST and '
+        'WebSocket for session streaming. Add one machine per daemon '
+        'and switch between them from the sessions page.',
+    '应用通过 HTTP(S) 访问 daemon 的 REST 接口，通过 WebSocket 接收会话流。'
+        '每个 daemon 添加为一台机器，可在会话页快速切换。',
   );
   String get defaults => _t('Defaults', '默认值');
   String get defaultCapabilityMode =>

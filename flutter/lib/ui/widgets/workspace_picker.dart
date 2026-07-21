@@ -116,6 +116,18 @@ class _NewSessionDialogState extends State<_NewSessionDialog> {
                 future: _providers,
                 builder: (context, snapshot) {
                   final providers = snapshot.data;
+                  // Provider profiles live on the daemon; the 'default'
+                  // placeholder may not exist on the active machine. Fall
+                  // back to the first real profile instead of submitting a
+                  // stale id the daemon does not know.
+                  if (providers != null &&
+                      providers.isNotEmpty &&
+                      !providers.any((p) => p.profileId == _profileId)) {
+                    final fallback = providers.first.profileId;
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) setState(() => _profileId = fallback);
+                    });
+                  }
                   return DropdownButtonFormField<String>(
                     initialValue:
                         providers != null &&

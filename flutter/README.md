@@ -41,7 +41,7 @@ lib/
                               #   event reduction, reconnect/backoff, resync)
     sessions_store.dart       # Session list polling store
     app_state.dart            # Root state: settings → transport → client
-  ui/                 # Pages (sessions, chat, tasks, settings) + widgets
+  ui/                 # Pages (sessions, chat, tasks, machines, settings) + widgets
 ```
 
 ### Pluggable transports
@@ -75,15 +75,18 @@ adb reverse tcp:8787 tcp:8787
 flutter run -d <android-device-id>
 ```
 
-Then open Settings and enter the daemon URL and the auth key (contents of
-`PHI_DAEMON_AUTH_KEY_FILE`). On Android/iOS you can instead scan the
+The app supports multiple daemon machines: each machine stores a name, the
+daemon URL, the auth key (contents of `PHI_DAEMON_AUTH_KEY_FILE`) and its
+own self-signed-certificate toggle. Manage them under **Settings →
+Machines**, and switch the active machine from the sessions-page app bar
+(one tap, no restart). On Android/iOS you can add a machine by scanning the
 connection QR code that `phi-daemon` prints to its terminal at startup
 (pass `--no-qr` to disable it): use the **Scan to connect** action on the
-unconfigured sessions screen, or **Scan QR code** in Settings. Scanning
-fills in the URL and auth key only; it never changes the self-signed
-certificate toggle. The scan entries are mobile-only and require camera
-permission (declared in the Android manifest and iOS `Info.plist`). For
-development, both can also be seeded:
+unconfigured sessions screen, or **Scan QR code** inside the machine
+editor. Scanning fills in the URL and auth key only; it never changes the
+self-signed certificate toggle. The scan entries are mobile-only and
+require camera permission (declared in the Android manifest and iOS
+`Info.plist`). For development, the first machine can also be seeded:
 
 ```sh
 flutter run --dart-define=PHI_DAEMON_URL=http://127.0.0.1:8787 \

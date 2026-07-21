@@ -32,6 +32,12 @@ class _HomeShellState extends State<HomeShell> {
 
   bool _pollingStarted = false;
 
+  /// AppState binding used to detect machine switches: when the client
+  /// identity changes, the wide-pane selection (which references sessions
+  /// on the previous machine) is reset.
+  AppState? _boundApp;
+  Object? _boundClient;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -39,6 +45,31 @@ class _HomeShellState extends State<HomeShell> {
       _pollingStarted = true;
       _app.sessionsStore.startPolling();
     }
+    final app = _app;
+    if (!identical(app, _boundApp)) {
+      _boundApp?.removeListener(_onAppChanged);
+      _boundApp = app;
+      _boundClient = app.client;
+      app.addListener(_onAppChanged);
+    }
+  }
+
+  void _onAppChanged() {
+    final client = _boundApp?.client;
+    if (client == null || identical(client, _boundClient)) return;
+    _boundClient = client;
+    setState(() {
+      _selectedSessionId = null;
+      _creatingNew = false;
+      _newSessionConfig = null;
+      _showingTasks = false;
+    });
+  }
+
+  @override
+  void dispose() {
+    _boundApp?.removeListener(_onAppChanged);
+    super.dispose();
   }
 
   void _openSession(String sessionId, {required bool wide}) {

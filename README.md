@@ -1031,9 +1031,10 @@ adb reverse tcp:8787 tcp:8787
 flutter run -d <android-device-id>
 ```
 
-首次运行可在 Settings 中设置 daemon URL 和长期 key；开发时也可用
-`PHI_DAEMON_URL`/`PHI_DAEMON_KEY` dart define 注入。Flutter-OH 版本、DevEco 签名和 HAP
-构建步骤见 [`flutter/README.md`](flutter/README.md)。
+应用支持配置多个 daemon 机器连接（名称、URL、长期 key、自签名开关），可在 Settings →
+Machines 管理，并在会话页标题栏一键切换活跃机器；开发时也可用
+`PHI_DAEMON_URL`/`PHI_DAEMON_KEY` dart define 注入首台机器。Flutter-OH 版本、DevEco 签名和
+HAP 构建步骤见 [`flutter/README.md`](flutter/README.md)。
 
 完整 Provider/Agent Profile、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon factory 按

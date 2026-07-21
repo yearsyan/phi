@@ -6,7 +6,11 @@ import 'dart:convert';
 /// The payload carries the long-term daemon key. It must never be written to
 /// logs, error messages, snapshots, or test fixtures.
 class ConnectionPayload {
-  const ConnectionPayload({required this.baseUrl, required this.authKey});
+  const ConnectionPayload({
+    required this.baseUrl,
+    required this.authKey,
+    this.name = '',
+  });
 
   /// Daemon base URL, e.g. `http://192.0.2.10:8787`. The scheme is `https`
   /// when the daemon serves TLS.
@@ -14,6 +18,10 @@ class ConnectionPayload {
 
   /// Long-term daemon auth key (contents of PHI_DAEMON_AUTH_KEY_FILE).
   final String authKey;
+
+  /// Optional human label for the machine (empty when the QR code does not
+  /// carry one).
+  final String name;
 
   static const String _expectedType = 'phi-daemon';
   static const int _expectedVersion = 1;
@@ -45,6 +53,11 @@ class ConnectionPayload {
     final authKey = decoded['auth_key'];
     if (authKey is! String || authKey.trim().isEmpty) return null;
 
-    return ConnectionPayload(baseUrl: baseUrl.trim(), authKey: authKey.trim());
+    final name = decoded['name'];
+    return ConnectionPayload(
+      baseUrl: baseUrl.trim(),
+      authKey: authKey.trim(),
+      name: name is String ? name.trim() : '',
+    );
   }
 }

@@ -7,6 +7,8 @@ import '../../core/models/wire.dart';
 import '../../i18n/strings.dart';
 import '../../platform/qr_scan_support.dart';
 import '../../state/app_state.dart';
+import '../widgets/machine_editor.dart';
+import '../widgets/machine_switcher.dart';
 import 'scan_connection_page.dart';
 
 /// Sessions sidebar: workspace-grouped session list with pin/delete actions.
@@ -43,13 +45,7 @@ class _SessionsPageState extends State<SessionsPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Row(
-          children: [
-            Icon(Icons.terminal_rounded, size: 22),
-            SizedBox(width: 8),
-            Text('Phi'),
-          ],
-        ),
+        title: const MachineSwitcher(),
         actions: [
           if (!widget.embedded)
             IconButton(
@@ -117,15 +113,9 @@ class _SessionsPageState extends State<SessionsPage> {
       MaterialPageRoute(builder: (_) => const ScanConnectionPage()),
     );
     if (payload == null || !mounted) return;
-    await _app.settings.updateConnection(
-      baseUrl: payload.baseUrl,
-      authKey: payload.authKey,
-    );
-    if (mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(S.of(context).settingsSaved)));
-    }
+    // A scanned daemon becomes a new machine; the editor lets the user name
+    // it and verify before saving, and saving makes it the active machine.
+    await showMachineEditor(context, prefill: payload, makeActive: true);
   }
 
   Widget _buildList(BuildContext context, dynamic store, ThemeData theme) {

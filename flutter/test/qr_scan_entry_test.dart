@@ -6,8 +6,8 @@ import 'package:phi_client/core/settings/app_settings.dart';
 import 'package:phi_client/platform/qr_scan_support.dart';
 import 'package:phi_client/state/app_state.dart';
 import 'package:phi_client/ui/pages/sessions_page.dart';
-import 'package:phi_client/ui/pages/settings_page.dart';
 import 'package:phi_client/ui/theme.dart';
+import 'package:phi_client/ui/widgets/machine_editor.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 Future<AppState> _pumpApp(WidgetTester tester, Widget home) async {
@@ -33,16 +33,16 @@ void main() {
   tearDown(() => debugQrScanSupportedOverride = null);
 
   testWidgets(
-    'settings page shows the scan button when scanning is supported',
+    'machine editor shows the scan button when scanning is supported',
     (tester) async {
       debugQrScanSupportedOverride = true;
-      await _pumpApp(tester, const SettingsPage());
+      await _pumpApp(tester, const MachineEditorPage());
 
       expect(find.byIcon(Icons.qr_code_scanner), findsOneWidget);
     },
   );
 
-  testWidgets('settings page buttons do not overflow on narrow screens', (
+  testWidgets('machine editor buttons do not overflow on narrow screens', (
     tester,
   ) async {
     debugQrScanSupportedOverride = true;
@@ -52,16 +52,16 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
 
     // A RenderFlex overflow would throw a FlutterError and fail this test.
-    await _pumpApp(tester, const SettingsPage());
+    await _pumpApp(tester, const MachineEditorPage());
 
     expect(find.byIcon(Icons.qr_code_scanner), findsOneWidget);
   });
 
-  testWidgets('settings page hides the scan button when unsupported', (
+  testWidgets('machine editor hides the scan button when unsupported', (
     tester,
   ) async {
     debugQrScanSupportedOverride = false;
-    await _pumpApp(tester, const SettingsPage());
+    await _pumpApp(tester, const MachineEditorPage());
 
     expect(find.byIcon(Icons.qr_code_scanner), findsNothing);
   });
