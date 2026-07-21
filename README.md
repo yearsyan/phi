@@ -75,7 +75,37 @@ Provider 配置、HTTP/WS 协议和停止语义见
 
 GitHub 上的每次 push 都会构建 Windows x86_64 和 macOS ARM64 版本的
 `phi-daemon`，并将压缩包上传到对应 Actions run 的 Artifacts；该流程不创建
-GitHub Release。
+GitHub Release。macOS 产物在仓库配置了下列全部 Actions secrets 时使用 Developer ID
+Application 签名并提交 Apple notarization。完全未配置时只生成名称带 `-unsigned` 的
+ad-hoc 签名产物，供可信的内部测试使用。
+只配置一部分 secrets 会让构建失败，避免误发布未完成签名的产物。
+
+- `MACOS_CERTIFICATE_P12_BASE64`：包含 Developer ID Application 证书与私钥的
+  PKCS#12 文件的 base64 内容。
+- `MACOS_CERTIFICATE_PASSWORD`：该 PKCS#12 文件的密码。
+- `APPLE_API_KEY_P8_BASE64`：用于 Notary API 的 App Store Connect `.p8` 私钥的
+  base64 内容。
+- `APPLE_API_KEY_ID`：App Store Connect API key ID。
+- `APPLE_API_ISSUER_ID`：App Store Connect issuer ID。
+
+`phi-daemon` 是命令行 daemon，不是可以从 Finder 双击启动的 `.app`。解压后应在
+Terminal 中创建鉴权 key 并启动：
+
+```bash
+chmod +x ./phi-daemon
+mkdir -p .phi/daemon
+openssl rand -hex 32 > .phi/daemon/auth.key
+chmod 600 .phi/daemon/auth.key
+PHI_DAEMON_AUTH_KEY_FILE="$PWD/.phi/daemon/auth.key" ./phi-daemon
+```
+
+正式分发应使用已签名且已 notarize、名称不带 `-unsigned` 的产物。只有在确认来源可信、
+需要测试未签名 Actions 产物时，才可在接收机器上移除浏览器添加的 quarantine 标记后按
+上述方式运行：
+
+```bash
+xattr -d com.apple.quarantine ./phi-daemon
+```
 
 ## SDK 用法
 
