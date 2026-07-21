@@ -573,7 +573,7 @@ let provider = OpenAiChatProvider::new(
 # Ok::<(), phi::ProviderError>(())
 ```
 
-三个内置 Provider 都支持链式 `.http_client(reqwest::Client)` 注入，也提供直接接收 Client 的 `new_with_client`（Anthropic 自定义 endpoint 使用 `with_base_url_and_client`）。需要构建多个 Agent/session 时应 clone 同一个 Client，以复用 DNS、TLS 和连接池；daemon 的默认 factory 使用直接构造入口，所有 session 共享一个 Client，且不会先创建临时 Client。
+三个内置 Provider 都支持链式 `.http_client(reqwest::Client)` 注入，也提供直接接收 Client 的 `new_with_client`（Anthropic 自定义 endpoint 使用 `with_base_url_and_client`）。需要构建多个 Agent/session 时应 clone 同一个 Client，以复用 DNS、TLS 和连接池；standalone daemon 会在启动时读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY`（同时接受小写别名），让普通/child Agent 和标题生成共享同一个 Client。协议专用代理优先于 `ALL_PROXY`，详细配置见 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md#环境变量)。
 
 重试分类如下：
 
@@ -949,6 +949,12 @@ PHI_DAEMON_BIND=127.0.0.1:9000 \
   PHI_DAEMON_SUBAGENTS_ENABLED=true \
   cargo run -p phi-daemon
 ```
+
+通过 Cloudflare Tunnel、Tailscale Funnel 或反向代理发布 loopback daemon 时，可设置
+`PHI_DAEMON_PUBLIC_URL=https://phi.example.com`。它只覆盖终端和 App 连接二维码中的
+公开 `base_url`，不改变 `PHI_DAEMON_BIND`、daemon TLS 或代理生命周期；因此代理仍可连接
+`http://127.0.0.1:8787`，客户端则使用公开 HTTPS/WSS 地址。公开 URL 必须是无 credentials、
+query 和 fragment 的绝对 HTTP(S) URL。
 
 ### Web client
 

@@ -49,11 +49,12 @@ type PendingTlsHandshake = Pin<
 >;
 
 pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
+    let provider_http_client = config.provider_http_client()?;
     let tls_acceptor = match config.tls_config() {
         Some(tls) => Some(load_tls_acceptor(tls).await?),
         None => None,
     };
-    let service = Arc::new(application_service(&config));
+    let service = Arc::new(application_service(&config, provider_http_client));
     let scheduled_task_store: Arc<dyn ScheduledTaskStore> = Arc::new(DiskScheduledTaskStore::new(
         config.data_dir().join(SCHEDULED_TASK_CONFIG_FILE),
     ));
@@ -124,7 +125,10 @@ async fn shutdown_agents(service: &ApplicationService) {
     }
 }
 
-fn application_service(config: &DaemonConfig) -> ApplicationService {
+fn application_service(
+    config: &DaemonConfig,
+    provider_http_client: reqwest::Client,
+) -> ApplicationService {
     let data_dir = config.data_dir();
     let control_store = Arc::new(DiskControlStore::new(data_dir.join(CONTROL_DIRECTORY)));
     let session_storage = Arc::new(DiskSessionStorage::new(data_dir.join(SESSION_DIRECTORY)));
@@ -134,13 +138,14 @@ fn application_service(config: &DaemonConfig) -> ApplicationService {
         data_dir.join(AGENT_PROFILE_CONFIG_FILE),
     ));
 
-    let title_generator = ProviderSessionTitleGenerator::new(Arc::clone(&provider_store));
+    let title_generator = ProviderSessionTitleGenerator::new(Arc::clone(&provider_store))
+        .http_client(provider_http_client.clone());
     let title_generator = match config.session_title_profile_id() {
         Some(profile_id) => title_generator.with_profile_id(profile_id),
         None => title_generator,
     };
 
-    ApplicationService::managed_with_profiles_skills_and_builtin_tools(
+    ApplicationService::managed_with_profiles_skills_and_builtin_tools_http_client(
         AgentRegistry::new(),
         control_store,
         session_storage,
@@ -148,6 +153,7 @@ fn application_service(config: &DaemonConfig) -> ApplicationService {
         agent_profile_store,
         config.skills_config_template(),
         BuiltinTools::all(config.workspace_dir()),
+        provider_http_client,
     )
     .with_session_title_generator(title_generator)
     .with_subagent_worktree_root(data_dir.join("subagent-worktrees"))

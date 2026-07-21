@@ -14,6 +14,7 @@ use phi::{DuplicateSkillPolicy, SkillDirectory, SkillsConfig};
 
 pub const BIND_ADDRESS_ENV: &str = "PHI_DAEMON_BIND";
 pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8787";
+pub const PUBLIC_URL_ENV: &str = "PHI_DAEMON_PUBLIC_URL";
 pub const DATA_DIR_ENV: &str = "PHI_DAEMON_DATA_DIR";
 pub const DEFAULT_DATA_DIR: &str = ".phi/daemon";
 pub const AUTH_KEY_FILE_ENV: &str = "PHI_DAEMON_AUTH_KEY_FILE";
@@ -26,6 +27,10 @@ pub const SESSION_TITLE_PROFILE_ID_ENV: &str = "PHI_DAEMON_SESSION_TITLE_PROFILE
 pub const WORKSPACE_DIR_ENV: &str = "PHI_DAEMON_WORKSPACE_DIR";
 pub const GLOBAL_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_GLOBAL_SKILLS_DIRS";
 pub const WORKSPACE_SKILLS_DIRS_ENV: &str = "PHI_DAEMON_WORKSPACE_SKILLS_DIRS";
+pub const HTTP_PROXY_ENV: &str = "HTTP_PROXY";
+pub const HTTPS_PROXY_ENV: &str = "HTTPS_PROXY";
+pub const ALL_PROXY_ENV: &str = "ALL_PROXY";
+pub const NO_PROXY_ENV: &str = "NO_PROXY";
 pub const DEFAULT_GLOBAL_SKILLS_DIR: &str = ".phy/skills";
 pub const DEFAULT_WORKSPACE_SKILLS_DIRS: [&str; 2] = [".phy/skills", ".claude/skills"];
 
@@ -69,9 +74,92 @@ impl fmt::Debug for TlsConfig {
     }
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+struct OutboundProxyConfig {
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    all_proxy: Option<String>,
+    no_proxy: Option<String>,
+}
+
+impl OutboundProxyConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        Self::from_values(
+            optional_environment_with_alias(HTTP_PROXY_ENV, "http_proxy")?,
+            optional_environment_with_alias(HTTPS_PROXY_ENV, "https_proxy")?,
+            optional_environment_with_alias(ALL_PROXY_ENV, "all_proxy")?,
+            optional_environment_with_alias(NO_PROXY_ENV, "no_proxy")?,
+        )
+    }
+
+    fn from_values(
+        http_proxy: Option<String>,
+        https_proxy: Option<String>,
+        all_proxy: Option<String>,
+        no_proxy: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            http_proxy: normalize_proxy_url(HTTP_PROXY_ENV, http_proxy)?,
+            https_proxy: normalize_proxy_url(HTTPS_PROXY_ENV, https_proxy)?,
+            all_proxy: normalize_proxy_url(ALL_PROXY_ENV, all_proxy)?,
+            no_proxy: normalize_optional_environment(no_proxy),
+        })
+    }
+
+    fn http_client(&self) -> Result<reqwest::Client, ConfigError> {
+        let no_proxy = self
+            .no_proxy
+            .as_deref()
+            .and_then(reqwest::NoProxy::from_string);
+        let mut builder = reqwest::Client::builder().no_proxy();
+
+        if let Some(url) = &self.http_proxy {
+            let proxy = reqwest::Proxy::http(url)
+                .map_err(|_| ConfigError::InvalidProxyUrl {
+                    name: HTTP_PROXY_ENV,
+                })?
+                .no_proxy(no_proxy.clone());
+            builder = builder.proxy(proxy);
+        }
+        if let Some(url) = &self.https_proxy {
+            let proxy = reqwest::Proxy::https(url)
+                .map_err(|_| ConfigError::InvalidProxyUrl {
+                    name: HTTPS_PROXY_ENV,
+                })?
+                .no_proxy(no_proxy.clone());
+            builder = builder.proxy(proxy);
+        }
+        if let Some(url) = &self.all_proxy {
+            let proxy = reqwest::Proxy::all(url)
+                .map_err(|_| ConfigError::InvalidProxyUrl {
+                    name: ALL_PROXY_ENV,
+                })?
+                .no_proxy(no_proxy);
+            builder = builder.proxy(proxy);
+        }
+
+        builder
+            .build()
+            .map_err(|_| ConfigError::ProviderHttpClientInitialization)
+    }
+}
+
+impl fmt::Debug for OutboundProxyConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OutboundProxyConfig")
+            .field("http_proxy_configured", &self.http_proxy.is_some())
+            .field("https_proxy_configured", &self.https_proxy.is_some())
+            .field("all_proxy_configured", &self.all_proxy.is_some())
+            .field("no_proxy_configured", &self.no_proxy.is_some())
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     bind_address: SocketAddr,
+    public_url: Option<String>,
     data_dir: PathBuf,
     auth_key: String,
     tls: Option<TlsConfig>,
@@ -82,6 +170,7 @@ pub struct DaemonConfig {
     workspace_dir: PathBuf,
     global_skill_dirs: Vec<PathBuf>,
     workspace_skill_dirs: Vec<PathBuf>,
+    outbound_proxy: OutboundProxyConfig,
 }
 
 impl DaemonConfig {
@@ -90,6 +179,7 @@ impl DaemonConfig {
         let workspace_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Ok(Self {
             bind_address,
+            public_url: None,
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             auth_key,
             tls: None,
@@ -103,6 +193,7 @@ impl DaemonConfig {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            outbound_proxy: OutboundProxyConfig::default(),
         })
     }
 
@@ -114,6 +205,11 @@ impl DaemonConfig {
     pub fn with_bind_address(mut self, bind_address: SocketAddr) -> Self {
         self.bind_address = bind_address;
         self
+    }
+
+    pub fn with_public_url(mut self, public_url: impl Into<String>) -> Result<Self, ConfigError> {
+        self.public_url = Some(validate_public_url(public_url.into())?);
+        Ok(self)
     }
 
     pub fn with_tls(
@@ -181,9 +277,14 @@ impl DaemonConfig {
         if data_dir.trim().is_empty() {
             return Err(ConfigError::InvalidDataDirectory { value: data_dir });
         }
+        let outbound_proxy = OutboundProxyConfig::from_env()?;
         let home = home_directory();
         let auth_key = load_auth_key(optional_environment(AUTH_KEY_FILE_ENV)?, home.as_deref())?;
         let mut config = Self::new(bind_address, auth_key)?.with_data_dir(data_dir);
+        if let Some(value) = optional_environment(PUBLIC_URL_ENV)? {
+            config.public_url = Some(validate_public_url(value)?);
+        }
+        config.outbound_proxy = outbound_proxy;
         config.tls = tls_config_from_values(
             optional_environment(TLS_CERT_FILE_ENV)?,
             optional_environment(TLS_KEY_FILE_ENV)?,
@@ -218,6 +319,10 @@ impl DaemonConfig {
 
     pub fn bind_address(&self) -> SocketAddr {
         self.bind_address
+    }
+
+    pub fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -277,6 +382,10 @@ impl DaemonConfig {
     pub(crate) fn auth_key(&self) -> &str {
         &self.auth_key
     }
+
+    pub(crate) fn provider_http_client(&self) -> Result<reqwest::Client, ConfigError> {
+        self.outbound_proxy.http_client()
+    }
 }
 
 impl fmt::Debug for DaemonConfig {
@@ -284,6 +393,7 @@ impl fmt::Debug for DaemonConfig {
         formatter
             .debug_struct("DaemonConfig")
             .field("bind_address", &self.bind_address)
+            .field("public_url", &self.public_url)
             .field("data_dir", &self.data_dir)
             .field("tls", &self.tls)
             .field("qr_enabled", &self.qr_enabled)
@@ -293,6 +403,7 @@ impl fmt::Debug for DaemonConfig {
             .field("workspace_dir", &self.workspace_dir)
             .field("global_skill_dirs", &self.global_skill_dirs)
             .field("workspace_skill_dirs", &self.workspace_skill_dirs)
+            .field("outbound_proxy", &self.outbound_proxy)
             .field("auth_key", &"[REDACTED]")
             .finish()
     }
@@ -312,6 +423,47 @@ fn optional_environment(name: &'static str) -> Result<Option<String>, ConfigErro
         Err(env::VarError::NotPresent) => Ok(None),
         Err(source) => Err(ConfigError::Environment { name, source }),
     }
+}
+
+fn optional_environment_with_alias(
+    name: &'static str,
+    alias: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    match optional_environment(name)? {
+        Some(value) => Ok(Some(value)),
+        None => optional_environment(alias),
+    }
+}
+
+fn normalize_proxy_url(
+    name: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, ConfigError> {
+    let value = normalize_optional_environment(value);
+    if let Some(value) = &value {
+        reqwest::Proxy::all(value).map_err(|_| ConfigError::InvalidProxyUrl { name })?;
+    }
+    Ok(value)
+}
+
+fn normalize_optional_environment(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn validate_public_url(value: String) -> Result<String, ConfigError> {
+    let value = value.trim();
+    let url = reqwest::Url::parse(value).map_err(|_| ConfigError::InvalidPublicUrl)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidPublicUrl);
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn optional_environment_os(name: &'static str) -> Option<std::ffi::OsString> {
@@ -520,11 +672,22 @@ pub enum ConfigError {
     #[error("daemon data directory must not be empty (got {value:?})")]
     InvalidDataDirectory { value: String },
 
+    #[error(
+        "PHI_DAEMON_PUBLIC_URL must be an absolute HTTP(S) URL without credentials, query, or fragment"
+    )]
+    InvalidPublicUrl,
+
     #[error("daemon directory environment variable {name} must not be empty (got {value:?})")]
     InvalidDirectory { name: &'static str, value: String },
 
     #[error("daemon boolean environment variable {name} has invalid value {value:?}")]
     InvalidBoolean { name: &'static str, value: String },
+
+    #[error("daemon proxy environment variable {name} is not a valid proxy URL")]
+    InvalidProxyUrl { name: &'static str },
+
+    #[error("could not initialize daemon Provider HTTP client")]
+    ProviderHttpClientInitialization,
 
     #[error("daemon Provider profile environment variable {name} has invalid value {value:?}")]
     InvalidProfileId { name: &'static str, value: String },
@@ -575,7 +738,30 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
+
+    async fn capture_proxy_request(listener: TcpListener, response: &'static [u8]) -> String {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(response).await.unwrap();
+        String::from_utf8(request).unwrap()
+    }
 
     #[test]
     fn builder_defaults_to_loopback_data_directory() {
@@ -586,6 +772,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.bind_address().to_string(), DEFAULT_BIND_ADDRESS);
         assert!(config.bind_address().ip().is_loopback());
+        assert_eq!(config.public_url(), None);
         assert_eq!(config.data_dir(), Path::new(DEFAULT_DATA_DIR));
         assert_eq!(config.tls_config(), None);
         assert!(config.qr_enabled());
@@ -602,6 +789,110 @@ mod tests {
             config.workspace_skill_dirs(),
             &DEFAULT_WORKSPACE_SKILLS_DIRS.map(PathBuf::from)
         );
+        assert_eq!(config.outbound_proxy, OutboundProxyConfig::default());
+    }
+
+    #[test]
+    fn proxy_configuration_validates_urls_and_redacts_credentials() {
+        let http_secret = "http-proxy-secret";
+        let https_secret = "https-proxy-secret";
+        let outbound_proxy = OutboundProxyConfig::from_values(
+            Some(format!(
+                "http://proxy-user:{http_secret}@http-proxy.example:8080"
+            )),
+            Some(format!(
+                "http://proxy-user:{https_secret}@https-proxy.example:8080"
+            )),
+            None,
+            Some("localhost,127.0.0.1".to_owned()),
+        )
+        .unwrap();
+        let mut config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap();
+        config.outbound_proxy = outbound_proxy;
+
+        config.provider_http_client().unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(http_secret));
+        assert!(!debug.contains(https_secret));
+        assert!(debug.contains("http_proxy_configured: true"));
+        assert!(debug.contains("https_proxy_configured: true"));
+        assert!(debug.contains("no_proxy_configured: true"));
+
+        let invalid_secret = "invalid-proxy-secret";
+        let error = OutboundProxyConfig::from_values(
+            Some(format!("http://proxy-user:{invalid_secret}@[")),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidProxyUrl {
+                name: HTTP_PROXY_ENV
+            }
+        ));
+        assert!(!error.to_string().contains(invalid_secret));
+
+        assert_eq!(
+            OutboundProxyConfig::from_values(
+                Some("  ".to_owned()),
+                Some(String::new()),
+                None,
+                None,
+            )
+            .unwrap(),
+            OutboundProxyConfig::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_specific_proxy_settings_route_http_and_https_requests() {
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_proxy_url = format!("http://{}", http_listener.local_addr().unwrap());
+        let http_capture = tokio::spawn(capture_proxy_request(
+            http_listener,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        ));
+        let http_client = OutboundProxyConfig::from_values(Some(http_proxy_url), None, None, None)
+            .unwrap()
+            .http_client()
+            .unwrap();
+
+        let response = http_client
+            .get("http://provider.example.invalid/v1/models")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let request = http_capture.await.unwrap();
+        assert!(request.starts_with("GET http://provider.example.invalid/v1/models HTTP/1.1\r\n"));
+
+        let https_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let https_proxy_url = format!("http://{}", https_listener.local_addr().unwrap());
+        let https_capture = tokio::spawn(capture_proxy_request(
+            https_listener,
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        ));
+        let https_client =
+            OutboundProxyConfig::from_values(None, Some(https_proxy_url), None, None)
+                .unwrap()
+                .http_client()
+                .unwrap();
+
+        assert!(
+            https_client
+                .get("https://provider.example.invalid/v1/models")
+                .send()
+                .await
+                .is_err()
+        );
+        let request = https_capture.await.unwrap();
+        assert!(request.starts_with("CONNECT provider.example.invalid:443 HTTP/1.1\r\n"));
     }
 
     #[test]
@@ -625,6 +916,38 @@ mod tests {
         .with_bind_address("0.0.0.0:9000".parse().unwrap());
 
         assert_eq!(config.bind_address(), "0.0.0.0:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn builder_validates_and_normalizes_the_public_url() {
+        let config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap()
+        .with_public_url("  HTTPS://PHI.EXAMPLE.COM/daemon/  ")
+        .unwrap();
+
+        assert_eq!(config.public_url(), Some("https://phi.example.com/daemon"));
+
+        for invalid in [
+            "",
+            "phi.example.com",
+            "ftp://phi.example.com",
+            "https://user:secret@phi.example.com",
+            "https://phi.example.com?token=secret",
+            "https://phi.example.com#fragment",
+        ] {
+            let error = DaemonConfig::new(
+                DEFAULT_BIND_ADDRESS.parse().unwrap(),
+                "a-secure-test-key-with-at-least-32-bytes",
+            )
+            .unwrap()
+            .with_public_url(invalid)
+            .unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidPublicUrl));
+            assert!(!error.to_string().contains("secret"));
+        }
     }
 
     #[test]

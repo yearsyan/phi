@@ -33,27 +33,29 @@ pub(crate) fn print_for_terminal(config: &DaemonConfig, address: SocketAddr, tls
     }
 
     let listener_address = address;
-    let address = advertised_address(listener_address);
-    match render(config.auth_key(), address, tls) {
+    let (advertised_url, advertised_address) = advertised_connection(config, listener_address, tls);
+    match render(config.auth_key(), &advertised_url) {
         Ok(qr) => {
             let mut output = format!(
                 "\nPhi app connection QR (contains the daemon key; keep it private)\n{QR_COLORS}{qr}{RESET_COLORS}\n{}\n",
-                base_url(address, tls)
+                advertised_url
             );
-            if listener_address.ip().is_loopback() {
-                output.push_str(
-                    "Loopback-only listener: restart with --lan for a phone on the local network.\n",
-                );
-            }
-            if listener_address.is_ipv4() && listener_address.ip().is_unspecified() {
-                match address.ip() {
-                    IpAddr::V4(ip) if ip.is_loopback() => output.push_str(
-                        "No usable non-loopback IPv4 address was found; set PHI_DAEMON_BIND to a specific reachable address.\n",
-                    ),
-                    IpAddr::V4(ip) if !ip.is_private() => output.push_str(&format!(
-                        "No private LAN IPv4 address was found; advertising fallback interface address {ip}. Set PHI_DAEMON_BIND to choose explicitly.\n",
-                    )),
-                    _ => {}
+            if let Some(address) = advertised_address {
+                if listener_address.ip().is_loopback() {
+                    output.push_str(
+                        "Loopback-only listener: restart with --lan for a phone on the local network.\n",
+                    );
+                }
+                if listener_address.is_ipv4() && listener_address.ip().is_unspecified() {
+                    match address.ip() {
+                        IpAddr::V4(ip) if ip.is_loopback() => output.push_str(
+                            "No usable non-loopback IPv4 address was found; set PHI_DAEMON_BIND to a specific reachable address.\n",
+                        ),
+                        IpAddr::V4(ip) if !ip.is_private() => output.push_str(&format!(
+                            "No private LAN IPv4 address was found; advertising fallback interface address {ip}. Set PHI_DAEMON_BIND to choose explicitly.\n",
+                        )),
+                        _ => {}
+                    }
                 }
             }
             let result = {
@@ -70,11 +72,11 @@ pub(crate) fn print_for_terminal(config: &DaemonConfig, address: SocketAddr, tls
     }
 }
 
-fn render(auth_key: &str, address: SocketAddr, tls: bool) -> Result<String, QrError> {
+fn render(auth_key: &str, base_url: &str) -> Result<String, QrError> {
     let payload = ConnectionPayload {
         r#type: CONNECTION_TYPE,
         version: CONNECTION_VERSION,
-        base_url: base_url(address, tls),
+        base_url: base_url.to_owned(),
         auth_key,
     };
     let payload = serde_json::to_vec(&payload).map_err(QrError::Serialize)?;
@@ -85,6 +87,19 @@ fn render(auth_key: &str, address: SocketAddr, tls: bool) -> Result<String, QrEr
 fn base_url(address: SocketAddr, tls: bool) -> String {
     let scheme = if tls { "https" } else { "http" };
     format!("{scheme}://{address}")
+}
+
+fn advertised_connection(
+    config: &DaemonConfig,
+    listener_address: SocketAddr,
+    tls: bool,
+) -> (String, Option<SocketAddr>) {
+    if let Some(public_url) = config.public_url() {
+        return (public_url.to_owned(), None);
+    }
+
+    let address = advertised_address(listener_address);
+    (base_url(address, tls), Some(address))
 }
 
 fn advertised_address(address: SocketAddr) -> SocketAddr {
@@ -215,15 +230,31 @@ mod tests {
         let address = "[2001:db8::1]:9443".parse().unwrap();
         assert_eq!(base_url(address, true), "https://[2001:db8::1]:9443");
 
-        let qr = render(AUTH_KEY, address, true).unwrap();
+        let qr = render(AUTH_KEY, &base_url(address, true)).unwrap();
         assert!(!qr.trim().is_empty());
+    }
+
+    #[test]
+    fn configured_public_url_overrides_the_listener_url() {
+        let config = DaemonConfig::new("127.0.0.1:8787".parse().unwrap(), AUTH_KEY)
+            .unwrap()
+            .with_public_url("https://phi.example.com")
+            .unwrap();
+        let (advertised_url, advertised_address) =
+            advertised_connection(&config, "127.0.0.1:8787".parse().unwrap(), false);
+
+        assert_eq!(advertised_url, "https://phi.example.com");
+        assert_eq!(advertised_address, None);
+        assert!(!render(AUTH_KEY, &advertised_url).unwrap().trim().is_empty());
     }
 
     #[test]
     fn oversized_keys_fail_qr_rendering_without_leaking_the_key() {
         let auth_key = "x".repeat(4096);
         let address = "127.0.0.1:8787".parse().unwrap();
-        let error = render(&auth_key, address, false).unwrap_err().to_string();
+        let error = render(&auth_key, &base_url(address, false))
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("does not fit in a QR code"));
         assert!(!error.contains(&auth_key));

@@ -291,10 +291,12 @@ impl ApplicationService {
         provider_store: Arc<dyn ProviderStore>,
         skills: SkillsConfig,
     ) -> Self {
+        let http_client = reqwest::Client::new();
         let agent_profile_store: Arc<dyn AgentProfileStore> =
             Arc::new(MemoryAgentProfileStore::new());
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .http_client(http_client.clone())
             .skills_config(skills);
         Self::managed_with_configured_factory(
             registry,
@@ -303,6 +305,7 @@ impl ApplicationService {
             provider_store,
             agent_profile_store,
             factory,
+            http_client,
         )
     }
 
@@ -314,10 +317,12 @@ impl ApplicationService {
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
     ) -> Self {
+        let http_client = reqwest::Client::new();
         let agent_profile_store: Arc<dyn AgentProfileStore> =
             Arc::new(MemoryAgentProfileStore::new());
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .http_client(http_client.clone())
             .skills_config(skills)
             .builtin_tools(builtin_tools);
         Self::managed_with_configured_factory(
@@ -327,6 +332,7 @@ impl ApplicationService {
             provider_store,
             agent_profile_store,
             factory,
+            http_client,
         )
     }
 
@@ -340,8 +346,32 @@ impl ApplicationService {
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
     ) -> Self {
+        Self::managed_with_profiles_skills_and_builtin_tools_http_client(
+            registry,
+            store,
+            session_storage,
+            provider_store,
+            agent_profile_store,
+            skills,
+            builtin_tools,
+            reqwest::Client::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn managed_with_profiles_skills_and_builtin_tools_http_client(
+        registry: AgentRegistry,
+        store: Arc<dyn ControlStore>,
+        session_storage: Arc<dyn SessionStorage>,
+        provider_store: Arc<dyn ProviderStore>,
+        agent_profile_store: Arc<dyn AgentProfileStore>,
+        skills: SkillsConfig,
+        builtin_tools: BuiltinTools,
+        http_client: reqwest::Client,
+    ) -> Self {
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .http_client(http_client.clone())
             .skills_config(skills)
             .builtin_tools(builtin_tools);
         Self::managed_with_configured_factory(
@@ -351,6 +381,7 @@ impl ApplicationService {
             provider_store,
             agent_profile_store,
             factory,
+            http_client,
         )
     }
 
@@ -361,12 +392,14 @@ impl ApplicationService {
         provider_store: Arc<dyn ProviderStore>,
         agent_profile_store: Arc<dyn AgentProfileStore>,
         factory: ConfiguredAgentFactory,
+        http_client: reqwest::Client,
     ) -> Self {
         let factory: Arc<dyn AgentFactory> = Arc::new(factory);
         let mut service = Self::new(registry, store, session_storage, factory);
-        service.title_generator = Some(Arc::new(ProviderSessionTitleGenerator::new(Arc::clone(
-            &provider_store,
-        ))));
+        service.title_generator = Some(Arc::new(
+            ProviderSessionTitleGenerator::new(Arc::clone(&provider_store))
+                .http_client(http_client),
+        ));
         service.provider_store = Some(provider_store);
         service.agent_profile_store = Some(agent_profile_store);
         service
