@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   android-release:
-    name: Signed Android release APK
+    name: Signed Android ARM64 release APK
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -57,9 +57,26 @@ jobs:
           printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" \
             | base64 --decode > "$ANDROID_RELEASE_KEYSTORE_PATH"
           chmod 600 "$ANDROID_RELEASE_KEYSTORE_PATH"
-          flutter build apk --release
+          flutter build apk --release --target-platform android-arm64
           mv build/app/outputs/flutter-apk/app-release.apk \
             build/app/outputs/flutter-apk/phi-client-android-release.apk
+
+      - name: Verify APK ABI
+        working-directory: flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path=build/app/outputs/flutter-apk/phi-client-android-release.apk
+          mapfile -t packaged_abis < <(
+            unzip -Z1 "$apk_path" \
+              | sed -n 's#^lib/\([^/]*\)/.*\.so$#\1#p' \
+              | sort -u
+          )
+          if [[ "${#packaged_abis[@]}" -ne 1 || "${packaged_abis[0]}" != "arm64-v8a" ]]; then
+            printf 'Expected only arm64-v8a native libraries, found: %s\n' \
+              "${packaged_abis[*]:-none}" >&2
+            exit 1
+          fi
 
       - name: Verify APK signature
         working-directory: flutter

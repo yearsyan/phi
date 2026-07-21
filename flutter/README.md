@@ -92,9 +92,9 @@ flutter run --dart-define=PHI_DAEMON_URL=http://127.0.0.1:8787 \
 
 ### Android
 
-Android release builds use a dedicated release key and never fall back to the
-debug signing config. A local or CI release build must provide all four
-environment variables:
+Android release builds support ARM64 (`arm64-v8a`) only, use a dedicated
+release key, and never fall back to the debug signing config. A local or CI
+release build must provide all four environment variables:
 
 - `ANDROID_RELEASE_KEYSTORE_PATH`
 - `ANDROID_RELEASE_STORE_PASSWORD`
@@ -104,12 +104,12 @@ environment variables:
 Then build the signed APK with:
 
 ```sh
-flutter build apk --release
+flutter build apk --release --target-platform android-arm64
 ```
 
 On every GitHub push, `.github/workflows/build-android-release.yml` restores
 the ignored keystore from `ANDROID_RELEASE_KEYSTORE_BASE64`, builds the signed
-APK, verifies its signature with `apksigner`, and uploads
+ARM64-only APK, verifies its packaged ABI and signature, and uploads
 `phi-client-android-release.apk` to the Actions run. The repository must define
 the base64 keystore secret plus the other three variables above as Actions
 secrets. Never commit the keystore, passwords, generated APK, or a local
