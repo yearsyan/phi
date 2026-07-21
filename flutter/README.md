@@ -1,8 +1,8 @@
 # Phi Flutter client
 
 A Flutter client for the phi coding-agent daemon, targeting Android, iOS,
-macOS, and HarmonyOS/OpenHarmony. The shared Dart code is otherwise
-platform-agnostic; Linux and Windows can use standard Flutter scaffolding.
+macOS, Windows, and HarmonyOS/OpenHarmony. The shared Dart code is otherwise
+platform-agnostic; Linux can use standard Flutter scaffolding.
 
 ## Features
 
@@ -20,7 +20,7 @@ platform-agnostic; Linux and Windows can use standard Flutter scaffolding.
 - **Scheduled tasks** — list / create (daily or interval) / enable / run now /
   delete, open the session produced by the last run.
 - **Adaptive layout** — phone: stacked navigation; wide screens (macOS,
-  tablets): sidebar + detail pane.
+  Windows, tablets): sidebar + detail pane.
 
 Provider configuration is intentionally not included (managed via the web
 client or `PUT /v1/providers`).
@@ -66,6 +66,8 @@ client's `sessionReducer`.
 
 ```sh
 flutter pub get
+# Windows release build
+flutter build windows --release
 # macOS
 flutter run -d macos
 # iOS unsigned release build (device install/archive still requires signing)
@@ -92,6 +94,31 @@ require camera permission (declared in the Android manifest and iOS
 flutter run --dart-define=PHI_DAEMON_URL=http://127.0.0.1:8787 \
             --dart-define=PHI_DAEMON_KEY=<key>
 ```
+
+### Windows
+
+Windows builds require Windows 10 or 11 and Visual Studio 2022 with the
+**Desktop development with C++** workload and a Windows SDK. Visual Studio Code
+alone is not a Windows compiler toolchain. Confirm the installation and build
+the x64 release bundle with:
+
+```powershell
+flutter doctor -v
+flutter pub get
+flutter build windows --release
+```
+
+The runnable bundle is written to
+`build/windows/x64/runner/Release/`; keep the executable, DLLs, and `data/`
+directory together when copying it. The Windows runner includes the same
+multi-image attachment flow as Android, backed by the native file picker and
+Windows Imaging Component. Selected images are oriented, resized, converted to
+JPEG, and compressed before entering the daemon prompt. QR scanning remains
+mobile-only.
+
+On every GitHub push, `.github/workflows/build-windows-client-release.yml`
+builds this release bundle with Flutter 3.44.6 and uploads the
+`phi-client-windows-x64` Actions artifact.
 
 ### Android
 

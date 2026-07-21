@@ -1,0 +1,42 @@
+name: Build Windows client release
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-client-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-release:
+    name: Windows x64 release bundle
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.6
+          cache: true
+
+      - name: Install Flutter dependencies
+        working-directory: flutter
+        run: flutter pub get
+
+      - name: Build Windows release
+        working-directory: flutter
+        run: flutter build windows --release
+
+      - name: Upload Windows release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: phi-client-windows-x64
+          path: flutter/build/windows/x64/runner/Release/
+          if-no-files-found: error
