@@ -1,8 +1,12 @@
 use std::{
-    env, fmt, fs, io,
+    env, fmt, fs,
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use thiserror::Error;
 
@@ -13,6 +17,7 @@ pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8787";
 pub const DATA_DIR_ENV: &str = "PHI_DAEMON_DATA_DIR";
 pub const DEFAULT_DATA_DIR: &str = ".phi/daemon";
 pub const AUTH_KEY_FILE_ENV: &str = "PHI_DAEMON_AUTH_KEY_FILE";
+pub const DEFAULT_AUTH_KEY_FILE: &str = ".phi/daemon/auth.key";
 pub const TLS_CERT_FILE_ENV: &str = "PHI_DAEMON_TLS_CERT_FILE";
 pub const TLS_KEY_FILE_ENV: &str = "PHI_DAEMON_TLS_KEY_FILE";
 pub const SKILLS_ENABLED_ENV: &str = "PHI_DAEMON_SKILLS_ENABLED";
@@ -26,6 +31,7 @@ pub const DEFAULT_WORKSPACE_SKILLS_DIRS: [&str; 2] = [".phy/skills", ".claude/sk
 
 const MIN_AUTH_KEY_BYTES: usize = 32;
 const MAX_AUTH_KEY_BYTES: usize = 4096;
+const GENERATED_AUTH_KEY_BYTES: usize = 32;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TlsConfig {
@@ -175,11 +181,8 @@ impl DaemonConfig {
         if data_dir.trim().is_empty() {
             return Err(ConfigError::InvalidDataDirectory { value: data_dir });
         }
-        let auth_key_file = required_environment(AUTH_KEY_FILE_ENV)?;
-        if auth_key_file.trim().is_empty() {
-            return Err(ConfigError::InvalidAuthKeyFilePath);
-        }
-        let auth_key = read_auth_key(Path::new(&auth_key_file))?;
+        let home = home_directory();
+        let auth_key = load_auth_key(optional_environment(AUTH_KEY_FILE_ENV)?, home.as_deref())?;
         let mut config = Self::new(bind_address, auth_key)?.with_data_dir(data_dir);
         config.tls = tls_config_from_values(
             optional_environment(TLS_CERT_FILE_ENV)?,
@@ -389,8 +392,94 @@ fn home_directory() -> Option<PathBuf> {
         })
 }
 
-fn required_environment(name: &'static str) -> Result<String, ConfigError> {
-    env::var(name).map_err(|source| ConfigError::Environment { name, source })
+fn load_auth_key(
+    configured_path: Option<String>,
+    home_directory: Option<&Path>,
+) -> Result<String, ConfigError> {
+    if let Some(path) = configured_path {
+        if path.trim().is_empty() {
+            return Err(ConfigError::InvalidAuthKeyFilePath);
+        }
+        return read_auth_key(Path::new(&path));
+    }
+
+    let home_directory = home_directory.ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    load_or_create_default_auth_key(&home_directory.join(DEFAULT_AUTH_KEY_FILE))
+}
+
+fn load_or_create_default_auth_key(path: &Path) -> Result<String, ConfigError> {
+    match read_auth_key(path) {
+        Ok(key) => Ok(key),
+        Err(ConfigError::AuthKeyFile { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            create_default_auth_key(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_default_auth_key(path: &Path) -> Result<String, ConfigError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
+            .create(parent)
+            .map_err(|source| ConfigError::AuthKeyDirectory {
+                path: parent.to_owned(),
+                source,
+            })?;
+    }
+
+    let key = generate_auth_key()?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return read_auth_key(path);
+        }
+        Err(source) => {
+            return Err(ConfigError::AuthKeyFileInitialization {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let result = file
+        .write_all(key.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    if let Err(source) = result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(ConfigError::AuthKeyFileInitialization {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    Ok(key)
+}
+
+fn generate_auth_key() -> Result<String, ConfigError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut random = [0_u8; GENERATED_AUTH_KEY_BYTES];
+    getrandom::fill(&mut random).map_err(|_| ConfigError::AuthKeyGeneration)?;
+    let mut key = String::with_capacity(GENERATED_AUTH_KEY_BYTES * 2);
+    for byte in random {
+        key.push(char::from(HEX[usize::from(byte >> 4)]));
+        key.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(key)
 }
 
 fn read_auth_key(path: &Path) -> Result<String, ConfigError> {
@@ -442,6 +531,28 @@ pub enum ConfigError {
 
     #[error("daemon auth key file path must not be empty")]
     InvalidAuthKeyFilePath,
+
+    #[error(
+        "could not determine the home directory for the default daemon auth key; set PHI_DAEMON_AUTH_KEY_FILE"
+    )]
+    HomeDirectoryUnavailable,
+
+    #[error("could not create daemon auth key directory {path}: {source}")]
+    AuthKeyDirectory {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("secure randomness is unavailable for daemon auth key generation")]
+    AuthKeyGeneration,
+
+    #[error("could not initialize daemon auth key file {path}: {source}")]
+    AuthKeyFileInitialization {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     #[error(
         "PHI_DAEMON_TLS_CERT_FILE and PHI_DAEMON_TLS_KEY_FILE must be configured together (missing {missing})"
@@ -665,5 +776,77 @@ mod tests {
         let loaded = read_auth_key(&path).unwrap();
         let _ = fs::remove_file(path);
         assert_eq!(loaded, secret);
+    }
+
+    #[test]
+    fn missing_auth_key_configuration_creates_a_protected_default_key() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(DEFAULT_AUTH_KEY_FILE);
+
+        let generated = load_auth_key(None, Some(home.path())).unwrap();
+
+        assert_eq!(generated.len(), GENERATED_AUTH_KEY_BYTES * 2);
+        assert!(generated.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(read_auth_key(&path).unwrap(), generated);
+        assert_eq!(load_auth_key(None, Some(home.path())).unwrap(), generated);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+            let directory_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(file_mode & 0o077, 0);
+            assert_eq!(directory_mode & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn default_auth_key_initialization_never_overwrites_an_existing_key() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(DEFAULT_AUTH_KEY_FILE);
+        let secret = "existing-auth-key-that-must-be-preserved";
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{secret}\n")).unwrap();
+
+        assert_eq!(load_auth_key(None, Some(home.path())).unwrap(), secret);
+        assert_eq!(fs::read_to_string(path).unwrap(), format!("{secret}\n"));
+    }
+
+    #[test]
+    fn invalid_default_auth_key_is_reported_without_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(DEFAULT_AUTH_KEY_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "too-short\n").unwrap();
+
+        assert!(matches!(
+            load_auth_key(None, Some(home.path())),
+            Err(ConfigError::InvalidAuthKey)
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "too-short\n");
+    }
+
+    #[test]
+    fn explicit_auth_key_path_still_requires_an_existing_valid_file() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("missing.key");
+
+        assert!(matches!(
+            load_auth_key(Some("  ".to_owned()), None),
+            Err(ConfigError::InvalidAuthKeyFilePath)
+        ));
+        assert!(matches!(
+            load_auth_key(Some(missing.to_string_lossy().into_owned()), None),
+            Err(ConfigError::AuthKeyFile { source, .. })
+                if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            load_auth_key(None, None),
+            Err(ConfigError::HomeDirectoryUnavailable)
+        ));
     }
 }

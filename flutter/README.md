@@ -90,6 +90,32 @@ flutter run --dart-define=PHI_DAEMON_URL=http://127.0.0.1:8787 \
             --dart-define=PHI_DAEMON_KEY=<key>
 ```
 
+### Android
+
+Android release builds use a dedicated release key and never fall back to the
+debug signing config. A local or CI release build must provide all four
+environment variables:
+
+- `ANDROID_RELEASE_KEYSTORE_PATH`
+- `ANDROID_RELEASE_STORE_PASSWORD`
+- `ANDROID_RELEASE_KEY_ALIAS`
+- `ANDROID_RELEASE_KEY_PASSWORD`
+
+Then build the signed APK with:
+
+```sh
+flutter build apk --release
+```
+
+On every GitHub push, `.github/workflows/build-android-release.yml` restores
+the ignored keystore from `ANDROID_RELEASE_KEYSTORE_BASE64`, builds the signed
+APK, verifies its signature with `apksigner`, and uploads
+`phi-client-android-release.apk` to the Actions run. The repository must define
+the base64 keystore secret plus the other three variables above as Actions
+secrets. Never commit the keystore, passwords, generated APK, or a local
+`key.properties`; keep a secure backup because future upgrades must use the
+same signing identity.
+
 ### iOS
 
 iOS builds require Xcode with an installed iOS Platform component and
@@ -173,7 +199,7 @@ test explicitly:
 flutter test
 
 PHI_RUN_DAEMON_SMOKE_TEST=1 \
-  PHI_DAEMON_AUTH_KEY_FILE=../.phi/daemon/auth.key \
+  PHI_DAEMON_AUTH_KEY_FILE="$HOME/.phi/daemon/auth.key" \
   PHI_DAEMON_URL=http://127.0.0.1:8787 \
   flutter test test/daemon_smoke_test.dart
 ```

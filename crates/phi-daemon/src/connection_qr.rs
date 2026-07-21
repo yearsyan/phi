@@ -45,10 +45,16 @@ pub(crate) fn print_for_terminal(config: &DaemonConfig, address: SocketAddr, tls
                     "Loopback-only listener: restart with --lan for a phone on the local network.\n",
                 );
             }
-            if listener_address.ip().is_unspecified() && address.ip().is_loopback() {
-                output.push_str(
-                    "No private LAN IPv4 address was found; set PHI_DAEMON_BIND to a specific reachable address.\n",
-                );
+            if listener_address.is_ipv4() && listener_address.ip().is_unspecified() {
+                match address.ip() {
+                    IpAddr::V4(ip) if ip.is_loopback() => output.push_str(
+                        "No usable non-loopback IPv4 address was found; set PHI_DAEMON_BIND to a specific reachable address.\n",
+                    ),
+                    IpAddr::V4(ip) if !ip.is_private() => output.push_str(&format!(
+                        "No private LAN IPv4 address was found; advertising fallback interface address {ip}. Set PHI_DAEMON_BIND to choose explicitly.\n",
+                    )),
+                    _ => {}
+                }
             }
             let result = {
                 let mut stderr = io::stderr().lock();
@@ -82,29 +88,73 @@ fn base_url(address: SocketAddr, tls: bool) -> String {
 }
 
 fn advertised_address(address: SocketAddr) -> SocketAddr {
-    advertised_address_with(address, route_ip)
+    advertised_address_with(address, route_ip, interface_ipv4_addresses)
 }
 
 fn advertised_address_with(
     address: SocketAddr,
     resolve_route: impl FnOnce(IpAddr, SocketAddr) -> Option<IpAddr>,
+    resolve_ipv4_interfaces: impl FnOnce() -> Vec<Ipv4Addr>,
 ) -> SocketAddr {
     if !address.ip().is_unspecified() {
         return address;
     }
 
     let ip = match address.ip() {
-        IpAddr::V4(_) => resolve_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED), IPV4_ROUTE_PROBE)
-            .filter(|ip| is_private_ipv4(*ip))
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpAddr::V4(_) => IpAddr::V4(select_ipv4_address(
+            resolve_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED), IPV4_ROUTE_PROBE),
+            resolve_ipv4_interfaces,
+        )),
         IpAddr::V6(_) => resolve_route(IpAddr::V6(Ipv6Addr::UNSPECIFIED), IPV6_ROUTE_PROBE)
             .unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST)),
     };
     SocketAddr::new(ip, address.port())
 }
 
-fn is_private_ipv4(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(ip) if ip.is_private())
+fn select_ipv4_address(
+    routed_ip: Option<IpAddr>,
+    resolve_interfaces: impl FnOnce() -> Vec<Ipv4Addr>,
+) -> Ipv4Addr {
+    let routed_ip = routed_ip.and_then(|ip| match ip {
+        IpAddr::V4(ip) if is_usable_ipv4(ip) => Some(ip),
+        _ => None,
+    });
+    if let Some(ip) = routed_ip.filter(Ipv4Addr::is_private) {
+        return ip;
+    }
+
+    let interface_ips = resolve_interfaces()
+        .into_iter()
+        .filter(|ip| is_usable_ipv4(*ip))
+        .collect::<Vec<_>>();
+    interface_ips
+        .iter()
+        .copied()
+        .find(Ipv4Addr::is_private)
+        .or(routed_ip)
+        .or_else(|| interface_ips.into_iter().next())
+        .unwrap_or(Ipv4Addr::LOCALHOST)
+}
+
+fn is_usable_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback()
+}
+
+fn interface_ipv4_addresses() -> Vec<Ipv4Addr> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .filter(|interface| interface.is_oper_up())
+            .filter_map(|interface| match interface.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+            .collect(),
+        Err(error) => {
+            warn!(%error, "could not enumerate local interfaces for the connection QR code");
+            Vec::new()
+        }
+    }
 }
 
 fn route_ip(bind_ip: IpAddr, destination: SocketAddr) -> Option<IpAddr> {
@@ -188,11 +238,15 @@ mod tests {
     #[test]
     fn wildcard_listener_preserves_family_and_port_but_advertises_a_concrete_ip() {
         let address = "0.0.0.0:8787".parse().unwrap();
-        let advertised = advertised_address_with(address, |bind_ip, destination| {
-            assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-            assert_eq!(destination, IPV4_ROUTE_PROBE);
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 9, 138)))
-        });
+        let advertised = advertised_address_with(
+            address,
+            |bind_ip, destination| {
+                assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                assert_eq!(destination, IPV4_ROUTE_PROBE);
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 9, 138)))
+            },
+            Vec::new,
+        );
 
         assert!(advertised.is_ipv4());
         assert!(!advertised.ip().is_unspecified());
@@ -202,22 +256,60 @@ mod tests {
     #[test]
     fn wildcard_listener_falls_back_to_loopback_when_no_route_is_available() {
         let address = "[::]:8787".parse().unwrap();
-        let advertised = advertised_address_with(address, |_, _| None);
+        let advertised = advertised_address_with(address, |_, _| None, Vec::new);
 
         assert_eq!(advertised, "[::1]:8787".parse().unwrap());
     }
 
     #[test]
-    fn wildcard_ipv4_listener_rejects_non_private_route_addresses() {
+    fn wildcard_ipv4_listener_prefers_a_private_interface_over_a_public_route() {
         let address = "0.0.0.0:8787".parse().unwrap();
-        let advertised = advertised_address_with(address, |_, _| {
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
-        });
+        let advertised = advertised_address_with(
+            address,
+            |_, _| Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            || {
+                vec![
+                    Ipv4Addr::LOCALHOST,
+                    Ipv4Addr::new(10, 1, 2, 3),
+                    Ipv4Addr::new(100, 64, 1, 2),
+                ]
+            },
+        );
+
+        assert_eq!(advertised, "10.1.2.3:8787".parse().unwrap());
+        assert!(Ipv4Addr::new(10, 1, 2, 3).is_private());
+        assert!(Ipv4Addr::new(172, 16, 2, 3).is_private());
+        assert!(Ipv4Addr::new(192, 168, 2, 3).is_private());
+    }
+
+    #[test]
+    fn wildcard_ipv4_listener_falls_back_to_a_non_loopback_interface() {
+        let address = "0.0.0.0:8787".parse().unwrap();
+        let advertised = advertised_address_with(
+            address,
+            |_, _| None,
+            || {
+                vec![
+                    Ipv4Addr::LOCALHOST,
+                    Ipv4Addr::UNSPECIFIED,
+                    Ipv4Addr::new(100, 64, 1, 2),
+                ]
+            },
+        );
+
+        assert_eq!(advertised, "100.64.1.2:8787".parse().unwrap());
+    }
+
+    #[test]
+    fn wildcard_ipv4_listener_uses_loopback_only_as_the_last_resort() {
+        let address = "0.0.0.0:8787".parse().unwrap();
+        let advertised = advertised_address_with(
+            address,
+            |_, _| None,
+            || vec![Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED],
+        );
 
         assert_eq!(advertised, "127.0.0.1:8787".parse().unwrap());
-        assert!(is_private_ipv4(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
-        assert!(is_private_ipv4(IpAddr::V4(Ipv4Addr::new(172, 16, 2, 3))));
-        assert!(is_private_ipv4(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 3))));
     }
 
     #[test]
