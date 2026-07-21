@@ -1,9 +1,8 @@
 # Phi Flutter client
 
-A Flutter client for the phi coding-agent daemon, targeting Android, macOS,
-and HarmonyOS/OpenHarmony (the codebase is otherwise platform-agnostic;
-iOS/Linux/Windows should work with the standard `flutter create` scaffolding
-for those targets).
+A Flutter client for the phi coding-agent daemon, targeting Android, iOS,
+macOS, and HarmonyOS/OpenHarmony. The shared Dart code is otherwise
+platform-agnostic; Linux and Windows can use standard Flutter scaffolding.
 
 ## Features
 
@@ -69,18 +68,42 @@ client's `sessionReducer`.
 flutter pub get
 # macOS
 flutter run -d macos
+# iOS unsigned release build (device install/archive still requires signing)
+flutter build ios --release --no-codesign
 # Android (daemon on the host's loopback):
 adb reverse tcp:8787 tcp:8787
 flutter run -d <android-device-id>
 ```
 
 Then open Settings and enter the daemon URL and the auth key (contents of
-`PHI_DAEMON_AUTH_KEY_FILE`). For development, both can be seeded:
+`PHI_DAEMON_AUTH_KEY_FILE`). On Android/iOS you can instead scan the
+connection QR code that `phi-daemon` prints to its terminal at startup
+(pass `--no-qr` to disable it): use the **Scan to connect** action on the
+unconfigured sessions screen, or **Scan QR code** in Settings. Scanning
+fills in the URL and auth key only; it never changes the self-signed
+certificate toggle. The scan entries are mobile-only and require camera
+permission (declared in the Android manifest and iOS `Info.plist`). For
+development, both can also be seeded:
 
 ```sh
 flutter run --dart-define=PHI_DAEMON_URL=http://127.0.0.1:8787 \
             --dart-define=PHI_DAEMON_KEY=<key>
 ```
+
+### iOS
+
+iOS builds require Xcode with an installed iOS Platform component and
+CocoaPods. The committed runner uses bundle identifier `dev.phi.phiClient`
+and targets iOS 13 or newer. A CI or local compile check can skip signing:
+
+```sh
+flutter build ios --release --no-codesign
+```
+
+To install on a physical device or create an archive/IPA, open
+`ios/Runner.xcworkspace` in Xcode and select an Apple Development or
+Distribution team and provisioning profile. Do not commit signing identities,
+profiles, or certificate paths.
 
 ### HarmonyOS
 

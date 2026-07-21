@@ -64,6 +64,33 @@ cargo run -p phi-daemon
 ```
 
 默认以 HTTP/WS 监听 `127.0.0.1:8787`，默认数据目录是相对于启动工作目录的 `.phi/daemon`。
+默认 loopback 只适合同机客户端或已经配置 `adb reverse` 的设备。让同一局域网中的手机直接
+连接时，显式传入 `--lan`：
+
+```bash
+PHI_DAEMON_AUTH_KEY_FILE=.phi/daemon/auth.key \
+  cargo run -p phi-daemon -- --lan
+```
+
+`--lan` 保留 `PHI_DAEMON_BIND` 中的端口，但把监听 IP 改为 `0.0.0.0`。这会把 daemon
+暴露给本机所有 IPv4 网络接口；必须遵循下文的非本机监听安全要求。
+在交互式终端中，daemon 绑定成功后默认显示一个 App 连接二维码；二维码包含实际连接地址和
+长期 key，因此应当像 key 文件本身一样保密。二维码载荷是版本化 JSON：
+
+```json
+{"type":"phi-daemon","version":1,"base_url":"http://127.0.0.1:8787","auth_key":"<key>"}
+```
+
+若合法 key 过长、超出单个二维码容量，daemon 只记录不含 key 的 warning 并继续监听。
+使用独立二进制时传入 `--no-qr` 可关闭二维码；通过 Cargo 启动时使用
+`cargo run -p phi-daemon -- --no-qr`。stderr 不是终端时也不会输出二维码，避免长期 key
+随重定向进入服务日志。监听具体地址时二维码使用该地址；使用 `--lan` 或监听 `0.0.0.0`
+时，daemon 通过本机路由表优先查找 `10.0.0.0/8`、`172.16.0.0/12` 或
+`192.168.0.0/16` 的局域网 IPv4，并保留 listener 的实际端口。找不到私网地址时会回退
+loopback 并在终端明确提示，此时应把 `PHI_DAEMON_BIND` 设置为一个确定可达的地址。使用
+TLS 时二维码中的 `base_url` 为 `https://...`，证书也必须对该地址有效，或由客户端按
+既有策略显式信任。
+
 同时配置证书与私钥文件后，同一地址改为 HTTPS/WSS；daemon 不会同时开放明文端口。
 启动后通过 `PUT /v1/providers/{profile_id}` 写入一个或多个 Provider profile；配置成功前 session 列表仍可使用，但选择未配置 profile 的 `/v1/ws/new` 会返回 `agent_build_failed`。
 

@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::{
     api::{self, AppState},
     config::{ConfigError, DaemonConfig, TlsConfig},
+    connection_qr,
     runtime::AgentRegistry,
     scheduled_task::{ScheduledTaskError, ScheduledTaskManager},
     service::ApplicationService,
@@ -77,6 +78,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
         workspace_dir = %config.workspace_dir().display(),
         "phi daemon listening"
     );
+    connection_qr::print_for_terminal(&config, local_address, tls_acceptor.is_some());
     let (begin_graceful_shutdown, graceful_shutdown) = oneshot::channel();
     let shutdown_service = Arc::clone(&service);
     let shutdown_scheduled_tasks = Arc::clone(&scheduled_tasks);

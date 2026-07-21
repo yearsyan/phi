@@ -1647,23 +1647,26 @@ impl From<AgentEvent> for EventDto {
                 tool_results,
             } => Self::TurnEnd {
                 turn,
-                message: PublicMessage::from(&message),
+                message: PublicMessage::from(message.as_ref()),
                 tool_results: tool_results.iter().map(PublicMessage::from).collect(),
             },
             AgentEvent::MessageStart { message } => Self::MessageStart {
-                message: PublicMessage::from(&message),
+                message: PublicMessage::from(message.as_ref()),
             },
             AgentEvent::MessageUpdate { delta } => Self::MessageUpdate {
                 delta: delta.into(),
             },
             AgentEvent::MessageEnd { message } => Self::MessageEnd {
-                message: PublicMessage::from(&message),
+                message: PublicMessage::from(message.as_ref()),
             },
             AgentEvent::MessageAborted => Self::MessageAborted,
-            AgentEvent::ToolExecutionStart { call } => Self::ToolExecutionStart { call },
-            AgentEvent::ToolExecutionProgress { call, progress } => {
-                Self::ToolExecutionProgress { call, progress }
-            }
+            AgentEvent::ToolExecutionStart { call } => Self::ToolExecutionStart {
+                call: call.as_ref().clone(),
+            },
+            AgentEvent::ToolExecutionProgress { call, progress } => Self::ToolExecutionProgress {
+                call: call.as_ref().clone(),
+                progress,
+            },
             AgentEvent::ToolExecutionEnd {
                 call,
                 content,
@@ -1671,10 +1674,10 @@ impl From<AgentEvent> for EventDto {
                 content_parts,
                 metadata,
             } => Self::ToolExecutionEnd {
-                call,
+                call: call.as_ref().clone(),
                 content,
                 is_error,
-                content_parts,
+                content_parts: content_parts.to_vec(),
                 metadata,
             },
             AgentEvent::UsageUpdate {
@@ -2315,7 +2318,7 @@ mod tests {
             before_message_count: 4,
             after_message_count: 1,
             changed_from: 0,
-            replacement: vec![Message::user("summary")],
+            replacement: vec![Message::user("summary")].into(),
             summary: "summary".to_owned(),
             usage: Some(TokenUsage::new(10, 2, 0)),
             estimated_context_tokens: 7,

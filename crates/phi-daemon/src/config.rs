@@ -69,6 +69,7 @@ pub struct DaemonConfig {
     data_dir: PathBuf,
     auth_key: String,
     tls: Option<TlsConfig>,
+    qr_enabled: bool,
     skills_enabled: bool,
     subagents_enabled: bool,
     session_title_profile_id: Option<String>,
@@ -86,6 +87,7 @@ impl DaemonConfig {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             auth_key,
             tls: None,
+            qr_enabled: true,
             skills_enabled: true,
             subagents_enabled: true,
             session_title_profile_id: None,
@@ -103,6 +105,11 @@ impl DaemonConfig {
         self
     }
 
+    pub fn with_bind_address(mut self, bind_address: SocketAddr) -> Self {
+        self.bind_address = bind_address;
+        self
+    }
+
     pub fn with_tls(
         mut self,
         certificate_file: impl Into<PathBuf>,
@@ -114,6 +121,11 @@ impl DaemonConfig {
 
     pub fn with_skills_enabled(mut self, enabled: bool) -> Self {
         self.skills_enabled = enabled;
+        self
+    }
+
+    pub fn with_qr_enabled(mut self, enabled: bool) -> Self {
+        self.qr_enabled = enabled;
         self
     }
 
@@ -217,6 +229,10 @@ impl DaemonConfig {
         self.skills_enabled
     }
 
+    pub fn qr_enabled(&self) -> bool {
+        self.qr_enabled
+    }
+
     pub fn subagents_enabled(&self) -> bool {
         self.subagents_enabled
     }
@@ -267,6 +283,7 @@ impl fmt::Debug for DaemonConfig {
             .field("bind_address", &self.bind_address)
             .field("data_dir", &self.data_dir)
             .field("tls", &self.tls)
+            .field("qr_enabled", &self.qr_enabled)
             .field("skills_enabled", &self.skills_enabled)
             .field("subagents_enabled", &self.subagents_enabled)
             .field("session_title_profile_id", &self.session_title_profile_id)
@@ -460,6 +477,7 @@ mod tests {
         assert!(config.bind_address().ip().is_loopback());
         assert_eq!(config.data_dir(), Path::new(DEFAULT_DATA_DIR));
         assert_eq!(config.tls_config(), None);
+        assert!(config.qr_enabled());
         assert!(config.skills_enabled());
         assert!(config.subagents_enabled());
         assert_eq!(config.session_title_profile_id(), None);
@@ -484,6 +502,30 @@ mod tests {
         .unwrap()
         .with_data_dir("state/phi");
         assert_eq!(config.data_dir(), Path::new("state/phi"));
+    }
+
+    #[test]
+    fn builder_overrides_the_bind_address() {
+        let config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap()
+        .with_bind_address("0.0.0.0:9000".parse().unwrap());
+
+        assert_eq!(config.bind_address(), "0.0.0.0:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn builder_can_disable_the_connection_qr_code() {
+        let config = DaemonConfig::new(
+            DEFAULT_BIND_ADDRESS.parse().unwrap(),
+            "a-secure-test-key-with-at-least-32-bytes",
+        )
+        .unwrap()
+        .with_qr_enabled(false);
+
+        assert!(!config.qr_enabled());
     }
 
     #[test]

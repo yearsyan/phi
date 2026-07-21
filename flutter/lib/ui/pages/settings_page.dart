@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../../app.dart';
+import '../../core/models/connection_payload.dart';
 import '../../core/models/wire.dart';
 import '../../i18n/strings.dart';
+import '../../platform/qr_scan_support.dart';
 import '../../state/app_state.dart';
+import 'scan_connection_page.dart';
 
 /// Connection settings: daemon address, auth key, TLS policy, plus default
 /// capability mode for new sessions.
@@ -59,6 +62,19 @@ class _SettingsPageState extends State<SettingsPage> {
         context,
       ).showSnackBar(SnackBar(content: Text(S.of(context).settingsSaved)));
     }
+  }
+
+  Future<void> _scanQr() async {
+    final payload = await Navigator.of(context).push<ConnectionPayload>(
+      MaterialPageRoute(builder: (_) => const ScanConnectionPage()),
+    );
+    if (payload == null || !mounted) return;
+    setState(() {
+      _baseUrl.text = payload.baseUrl;
+      _authKey.text = payload.authKey;
+      _testResult = null;
+    });
+    await _save();
   }
 
   Future<void> _test() async {
@@ -127,6 +143,13 @@ class _SettingsPageState extends State<SettingsPage> {
                       hintText: 'http://127.0.0.1:8787',
                       border: const OutlineInputBorder(),
                       prefixIcon: const Icon(Icons.link_rounded),
+                      suffixIcon: qrScanSupported
+                          ? IconButton(
+                              tooltip: S.of(context).scanQrCode,
+                              icon: const Icon(Icons.qr_code_scanner),
+                              onPressed: _scanQr,
+                            )
+                          : null,
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -159,14 +182,15 @@ class _SettingsPageState extends State<SettingsPage> {
                         setState(() => _allowUntrustedCerts = value),
                   ),
                   const SizedBox(height: 8),
-                  Row(
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 8,
                     children: [
                       FilledButton.icon(
                         onPressed: _save,
                         icon: const Icon(Icons.save_outlined, size: 18),
                         label: Text(S.of(context).save),
                       ),
-                      const SizedBox(width: 12),
                       OutlinedButton.icon(
                         onPressed: _testing ? null : _test,
                         icon: _testing

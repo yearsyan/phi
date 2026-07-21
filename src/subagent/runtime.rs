@@ -2155,7 +2155,7 @@ fn forward_agent_event(
                 snapshot.draft = None;
             }
             AgentEvent::AgentEnd { messages } | AgentEvent::AgentStopped { messages } => {
-                snapshot.messages = messages.clone();
+                snapshot.messages = messages.to_vec();
                 snapshot.draft = None;
             }
             AgentEvent::UsageUpdate {

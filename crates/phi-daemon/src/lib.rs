@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+mod connection_qr;
 pub mod runtime;
 pub mod scheduled_task;
 pub mod server;

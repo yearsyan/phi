@@ -264,6 +264,22 @@ class S {
     '仅在可信网络中开启（用于证书不受信的 HTTPS daemon）',
   );
   String get testConnection => _t('Test connection', '测试连接');
+  String get scanQrCode => _t('Scan QR code', '扫描二维码');
+  String get scanToConnect => _t('Scan to connect', '扫码连接');
+  String get scanQrHint => _t(
+    'Point the camera at the connection QR code printed by phi-daemon '
+        'when it starts.',
+    '对准 phi-daemon 启动时在终端打印的连接二维码。',
+  );
+  String get invalidQrCode =>
+      _t('Not a phi-daemon connection QR code', '不是有效的 phi-daemon 连接二维码');
+  String get cameraPermissionDenied => _t(
+    'Camera access was denied. Enable it in system settings to scan the '
+        'connection QR code.',
+    '相机权限被拒绝。请在系统设置中允许访问相机后再扫码。',
+  );
+  String get cameraUnavailable =>
+      _t('Camera is unavailable on this device.', '此设备的相机不可用。');
   String get settingsSaved => _t('Settings saved', '设置已保存');
   String connectedSessions(int count) => _t(
     'Connected — $count session(s) on daemon.',

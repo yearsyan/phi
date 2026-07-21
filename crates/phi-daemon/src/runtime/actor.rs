@@ -2314,10 +2314,10 @@ fn wire_agent_event(event: &AgentEvent) -> AgentEvent {
         // are deliberately omitted from the broadcast ring because the WS
         // protocol represents these as terminal markers, not history payloads.
         AgentEvent::AgentEnd { .. } => AgentEvent::AgentEnd {
-            messages: Vec::new(),
+            messages: Vec::new().into(),
         },
         AgentEvent::AgentStopped { .. } => AgentEvent::AgentStopped {
-            messages: Vec::new(),
+            messages: Vec::new().into(),
         },
         AgentEvent::ContextCompactionStarted {
             trigger, compactor, ..
@@ -2341,7 +2341,7 @@ fn wire_agent_event(event: &AgentEvent) -> AgentEvent {
             before_message_count: *before_message_count,
             after_message_count: *after_message_count,
             changed_from: *changed_from,
-            replacement: Vec::new(),
+            replacement: Vec::new().into(),
             summary: String::new(),
             usage: *usage,
             estimated_context_tokens: *estimated_context_tokens,
@@ -2394,7 +2394,7 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
     match event {
         AgentEvent::AgentStart => state.draft = None,
         AgentEvent::AgentEnd { messages } | AgentEvent::AgentStopped { messages } => {
-            state.messages.clone_from(messages);
+            state.messages.clone_from_slice(messages);
             state.draft = None;
         }
         AgentEvent::MessageStart { message } if message.role == Role::Assistant => {
@@ -2402,8 +2402,8 @@ fn apply_agent_event(state: &mut AgentView, event: &AgentEvent) {
         }
         AgentEvent::MessageUpdate { delta } => apply_delta(state, delta),
         AgentEvent::MessageEnd { message } => {
-            state.messages.push(message.clone());
-            state.display_messages.push(message.clone());
+            state.messages.push(message.as_ref().clone());
+            state.display_messages.push(message.as_ref().clone());
             if message.role == Role::Assistant {
                 state.draft = None;
             }
@@ -2695,7 +2695,7 @@ mod tests {
                 before_message_count: visible.len(),
                 after_message_count: replacement.len(),
                 changed_from: 0,
-                replacement: replacement.clone(),
+                replacement: replacement.clone().into(),
                 summary: "must stay private".to_owned(),
                 usage: None,
                 estimated_context_tokens: 10,
@@ -2743,7 +2743,7 @@ mod tests {
         apply_agent_event(
             &mut state,
             &AgentEvent::MessageStart {
-                message: Message::assistant(None, Vec::new()),
+                message: Message::assistant(None, Vec::new()).into(),
             },
         );
         apply_agent_event(

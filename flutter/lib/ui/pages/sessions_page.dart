@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app.dart';
+import '../../core/models/connection_payload.dart';
 import '../../core/models/wire.dart';
 import '../../i18n/strings.dart';
+import '../../platform/qr_scan_support.dart';
 import '../../state/app_state.dart';
+import 'scan_connection_page.dart';
 
 /// Sessions sidebar: workspace-grouped session list with pin/delete actions.
 class SessionsPage extends StatefulWidget {
@@ -109,6 +112,22 @@ class _SessionsPageState extends State<SessionsPage> {
     );
   }
 
+  Future<void> _scanToConnect() async {
+    final payload = await Navigator.of(context).push<ConnectionPayload>(
+      MaterialPageRoute(builder: (_) => const ScanConnectionPage()),
+    );
+    if (payload == null || !mounted) return;
+    await _app.settings.updateConnection(
+      baseUrl: payload.baseUrl,
+      authKey: payload.authKey,
+    );
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(S.of(context).settingsSaved)));
+    }
+  }
+
   Widget _buildList(BuildContext context, dynamic store, ThemeData theme) {
     final s = S.of(context);
     if (!_app.settings.isConfigured) {
@@ -118,6 +137,8 @@ class _SessionsPageState extends State<SessionsPage> {
         message: s.daemonNotConfiguredHint,
         actionLabel: s.openSettings,
         onAction: widget.onOpenSettings,
+        secondaryActionLabel: qrScanSupported ? s.scanToConnect : null,
+        onSecondaryAction: qrScanSupported ? _scanToConnect : null,
       );
     }
     if (store.error != null && store.sessions.isEmpty) {
@@ -441,6 +462,8 @@ class _CenteredHint extends StatelessWidget {
     required this.message,
     this.actionLabel,
     this.onAction,
+    this.secondaryActionLabel,
+    this.onSecondaryAction,
   });
 
   final IconData icon;
@@ -448,6 +471,8 @@ class _CenteredHint extends StatelessWidget {
   final String message;
   final String? actionLabel;
   final VoidCallback? onAction;
+  final String? secondaryActionLabel;
+  final VoidCallback? onSecondaryAction;
 
   @override
   Widget build(BuildContext context) {
@@ -472,6 +497,13 @@ class _CenteredHint extends StatelessWidget {
             if (actionLabel != null) ...[
               const SizedBox(height: 12),
               FilledButton(onPressed: onAction, child: Text(actionLabel!)),
+            ],
+            if (secondaryActionLabel != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: onSecondaryAction,
+                child: Text(secondaryActionLabel!),
+              ),
             ],
           ],
         ),

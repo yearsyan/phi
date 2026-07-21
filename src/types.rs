@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt, ops::AddAssign, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, fmt, ops::AddAssign, str::FromStr, sync::Arc, time::Duration};
 
 use crate::context::ContextCompactionTrigger;
 
@@ -696,21 +696,21 @@ pub enum ToolExecutionMode {
 pub enum AgentEvent {
     AgentStart,
     AgentEnd {
-        messages: Vec<Message>,
+        messages: Arc<[Message]>,
     },
     TurnStart {
         turn: usize,
     },
     TurnEnd {
         turn: usize,
-        message: Message,
-        tool_results: Vec<Message>,
+        message: Arc<Message>,
+        tool_results: Arc<[Message]>,
     },
     MessageStart {
-        message: Message,
+        message: Arc<Message>,
     },
     MessageEnd {
-        message: Message,
+        message: Arc<Message>,
     },
     MessageUpdate {
         delta: AssistantDelta,
@@ -719,17 +719,17 @@ pub enum AgentEvent {
     /// must not be added to the transcript.
     MessageAborted,
     ToolExecutionStart {
-        call: ToolCall,
+        call: Arc<ToolCall>,
     },
     ToolExecutionProgress {
-        call: ToolCall,
+        call: Arc<ToolCall>,
         progress: crate::tool::ToolProgress,
     },
     ToolExecutionEnd {
-        call: ToolCall,
+        call: Arc<ToolCall>,
         content: String,
         is_error: bool,
-        content_parts: Vec<ContentPart>,
+        content_parts: Arc<[ContentPart]>,
         metadata: Option<Value>,
     },
     UsageUpdate {
@@ -755,7 +755,7 @@ pub enum AgentEvent {
         /// First replaced transcript index.
         changed_from: usize,
         /// Complete replacement tail beginning at `changed_from`.
-        replacement: Vec<Message>,
+        replacement: Arc<[Message]>,
         summary: String,
         usage: Option<TokenUsage>,
         estimated_context_tokens: u64,
@@ -772,7 +772,7 @@ pub enum AgentEvent {
     /// A controlled run stopped after its last protocol-safe transcript state
     /// was persisted.
     AgentStopped {
-        messages: Vec<Message>,
+        messages: Arc<[Message]>,
     },
 }
 

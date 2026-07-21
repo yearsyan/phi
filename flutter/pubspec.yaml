@@ -48,6 +48,9 @@ dependencies:
       ref: shared_preferences-v2.5.4-ohos-1.0.0
       path: packages/shared_preferences/shared_preferences
   uuid: ^4.5.1
+  # QR scanning for daemon connection codes. Camera-based; the scan entry is
+  # only shown on Android/iOS (no OpenHarmony implementation exists).
+  mobile_scanner: ^7.4.0
   flutter_markdown_plus: ^1.0.4
   flutter_highlight: ^0.7.0
   markdown: ^7.3.0

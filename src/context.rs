@@ -86,7 +86,7 @@ pub struct ContextCompactionOutcome {
     pub before_message_count: usize,
     pub after_message_count: usize,
     pub changed_from: usize,
-    pub replacement: Vec<Message>,
+    pub replacement: std::sync::Arc<[Message]>,
     pub summary: String,
     pub usage: Option<TokenUsage>,
     pub estimated_context_tokens: u64,

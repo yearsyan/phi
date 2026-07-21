@@ -1,0 +1,61 @@
+name: Build daemon binaries
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-arm64:
+    name: macOS ARM64
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Build phi-daemon
+        run: cargo +stable build --locked --release --package phi-daemon --bin phi-daemon
+
+      - name: Package executable
+        run: tar -czf phi-daemon-macos-arm64.tar.gz -C target/release phi-daemon
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: phi-daemon-macos-arm64.tar.gz
+          if-no-files-found: error
+          archive: false
+
+  windows-x86-64:
+    name: Windows x86_64
+    runs-on: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Build phi-daemon
+        run: cargo +stable build --locked --release --package phi-daemon --bin phi-daemon
+
+      - name: Package executable
+        shell: pwsh
+        run: >-
+          Compress-Archive
+          -LiteralPath target/release/phi-daemon.exe
+          -DestinationPath phi-daemon-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: phi-daemon-windows-x86_64.zip
+          if-no-files-found: error
+          archive: false

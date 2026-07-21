@@ -1117,13 +1117,14 @@ impl Agent {
                 .append_active(std::slice::from_ref(&user_message));
             self.commit_or_rollback(&checkpoint).await?;
             checkpoint = AgentCheckpoint::capture(self);
+            let user_message = Arc::new(user_message);
             self.emit(AgentEvent::MessageStart {
-                message: user_message.clone(),
+                message: Arc::clone(&user_message),
             });
             self.emit(AgentEvent::MessageEnd {
                 message: user_message.clone(),
             });
-            run_messages.push(user_message);
+            run_messages.push(Arc::unwrap_or_clone(user_message));
         }
         if let Some(batch) = initial_batch {
             self.commit_mailbox_batch(batch, &mut run_messages, &mut checkpoint)
@@ -1215,7 +1216,7 @@ impl Agent {
                             received_model_output |= delta_has_output(&delta);
                             if !message_started {
                                 self.emit(AgentEvent::MessageStart {
-                                    message: Message::assistant(None, Vec::new()),
+                                    message: Arc::new(Message::assistant(None, Vec::new())),
                                 });
                                 message_started = true;
                             }
@@ -1224,7 +1225,7 @@ impl Agent {
                         Some(Ok(ProviderEvent::Done(response))) => {
                             if !message_started {
                                 self.emit(AgentEvent::MessageStart {
-                                    message: Message::assistant(None, Vec::new()),
+                                    message: Arc::new(Message::assistant(None, Vec::new())),
                                 });
                                 message_started = true;
                             }
@@ -1299,7 +1300,13 @@ impl Agent {
             let response = llm_response.response;
             let response_usage = response.usage;
 
-            let tool_calls = response.message.tool_calls.clone();
+            let tool_calls: Vec<Arc<ToolCall>> = response
+                .message
+                .tool_calls
+                .iter()
+                .cloned()
+                .map(Arc::new)
+                .collect();
             // Freeze the capability boundaries that were in force for the
             // provider request and immediately before execution.
             let tool_batch_permissions =
@@ -1312,50 +1319,54 @@ impl Agent {
             // otherwise it is where a hook-created complete tool turn will be
             // appended. A post-hook result count cannot recover this index.
             let journal_start = self.messages.len();
-            let tool_results = if had_tool_calls {
-                // Persist a complete, protocol-valid journal before any tool
-                // can produce an external side effect. Unknown results are
-                // deliberately pessimistic: after a crash we continue from
-                // this turn instead of silently invoking the tool again.
-                self.apply_response_usage(response_usage, &mut run_usage);
-                let mut journal_messages = Vec::with_capacity(tool_calls.len() + 1);
-                journal_messages.push(assistant_message.clone());
-                journal_messages.extend(
-                    tool_calls.iter().map(|call| {
+            let tool_results =
+                if had_tool_calls {
+                    // Persist a complete, protocol-valid journal before any tool
+                    // can produce an external side effect. Unknown results are
+                    // deliberately pessimistic: after a crash we continue from
+                    // this turn instead of silently invoking the tool again.
+                    self.apply_response_usage(response_usage, &mut run_usage);
+                    let mut journal_messages = Vec::with_capacity(tool_calls.len() + 1);
+                    journal_messages.push(assistant_message.clone());
+                    journal_messages.extend(tool_calls.iter().map(|call| {
                         Message::tool_result(call.id.clone(), UNKNOWN_TOOL_RESULT, true)
-                    }),
-                );
-                self.messages.extend(journal_messages.iter().cloned());
-                self.session_history.append_active(&journal_messages);
-                self.commit_or_rollback(&checkpoint).await?;
-                checkpoint = AgentCheckpoint::capture(self);
+                    }));
+                    self.messages.extend(journal_messages.iter().cloned());
+                    self.session_history.append_active(&journal_messages);
+                    self.commit_or_rollback(&checkpoint).await?;
+                    checkpoint = AgentCheckpoint::capture(self);
 
-                let outcome = self
-                    .execute_tool_calls_controlled(tool_calls, &control, tool_batch_permissions)
-                    .await;
-                let results = outcome
-                    .executions
-                    .into_iter()
-                    .map(execution_message)
-                    .collect::<Vec<_>>();
-                self.replace_journal_turn(journal_start, &assistant_message, &results);
-                // Record completed/cancelled/unknown outcomes before hooks.
-                // A failed hook or failed save can now roll back only to the
-                // already-persisted unknown journal, never to a replayable
-                // pre-tool transcript.
-                self.commit_or_rollback(&checkpoint).await?;
-                checkpoint = AgentCheckpoint::capture(self);
+                    let outcome = self
+                        .execute_tool_calls_controlled(tool_calls, &control, tool_batch_permissions)
+                        .await;
+                    let results = outcome
+                        .executions
+                        .into_iter()
+                        .map(execution_message)
+                        .collect::<Vec<_>>();
+                    self.replace_journal_turn(journal_start, &assistant_message, &results);
+                    // Record completed/cancelled/unknown outcomes before hooks.
+                    // A failed hook or failed save can now roll back only to the
+                    // already-persisted unknown journal, never to a replayable
+                    // pre-tool transcript.
+                    self.commit_or_rollback(&checkpoint).await?;
+                    checkpoint = AgentCheckpoint::capture(self);
 
-                if outcome.stopped || control.is_stopped() {
-                    self.context_usage_message_count =
-                        response_usage.map(|_| journal_start.saturating_add(1));
-                    self.emit_committed_turn(turn, &assistant_message, &results, response_usage);
-                    return self.finish_stopped_run(false).await;
-                }
-                results
-            } else {
-                Vec::new()
-            };
+                    if outcome.stopped || control.is_stopped() {
+                        self.context_usage_message_count =
+                            response_usage.map(|_| journal_start.saturating_add(1));
+                        self.emit_committed_turn(
+                            turn,
+                            assistant_message.clone(),
+                            &results,
+                            response_usage,
+                        );
+                        return self.finish_stopped_run(false).await;
+                    }
+                    results
+                } else {
+                    Vec::new()
+                };
             let mut turn_end = TurnEndContext {
                 turn,
                 message: assistant_message,
@@ -1401,7 +1412,7 @@ impl Agent {
 
             self.emit_committed_turn(
                 turn,
-                &turn_end.message,
+                turn_end.message.clone(),
                 &turn_end.tool_results,
                 response_usage,
             );
@@ -1462,13 +1473,14 @@ impl Agent {
         batch.commit();
         *checkpoint = AgentCheckpoint::capture(self);
         for message in messages {
+            let message = Arc::new(message);
             self.emit(AgentEvent::MessageStart {
-                message: message.clone(),
+                message: Arc::clone(&message),
             });
             self.emit(AgentEvent::MessageEnd {
                 message: message.clone(),
             });
-            run_messages.push(message);
+            run_messages.push(Arc::unwrap_or_clone(message));
         }
         Ok(())
     }
@@ -1621,14 +1633,14 @@ impl Agent {
         if let (Some(run_usage), Some(usage)) = (run_usage, plan.usage) {
             *run_usage += usage;
         }
-        let replacement = self.messages[changed_from..].to_vec();
+        let replacement: Arc<[Message]> = self.messages[changed_from..].into();
         let outcome = ContextCompactionOutcome {
             compactor: compactor_name.clone(),
             trigger: trigger.clone(),
             before_message_count,
             after_message_count: self.messages.len(),
             changed_from,
-            replacement: replacement.clone(),
+            replacement: Arc::clone(&replacement),
             summary: plan.summary.clone(),
             usage: plan.usage,
             estimated_context_tokens: plan.estimated_context_tokens,
@@ -1687,7 +1699,7 @@ impl Agent {
         }
         self.synchronize_session_or_end().await?;
         self.emit(AgentEvent::AgentStopped {
-            messages: self.messages.clone(),
+            messages: self.messages.as_slice().into(),
         });
         self.emit_agent_end();
         Ok(AgentRunOutcome::Stopped)
@@ -1724,7 +1736,7 @@ impl Agent {
 
     async fn execute_tool_calls_controlled(
         &self,
-        calls: Vec<ToolCall>,
+        calls: Vec<Arc<ToolCall>>,
         control: &AgentRunControl,
         permissions: ToolBatchPermissions,
     ) -> ToolExecutionOutcome {
@@ -1746,15 +1758,16 @@ impl Agent {
             ToolExecutionMode::Sequential => {
                 let mut results = calls
                     .iter()
-                    .cloned()
-                    .map(Self::cancelled_tool)
+                    .map(|call| Self::cancelled_tool(Arc::clone(call)))
                     .collect::<Vec<_>>();
                 for (index, call) in calls.into_iter().enumerate() {
                     if control.is_stopped() {
                         continue;
                     }
-                    self.emit(AgentEvent::ToolExecutionStart { call: call.clone() });
-                    results[index] = Self::unknown_tool(call.clone());
+                    self.emit(AgentEvent::ToolExecutionStart {
+                        call: Arc::clone(&call),
+                    });
+                    results[index] = Self::unknown_tool(Arc::clone(&call));
                     let context = self.tool_execution_context(
                         &call,
                         control,
@@ -1801,8 +1814,7 @@ impl Agent {
                 let count = calls.len();
                 let mut ordered = calls
                     .iter()
-                    .cloned()
-                    .map(Self::cancelled_tool)
+                    .map(|call| Self::cancelled_tool(Arc::clone(call)))
                     .collect::<Vec<_>>();
                 let mut started = vec![false; count];
                 let mut finished = vec![false; count];
@@ -1817,9 +1829,11 @@ impl Agent {
                         if control.is_stopped() {
                             continue;
                         }
-                        let call = calls[index].clone();
-                        self.emit(AgentEvent::ToolExecutionStart { call: call.clone() });
-                        ordered[index] = Self::unknown_tool(call.clone());
+                        let call = Arc::clone(&calls[index]);
+                        self.emit(AgentEvent::ToolExecutionStart {
+                            call: Arc::clone(&call),
+                        });
+                        ordered[index] = Self::unknown_tool(Arc::clone(&call));
                         started[index] = true;
                         let tool = self.tools.get(&call.name).cloned();
                         let timeout = self.tool_call_timeout;
@@ -1884,14 +1898,14 @@ impl Agent {
         }
     }
 
-    fn cancelled_tool(call: ToolCall) -> ExecutedTool {
+    fn cancelled_tool(call: Arc<ToolCall>) -> ExecutedTool {
         ExecutedTool {
             call,
             output: ToolOutput::error(CANCELLED_TOOL_RESULT),
         }
     }
 
-    fn unknown_tool(call: ToolCall) -> ExecutedTool {
+    fn unknown_tool(call: Arc<ToolCall>) -> ExecutedTool {
         ExecutedTool {
             call,
             output: ToolOutput::error(UNKNOWN_TOOL_RESULT),
@@ -1900,7 +1914,7 @@ impl Agent {
 
     async fn execute_one(
         tool: Option<&Arc<dyn Tool>>,
-        call: ToolCall,
+        call: Arc<ToolCall>,
         timeout: Option<Duration>,
         authorization: ToolInvocationPermissions,
         context: ToolExecutionContext,
@@ -1989,10 +2003,11 @@ impl Agent {
     fn emit_committed_turn(
         &self,
         turn: usize,
-        message: &Message,
+        message: Message,
         tool_results: &[Message],
         usage: Option<TokenUsage>,
     ) {
+        let message = Arc::new(message);
         if let Some(usage) = usage {
             self.emit(AgentEvent::UsageUpdate {
                 usage,
@@ -2000,45 +2015,45 @@ impl Agent {
             });
         }
         self.emit(AgentEvent::MessageEnd {
-            message: message.clone(),
+            message: Arc::clone(&message),
         });
-        for message in tool_results {
+        let tool_results: Arc<[Message]> = tool_results.into();
+        for message in tool_results.iter() {
+            let message = Arc::new(message.clone());
             self.emit(AgentEvent::MessageStart {
-                message: message.clone(),
+                message: Arc::clone(&message),
             });
-            self.emit(AgentEvent::MessageEnd {
-                message: message.clone(),
-            });
+            self.emit(AgentEvent::MessageEnd { message });
         }
         self.emit(AgentEvent::TurnEnd {
             turn,
-            message: message.clone(),
-            tool_results: tool_results.to_vec(),
+            message,
+            tool_results,
         });
     }
 
     fn emit_tool_end(&self, executed: &ExecutedTool) {
         self.emit(AgentEvent::ToolExecutionEnd {
-            call: executed.call.clone(),
+            call: Arc::clone(&executed.call),
             content: executed.output.content.clone(),
             is_error: executed.output.is_error,
-            content_parts: executed.output.content_parts.clone(),
+            content_parts: executed.output.content_parts.as_slice().into(),
             metadata: executed.output.metadata.clone(),
         });
     }
 
     fn tool_execution_context(
         &self,
-        call: &ToolCall,
+        call: &Arc<ToolCall>,
         control: &AgentRunControl,
         visible_tool_results: Arc<HashSet<String>>,
         capability_mode: CapabilityMode,
     ) -> ToolExecutionContext {
         let listeners = self.listeners.clone();
-        let progress_call = call.clone();
+        let progress_call = Arc::clone(call);
         let progress = Arc::new(move |progress: ToolProgress| {
             let event = AgentEvent::ToolExecutionProgress {
-                call: progress_call.clone(),
+                call: Arc::clone(&progress_call),
                 progress,
             };
             for listener in &listeners {
@@ -2079,7 +2094,7 @@ impl Agent {
 
     fn emit_agent_end(&self) {
         self.emit(AgentEvent::AgentEnd {
-            messages: self.messages.clone(),
+            messages: self.messages.as_slice().into(),
         });
     }
 
@@ -2092,7 +2107,7 @@ impl Agent {
 
 #[derive(Clone, Debug)]
 struct ExecutedTool {
-    call: ToolCall,
+    call: Arc<ToolCall>,
     output: ToolOutput,
 }
 
@@ -2136,7 +2151,7 @@ impl ToolBatchPermissions {
 
     fn requires_sequential(
         self,
-        calls: &[ToolCall],
+        calls: &[Arc<ToolCall>],
         tools: &HashMap<String, Arc<dyn Tool>>,
     ) -> bool {
         calls.iter().any(|call| {
@@ -2148,8 +2163,9 @@ impl ToolBatchPermissions {
 }
 
 fn execution_message(execution: ExecutedTool) -> Message {
+    let call_id = execution.call.id.clone();
     let (content, is_error, metadata) = execution.output.into_message_parts();
-    Message::tool_result_content(execution.call.id, content, is_error, metadata)
+    Message::tool_result_content(call_id, content, is_error, metadata)
 }
 
 fn nonzero_timeout(timeout: Duration) -> Duration {
@@ -4214,7 +4230,7 @@ mod tests {
 
         assert_eq!(outcome.compactor, "default");
         assert_eq!(outcome.changed_from, 0);
-        assert_eq!(outcome.replacement, agent.messages());
+        assert_eq!(outcome.replacement.as_ref(), agent.messages());
         assert!(agent.last_usage().is_none());
         assert!(agent.context_usage().is_none());
         assert_eq!(agent.session_history().messages, visible_before);
