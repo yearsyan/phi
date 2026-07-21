@@ -58,6 +58,8 @@ jobs:
             | base64 --decode > "$ANDROID_RELEASE_KEYSTORE_PATH"
           chmod 600 "$ANDROID_RELEASE_KEYSTORE_PATH"
           flutter build apk --release
+          mv build/app/outputs/flutter-apk/app-release.apk \
+            build/app/outputs/flutter-apk/phi-client-android-release.apk
 
       - name: Verify APK signature
         working-directory: flutter
@@ -68,12 +70,12 @@ jobs:
           "$ANDROID_SDK_ROOT/build-tools/$build_tools_version/apksigner" verify \
             --verbose \
             --print-certs \
-            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/phi-client-android-release.apk
 
       - name: Upload release APK
         uses: actions/upload-artifact@v7
         with:
           name: phi-client-android-release.apk
-          path: flutter/build/app/outputs/flutter-apk/app-release.apk
+          path: flutter/build/app/outputs/flutter-apk/phi-client-android-release.apk
           if-no-files-found: error
           archive: false
