@@ -84,6 +84,56 @@ function snapshot(overrides: Partial<SessionDto> = {}): SessionDto {
 }
 
 describe('sessionReducer', () => {
+  it('restores and incrementally resolves pending tool permissions', () => {
+    const request = {
+      permission_id: 'permission-1',
+      call: {
+        id: 'call-1',
+        name: 'bash',
+        arguments: { command: 'ls' },
+      },
+      effect: 'external_side_effect' as const,
+      capability_mode: 'workspace_edit' as const,
+      suggestions: [{ tool_name: 'bash', pattern: 'ls *' }],
+    };
+    let state = sessionReducer(initialSessionState, {
+      type: 'snapshot',
+      session: snapshot({
+        pending_tool_permissions: [request],
+        last_sequence: 4,
+      }),
+    });
+    expect(state.pendingToolPermissions).toEqual([request]);
+
+    state = applyEvent(state, 5, {
+      type: 'tool_permission_resolved',
+      permission_id: 'permission-1',
+      allowed: true,
+    });
+    expect(state.pendingToolPermissions).toEqual([]);
+
+    state = applyEvent(state, 6, {
+      type: 'tool_permission_requested',
+      request: { ...request, permission_id: 'permission-2' },
+    });
+    expect(state.pendingToolPermissions).toHaveLength(1);
+    state = applyEvent(state, 7, {
+      type: 'tool_permission_cancelled',
+      permission_id: 'permission-2',
+    });
+    expect(state.pendingToolPermissions).toEqual([]);
+
+    state = applyEvent(state, 8, {
+      type: 'tool_permission_requested',
+      request: { ...request, permission_id: 'permission-3' },
+    });
+    state = applyEvent(state, 9, {
+      type: 'actor_crashed',
+      message: 'provider panicked',
+    });
+    expect(state.pendingToolPermissions).toEqual([]);
+  });
+
   it('tracks generated session titles from snapshots and ordered events', () => {
     let state = sessionReducer(initialSessionState, {
       type: 'snapshot',

@@ -49,6 +49,7 @@ function controls(
     sendPrompt: vi.fn(() => true),
     stop: vi.fn(),
     answerAsk: vi.fn(() => true),
+    decideToolPermission: vi.fn(() => true),
     setModel: vi.fn(),
     setReasoningEffort: vi.fn(),
     setCapabilityMode: vi.fn(),

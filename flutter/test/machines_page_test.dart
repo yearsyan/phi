@@ -56,7 +56,7 @@ void main() {
     await tester.enterText(find.byType(TextField).at(0), 'Workstation');
     await tester.enterText(find.byType(TextField).at(1), '192.0.2.10:8787');
     await tester.enterText(find.byType(TextField).at(2), 'fixture-key-new');
-    await tester.tap(find.widgetWithText(FilledButton, '保存'));
+    await tester.tap(find.byIcon(Icons.save_outlined));
     await tester.pumpAndSettle();
 
     expect(app.settings.machines, hasLength(1));
@@ -73,7 +73,7 @@ void main() {
 
     await tester.tap(find.text('添加机器'));
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(FilledButton, '保存'));
+    await tester.tap(find.byIcon(Icons.save_outlined));
     await tester.pump();
 
     expect(find.text('地址和密钥必填。'), findsOneWidget);

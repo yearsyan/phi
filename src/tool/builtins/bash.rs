@@ -25,6 +25,10 @@ use super::{
 };
 use crate::{
     error::ToolError,
+    permission::{
+        MAX_TOOL_PERMISSION_PATTERN_BYTES, MAX_TOOL_PERMISSION_TARGET_BYTES,
+        escape_permission_pattern, matches_permission_pattern,
+    },
     tool::{Tool, ToolConcurrency, ToolEffect, ToolExecutionContext, ToolOutput, ToolProgress},
     types::ToolDefinition,
 };
@@ -313,6 +317,44 @@ impl Tool for BashTool {
         ToolEffect::ExternalSideEffect
     }
 
+    fn permission_target(&self, arguments: &serde_json::Value) -> String {
+        arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| arguments.to_string(), str::to_owned)
+    }
+
+    fn matches_permission_pattern(&self, arguments: &serde_json::Value, pattern: &str) -> bool {
+        let command = self.permission_target(arguments);
+        if pattern.len() > MAX_TOOL_PERMISSION_PATTERN_BYTES
+            || command.len() > MAX_TOOL_PERMISSION_TARGET_BYTES
+        {
+            return false;
+        }
+        if let Some(prefix) = pattern.strip_suffix(":*") {
+            return bash_command_allows_reusable_rule(&command)
+                && (command == prefix || command.starts_with(&format!("{prefix} ")));
+        }
+        if has_unescaped_wildcard(pattern) && !bash_command_allows_reusable_rule(&command) {
+            return false;
+        }
+        matches_permission_pattern(pattern, &command)
+    }
+
+    fn permission_rule_suggestions(&self, arguments: &serde_json::Value) -> Vec<String> {
+        let command = self.permission_target(arguments);
+        let exact = escape_permission_pattern(&command);
+        let Some(prefix) = reusable_bash_command_prefix(&command) else {
+            return vec![exact];
+        };
+        let reusable = format!("{prefix} *");
+        if reusable == exact {
+            vec![exact]
+        } else {
+            vec![reusable, exact]
+        }
+    }
+
     fn concurrency(&self, arguments: &serde_json::Value) -> ToolConcurrency {
         if classify_bash_arguments_concurrency(arguments) {
             ToolConcurrency::Safe
@@ -409,6 +451,134 @@ impl Tool for BashTool {
         );
         result
     }
+}
+
+fn has_unescaped_wildcard(pattern: &str) -> bool {
+    let mut backslashes = 0_usize;
+    for character in pattern.chars() {
+        if character == '*' && backslashes.is_multiple_of(2) {
+            return true;
+        }
+        if character == '\\' {
+            backslashes = backslashes.saturating_add(1);
+        } else {
+            backslashes = 0;
+        }
+    }
+    false
+}
+
+/// Reusable Bash rules deliberately fail closed for shell composition. Exact
+/// rules can still authorize these commands after the complete string is shown
+/// to the user.
+fn bash_command_allows_reusable_rule(command: &str) -> bool {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let characters = command.chars().collect::<Vec<_>>();
+    let mut quote = Quote::None;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match character {
+                '"' => quote = Quote::None,
+                '\\' => index = index.saturating_add(1),
+                '`' => return false,
+                '$' if characters.get(index + 1) == Some(&'(') => return false,
+                _ => {}
+            },
+            Quote::None => match character {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => index = index.saturating_add(1),
+                '\n' | '\r' | '&' | '|' | ';' | '<' | '>' | '`' => return false,
+                '$' if characters.get(index + 1) == Some(&'(') => return false,
+                _ => {}
+            },
+        }
+        index = index.saturating_add(1);
+    }
+    quote == Quote::None
+}
+
+fn reusable_bash_command_prefix(command: &str) -> Option<String> {
+    if !bash_command_allows_reusable_rule(command) {
+        return None;
+    }
+    let tokens = command.split_ascii_whitespace().collect::<Vec<_>>();
+    let executable = *tokens.first()?;
+    if !executable
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    if matches!(
+        executable,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "ksh"
+            | "dash"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "env"
+            | "xargs"
+            | "nice"
+            | "stdbuf"
+            | "nohup"
+            | "timeout"
+            | "time"
+            | "sudo"
+            | "doas"
+            | "pkexec"
+            | "command"
+            | "builtin"
+            | "eval"
+            | "exec"
+            | "source"
+            | "."
+            | "python"
+            | "python3"
+            | "node"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+            | "deno"
+            | "osascript"
+    ) {
+        return None;
+    }
+
+    // Mirror Claude Code's conservative automatic suggestion: only a stable,
+    // lowercase second token is treated as a reusable subcommand. Flags,
+    // paths, URLs, numbers, and bare executables fall back to an exact rule.
+    let subcommand = *tokens.get(1)?;
+    if subcommand
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && subcommand.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+    {
+        return Some(format!("{executable} {subcommand}"));
+    }
+    None
 }
 
 fn task_description(description: Option<&str>, command: &str) -> String {
@@ -945,6 +1115,61 @@ mod tests {
     use super::*;
     use crate::tool::builtins::bash_task::{BashTaskOutputTool, BashTaskStopTool};
     use crate::types::Content;
+
+    #[test]
+    fn bash_permission_suggestions_prefer_safe_reusable_prefixes() {
+        let tool = BashTool::new(".");
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "ls -la" })),
+            ["ls -la"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "git status --short" })),
+            ["git status *", "git status --short"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "ls && rm -rf build" })),
+            ["ls && rm -rf build"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "bash -c 'echo ok'" })),
+            ["bash -c 'echo ok'"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "python3 script.py" })),
+            ["python3 script.py"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "rm -rf build" })),
+            ["rm -rf build"]
+        );
+        assert_eq!(
+            tool.permission_rule_suggestions(&json!({ "command": "git -C . status" })),
+            ["git -C . status"]
+        );
+    }
+
+    #[test]
+    fn reusable_bash_rules_never_cover_compound_or_redirected_commands() {
+        let tool = BashTool::new(".");
+        assert!(tool.matches_permission_pattern(&json!({ "command": "ls -la" }), "ls *"));
+        assert!(tool.matches_permission_pattern(&json!({ "command": "ls" }), "ls:*"));
+        assert!(
+            !tool.matches_permission_pattern(&json!({ "command": "ls && rm -rf build" }), "ls *")
+        );
+        assert!(
+            !tool.matches_permission_pattern(&json!({ "command": "ls > listing.txt" }), "ls:*")
+        );
+        assert!(!tool.matches_permission_pattern(&json!({ "command": "ls $(dangerous)" }), "ls *"));
+        assert!(tool.matches_permission_pattern(
+            &json!({ "command": "ls && rm -rf build" }),
+            "ls && rm -rf build"
+        ));
+        assert!(!tool.matches_permission_pattern(
+            &json!({ "command": "x".repeat(MAX_TOOL_PERMISSION_TARGET_BYTES + 1) }),
+            "x:*"
+        ));
+    }
 
     fn task_id(output: &ToolOutput) -> String {
         output.metadata.as_ref().unwrap()["task_id"]

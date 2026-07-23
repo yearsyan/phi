@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::stream;
 use phi::{
-    Agent, AssistantMessage, InMemorySessionStorage, LlmProvider, ProviderEvent,
-    ProviderEventStream, ProviderRequest, ProviderResponse, SkillCatalog, Workspace,
+    Agent, AssistantMessage, CapabilityMode, InMemorySessionStorage, LlmProvider, ProviderEvent,
+    ProviderEventStream, ProviderRequest, ProviderResponse, SkillCatalog, Tool, ToolDefinition,
+    ToolEffect, ToolError, ToolOutput, Workspace,
 };
 use phi_daemon::{
     api::AppState,
@@ -179,6 +180,7 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         Arc::new(InMemorySessionStorage::new()),
         Arc::new(ImmediateFactory {
             provider_calls: Arc::clone(&provider_calls),
+            install_permission_tool: true,
         }),
     ));
     let store = Arc::new(MemoryScheduledTaskStore::new());
@@ -190,7 +192,7 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         workspace: Workspace::new(&workspace.0),
         profile_id: "default".to_owned(),
         agent_profile_id: "default".to_owned(),
-        capability_mode: None,
+        capability_mode: Some(CapabilityMode::WorkspaceEdit),
         schedule: ScheduledTaskSchedule::Interval {
             every: 1,
             unit: ScheduledIntervalUnit::Minutes,
@@ -304,6 +306,7 @@ async fn startup_marks_an_uncertain_persisted_run_interrupted() {
         Arc::new(InMemorySessionStorage::new()),
         Arc::new(ImmediateFactory {
             provider_calls: Arc::new(AtomicUsize::new(0)),
+            install_permission_tool: false,
         }),
     ));
     let store = Arc::new(MemoryScheduledTaskStore::new());
@@ -403,11 +406,21 @@ async fn spawn_server(
 #[derive(Clone)]
 struct ImmediateProvider {
     calls: Arc<AtomicUsize>,
+    expect_permission_tool_hidden: bool,
 }
 
 impl LlmProvider for ImmediateProvider {
-    fn stream(&self, _request: ProviderRequest) -> ProviderEventStream {
+    fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.expect_permission_tool_hidden {
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != "scheduled_external"),
+                "noninteractive scheduled tasks must not expose tools that require approval"
+            );
+        }
         Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
             message: AssistantMessage::text("scheduled result"),
             usage: None,
@@ -418,6 +431,29 @@ impl LlmProvider for ImmediateProvider {
 #[derive(Clone)]
 struct ImmediateFactory {
     provider_calls: Arc<AtomicUsize>,
+    install_permission_tool: bool,
+}
+
+#[derive(Clone)]
+struct ScheduledExternalTool;
+
+#[async_trait]
+impl Tool for ScheduledExternalTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "scheduled_external",
+            "must remain hidden from a noninteractive scheduled task",
+            json!({ "type": "object" }),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ExternalSideEffect
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<ToolOutput, ToolError> {
+        panic!("the hidden scheduled external tool must never execute")
+    }
 }
 
 #[derive(Clone)]
@@ -489,13 +525,21 @@ impl AgentFactory for ImmediateFactory {
             .model
             .clone()
             .unwrap_or_else(|| "test-model".to_owned());
-        let agent = Agent::builder(ImmediateProvider {
+        let capability_mode = request
+            .capability_mode
+            .unwrap_or(agent_profile.definition.initial_capability_mode);
+        let mut builder = Agent::builder(ImmediateProvider {
             calls: Arc::clone(&self.provider_calls),
+            expect_permission_tool_hidden: self.install_permission_tool,
         })
         .workspace(workspace)
         .model(model.clone())
-        .system_prompt(agent_profile.compiled_system_prompt.clone())
-        .build();
+        .capability_mode(capability_mode)
+        .system_prompt(agent_profile.compiled_system_prompt.clone());
+        if self.install_permission_tool {
+            builder = builder.tool(ScheduledExternalTool);
+        }
+        let agent = builder.build();
         Ok(BuiltAgent {
             agent,
             skills: SkillCatalog::default(),

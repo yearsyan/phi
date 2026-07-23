@@ -773,6 +773,28 @@ async fn handle_command(
             }
             Err(error) => reject_handle(sender, request_id, error).await,
         },
+        ClientCommand::DecideToolPermission {
+            permission_id,
+            decision,
+            ..
+        } => match handle
+            .decide_tool_permission(permission_id, decision.into_decision())
+            .await
+        {
+            Ok(()) => {
+                send_json(
+                    sender,
+                    &ServerMessage::CommandAccepted {
+                        request_id,
+                        command: "decide_tool_permission",
+                        run_id: None,
+                        queue_position: None,
+                    },
+                )
+                .await
+            }
+            Err(error) => reject_handle(sender, request_id, error).await,
+        },
         ClientCommand::Ping { .. } => send_json(sender, &ServerMessage::Pong { request_id }).await,
     }
 }
@@ -813,6 +835,10 @@ async fn reject_handle(
         AgentHandleError::InvalidCommand { .. } => "invalid_command",
         AgentHandleError::AskUserNotPending { .. } => "askuser_not_pending",
         AgentHandleError::InvalidAskUserAnswer { .. } => "invalid_askuser_answer",
+        AgentHandleError::ToolPermissionNotPending { .. } => "tool_permission_not_pending",
+        AgentHandleError::InvalidToolPermissionDecision { .. } => {
+            "invalid_tool_permission_decision"
+        }
         AgentHandleError::ActorStopped { .. } | AgentHandleError::ResponseDropped { .. } => {
             "actor_stopped"
         }

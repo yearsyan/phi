@@ -26,7 +26,7 @@ jobs:
           flutter-version: 3.44.6
           cache: true
 
-      - name: Enable Git long paths
+      - name: Enable long Git paths
         run: git config --global core.longpaths true
 
       - name: Install Flutter dependencies

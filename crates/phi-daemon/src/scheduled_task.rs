@@ -538,7 +538,7 @@ impl ScheduledTaskManager {
     ) -> TaskCompletion {
         let prepared = match self
             .service
-            .prepare_session_configured_in_workspace(
+            .prepare_noninteractive_session_configured_in_workspace(
                 task.profile_id.clone(),
                 task.agent_profile_id.clone(),
                 task.capability_mode,

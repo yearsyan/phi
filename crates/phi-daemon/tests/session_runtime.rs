@@ -105,6 +105,9 @@ enum ProviderScript {
         started: Arc<Notify>,
     },
     AskUser,
+    Permission {
+        executions: Arc<AtomicUsize>,
+    },
     ToolCall,
     PanickingToolCall,
     BackgroundNotification {
@@ -222,6 +225,35 @@ impl LlmProvider for ScriptedProvider {
                         .text_content()
                         .is_some_and(|content| content.contains("My custom layout"))
                 );
+                immediate_stream(call)
+            }
+            ProviderScript::Permission { .. } if call == 0 => {
+                assert!(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "permission_tool"),
+                    "the daemon approver must expose tools above WorkspaceEdit"
+                );
+                Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "permission-call-1",
+                        "permission_tool",
+                        json!({ "scope": "repo" }),
+                    )]),
+                    usage: None,
+                }))]))
+            }
+            ProviderScript::Permission { .. } => {
+                let result = request
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.role == Role::Tool
+                            && message.tool_call_id.as_deref() == Some("permission-call-1")
+                    })
+                    .expect("the approved tool result must return to the provider");
+                assert!(!result.tool_result_is_error);
                 immediate_stream(call)
             }
             ProviderScript::ToolCall if call == 0 => {
@@ -481,6 +513,27 @@ impl Tool for DelayedNotificationTool {
 #[derive(Clone)]
 struct PanickingTool;
 
+#[derive(Clone)]
+struct PermissionTool {
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for PermissionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "permission_tool",
+            "Records an external side effect after approval",
+            json!({ "type": "object" }),
+        )
+    }
+
+    async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::success("approved side effect"))
+    }
+}
+
 #[async_trait]
 impl Tool for PanickingTool {
     fn definition(&self) -> ToolDefinition {
@@ -638,6 +691,11 @@ impl AgentFactory for TestFactory {
         }
         if matches!(&self.script, ProviderScript::PanickingToolCall) {
             builder = builder.tool(PanickingTool);
+        }
+        if let ProviderScript::Permission { executions } = &self.script {
+            builder = builder.tool(PermissionTool {
+                executions: Arc::clone(executions),
+            });
         }
         let mut agent = builder.build();
         if let ProviderScript::PauseAtAgentEnd { entered, release } = &self.script {
@@ -2591,6 +2649,117 @@ async fn askuser_round_trips_custom_answers_and_survives_websocket_reconnect() {
 }
 
 #[tokio::test]
+async fn tool_permission_round_trips_a_remembered_rule_and_survives_websocket_reconnect() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let storage = InMemorySessionStorage::new();
+    let service = Arc::new(test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(storage.clone()),
+        Arc::new(TestFactory::new(ProviderScript::Permission {
+            executions: Arc::clone(&executions),
+        })),
+    ));
+    let prepared = service
+        .prepare_session_configured(PROFILE, "default", Some(CapabilityMode::WorkspaceEdit))
+        .await
+        .unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let path = format!("/v1/ws/attach/{}", handle.session_id());
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+    let mut client_a = RawWebSocket::connect(address, &path).await;
+    assert_eq!(client_a.receive_json().await["type"], "snapshot");
+
+    client_a
+        .send_json(json!({
+            "type": "prompt",
+            "request_id": "permission-prompt",
+            "content": { "type": "text", "value": "Run the external tool" }
+        }))
+        .await;
+    let accepted = client_a.receive_json().await;
+    assert_eq!(accepted["type"], "command_accepted");
+
+    let requested = receive_wire_event(&mut client_a, "tool_permission_requested").await;
+    let request = &requested["event"]["request"];
+    let permission_id = request["permission_id"].as_str().unwrap().to_owned();
+    assert_eq!(request["call"]["name"], "permission_tool");
+    assert_eq!(request["effect"], "external_side_effect");
+    assert_eq!(request["capability_mode"], "workspace_edit");
+    assert_eq!(request["suggestions"].as_array().unwrap().len(), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let durable = storage
+        .load(&handle.session_id().to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable.messages.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("permission-call-1")
+            && message.tool_result_is_error
+            && message
+                .text_content()
+                .is_some_and(|text| text.contains("outcome is unknown"))
+    }));
+
+    let mut client_b = RawWebSocket::connect(address, &path).await;
+    let reconnected = client_b.receive_json().await;
+    assert_eq!(
+        reconnected["session"]["pending_tool_permissions"][0],
+        *request
+    );
+
+    client_b
+        .send_json(json!({
+            "type": "decide_tool_permission",
+            "request_id": "invalid-permission-rule",
+            "permission_id": permission_id,
+            "decision": {
+                "type": "allow_for_session",
+                "rule": { "tool_name": "permission_tool" }
+            }
+        }))
+        .await;
+    let rejected = client_b.receive_json().await;
+    assert_eq!(rejected["type"], "command_rejected");
+    assert_eq!(rejected["code"], "invalid_tool_permission_decision");
+    assert_eq!(handle.snapshot().pending_tool_permissions.len(), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let rule = request["suggestions"][0].clone();
+    client_b
+        .send_json(json!({
+            "type": "decide_tool_permission",
+            "request_id": "remember-permission",
+            "permission_id": permission_id,
+            "decision": { "type": "allow_for_session", "rule": rule }
+        }))
+        .await;
+    let accepted = client_b.receive_json().await;
+    assert_eq!(accepted["type"], "command_accepted");
+    assert_eq!(accepted["command"], "decide_tool_permission");
+    let resolved = receive_wire_event(&mut client_b, "tool_permission_resolved").await;
+    assert_eq!(resolved["event"]["permission_id"], permission_id);
+    assert_eq!(resolved["event"]["allowed"], true);
+    receive_wire_event(&mut client_b, "run_completed").await;
+
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert!(handle.snapshot().pending_tool_permissions.is_empty());
+    let durable = storage
+        .load(&handle.session_id().to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.permission_rules.len(), 1);
+    assert_eq!(durable.permission_rules[0].tool_name, "permission_tool");
+
+    drop(client_a);
+    drop(client_b);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
 async fn stopping_a_run_cancels_its_pending_askuser_request() {
     let service = test_service(
         AgentRegistry::new(),
@@ -2653,6 +2822,87 @@ async fn stopping_a_run_cancels_its_pending_askuser_request() {
     assert_eq!(cancellation_count, 1);
     assert!(cancellation_sequence.unwrap() < stopped.sequence);
     assert!(handle.snapshot().pending_asks.is_empty());
+
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn stopping_a_run_cancels_its_pending_tool_permission_request() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let service = test_service(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        Arc::new(TestFactory::new(ProviderScript::Permission {
+            executions: Arc::clone(&executions),
+        })),
+    );
+    let prepared = service
+        .prepare_session_configured(PROFILE, "default", Some(CapabilityMode::WorkspaceEdit))
+        .await
+        .unwrap();
+    let handle = service.activate_session(&prepared).await.unwrap();
+    let mut events = handle.subscribe();
+    let run = handle
+        .enqueue_prompt(Content::text("request permission, then stop"))
+        .await
+        .unwrap();
+    let requested = wait_for_event(&mut events, |event| {
+        matches!(event.kind, RuntimeEventKind::ToolPermissionRequested { .. })
+    })
+    .await;
+    let permission_id = match requested.kind {
+        RuntimeEventKind::ToolPermissionRequested { request } => request.permission_id,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        handle.snapshot().pending_tool_permissions[0].permission_id,
+        permission_id
+    );
+
+    handle.stop(run.run_id).unwrap();
+    let error = handle
+        .decide_tool_permission(permission_id, phi::ToolPermissionDecision::AllowOnce)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentHandleError::ToolPermissionNotPending {
+            permission_id: current,
+            ..
+        } if current == permission_id
+    ));
+
+    let mut cancellation_count = 0;
+    let mut cancellation_sequence = None;
+    let stopped = loop {
+        let event = events.recv().await.expect("runtime event channel closed");
+        match event.kind {
+            RuntimeEventKind::ToolPermissionCancelled {
+                permission_id: current,
+            } if current == permission_id => {
+                cancellation_count += 1;
+                cancellation_sequence.get_or_insert(event.sequence);
+            }
+            RuntimeEventKind::RunStopped { run_id } if run_id == run.run_id => break event,
+            _ => {}
+        }
+    };
+    tokio::task::yield_now().await;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event.kind,
+            RuntimeEventKind::ToolPermissionCancelled {
+                permission_id: current,
+            } if current == permission_id
+        ) {
+            cancellation_count += 1;
+        }
+    }
+    assert_eq!(cancellation_count, 1);
+    assert!(cancellation_sequence.unwrap() < stopped.sequence);
+    assert!(handle.snapshot().pending_tool_permissions.is_empty());
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
 
     assert!(service.shutdown().await.is_empty());
 }

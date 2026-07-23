@@ -15,7 +15,8 @@ use phi::{
     ContextUsage, DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE, Message, MessageVisibility,
     ReasoningEffort, Role, SessionSnapshot, SessionStorage, SkillCatalog, SkillDiagnostic,
     SkillInvocation, SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotificationKind,
-    SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage, Workspace,
+    SubagentRuntime, SubagentSnapshot, SubagentState, TokenUsage, ToolPermissionDecision,
+    Workspace,
 };
 use thiserror::Error;
 use tokio::sync::{
@@ -23,11 +24,14 @@ use tokio::sync::{
 };
 
 use super::{
-    AskUserId, PinnedAgentProfile, RunId, SessionId,
+    AskUserId, PinnedAgentProfile, RunId, SessionId, ToolPermissionId,
     ask_user::{
         AskUserAnswer, AskUserRequest, AskUserTool, PendingAskUserRequest, validate_answers,
     },
     compile_agent_profile, default_agent_profile,
+    tool_permission::{
+        DaemonToolPermissionApprover, PendingToolPermissionRequest, ToolPermissionPrompt,
+    },
 };
 use crate::store::{ControlStore, SessionRecord};
 
@@ -107,6 +111,7 @@ pub struct AgentView {
     pub context_usage: Option<ContextUsage>,
     pub cumulative_usage: TokenUsage,
     pub pending_asks: Vec<AskUserRequest>,
+    pub pending_tool_permissions: Vec<ToolPermissionPrompt>,
     pub subagents: Vec<SubagentSummary>,
     pub last_event_sequence: u64,
 }
@@ -191,6 +196,16 @@ pub enum RuntimeEventKind {
     },
     AskUserCancelled {
         ask_id: AskUserId,
+    },
+    ToolPermissionRequested {
+        request: ToolPermissionPrompt,
+    },
+    ToolPermissionResolved {
+        permission_id: ToolPermissionId,
+        allowed: bool,
+    },
+    ToolPermissionCancelled {
+        permission_id: ToolPermissionId,
     },
     OperationFailed {
         operation: String,
@@ -290,7 +305,7 @@ impl AgentHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_configured_with_skills_and_subagents(
         session_id: SessionId,
-        mut agent: Agent,
+        agent: Agent,
         profile_id: impl Into<String>,
         agent_profile: PinnedAgentProfile,
         model: impl Into<String>,
@@ -298,9 +313,41 @@ impl AgentHandle {
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
     ) -> Self {
+        Self::spawn_configured_with_skills_subagents_and_tool_permissions(
+            session_id,
+            agent,
+            profile_id,
+            agent_profile,
+            model,
+            reasoning_effort,
+            skills,
+            subagents,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_configured_with_skills_subagents_and_tool_permissions(
+        session_id: SessionId,
+        mut agent: Agent,
+        profile_id: impl Into<String>,
+        agent_profile: PinnedAgentProfile,
+        model: impl Into<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+        skills: SkillCatalog,
+        subagents: Option<SubagentRuntime>,
+        interactive_tool_permissions: bool,
+    ) -> Self {
         let stored_agent_profile = agent_profile.clone();
         let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
         agent.add_mandatory_tool(ask_user_tool);
+        let tool_permission_requests = if interactive_tool_permissions {
+            let (approver, requests) = DaemonToolPermissionApprover::channel(COMMAND_CAPACITY);
+            agent.set_tool_permission_approver(approver);
+            Some(requests)
+        } else {
+            None
+        };
         let (parent_mailbox, mailbox) = AgentMailbox::bounded(COMMAND_CAPACITY);
         agent.set_mailbox(mailbox);
         let parent_mailbox = Some(parent_mailbox);
@@ -339,6 +386,7 @@ impl AgentHandle {
             context_usage: agent.context_usage(),
             cumulative_usage: agent.cumulative_usage(),
             pending_asks: Vec::new(),
+            pending_tool_permissions: Vec::new(),
             subagents: subagents
                 .as_ref()
                 .map(SubagentRuntime::snapshots)
@@ -384,6 +432,7 @@ impl AgentHandle {
                 ActorRuntime {
                     commands: command_receiver,
                     ask_user_requests,
+                    tool_permission_requests,
                     hub: actor_hub,
                     active_run: actor_active_run,
                     active_compaction: actor_active_compaction,
@@ -776,6 +825,23 @@ impl AgentHandle {
         response.await.map_err(|_| self.response_error())?
     }
 
+    pub async fn decide_tool_permission(
+        &self,
+        permission_id: ToolPermissionId,
+        decision: ToolPermissionDecision,
+    ) -> Result<(), AgentHandleError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(AgentCommand::DecideToolPermission {
+                permission_id,
+                decision,
+                reply,
+            })
+            .await
+            .map_err(|_| self.stopped_error())?;
+        response.await.map_err(|_| self.response_error())?
+    }
+
     pub fn stop(&self, run_id: RunId) -> Result<(), AgentHandleError> {
         let mut active = self.active_run.lock().expect("active run lock poisoned");
         let status = self.hub.current_status();
@@ -947,6 +1013,11 @@ enum AgentCommand {
         answers: Vec<AskUserAnswer>,
         reply: oneshot::Sender<Result<(), AgentHandleError>>,
     },
+    DecideToolPermission {
+        permission_id: ToolPermissionId,
+        decision: ToolPermissionDecision,
+        reply: oneshot::Sender<Result<(), AgentHandleError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -955,6 +1026,7 @@ enum AgentCommand {
 struct ActorRuntime {
     commands: mpsc::Receiver<AgentCommand>,
     ask_user_requests: mpsc::UnboundedReceiver<PendingAskUserRequest>,
+    tool_permission_requests: Option<mpsc::Receiver<PendingToolPermissionRequest>>,
     hub: Arc<EventHub>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
     active_compaction: Arc<Mutex<Option<AgentRunControl>>>,
@@ -968,6 +1040,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
     let ActorRuntime {
         mut commands,
         mut ask_user_requests,
+        mut tool_permission_requests,
         hub,
         active_run,
         active_compaction,
@@ -1122,6 +1195,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 }
 
                 let mut pending_asks = HashMap::new();
+                let mut pending_tool_permissions = HashMap::new();
                 let mailbox_driven = content.is_none();
                 let mut run = Box::pin(async {
                     match content {
@@ -1151,6 +1225,23 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                 break run.as_mut().await;
                             };
                             register_pending_ask(&mut pending_asks, &hub, request);
+                        }
+                        request = receive_tool_permission_request(&mut tool_permission_requests) => {
+                            let Some(request) = request else {
+                                closing = true;
+                                control.stop();
+                                hub.operation_failed(
+                                    "tool_permission",
+                                    "tool permission request channel closed unexpectedly".to_owned(),
+                                );
+                                hub.status(AgentStatus::Closing);
+                                break run.as_mut().await;
+                            };
+                            register_pending_tool_permission(
+                                &mut pending_tool_permissions,
+                                &hub,
+                                request,
+                            );
                         }
                         // Delegation is published synchronously by the core
                         // runtime. If it and the parent run become ready in
@@ -1259,6 +1350,39 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                                     drop(active);
                                     let _ = reply.send(result);
                                 }
+                                AgentCommand::DecideToolPermission {
+                                    permission_id,
+                                    decision,
+                                    reply,
+                                } => {
+                                    let active = active_run.lock().expect("active run lock poisoned");
+                                    let stopping = active.as_ref().is_none_or(|active| {
+                                        active.stop_requested || active.control.is_stopped()
+                                    }) || run_is_stopping(&control, &hub);
+                                    let result = if stopping {
+                                        cancel_pending_tool_permission(
+                                            &mut pending_tool_permissions,
+                                            &hub,
+                                            permission_id,
+                                            ToolPermissionDecision::Deny {
+                                                message: "tool permission request was cancelled because the run is stopping".to_owned(),
+                                            },
+                                        );
+                                        Err(AgentHandleError::ToolPermissionNotPending {
+                                            session_id: hub.session_id,
+                                            permission_id,
+                                        })
+                                    } else {
+                                        resolve_pending_tool_permission(
+                                            &mut pending_tool_permissions,
+                                            &hub,
+                                            permission_id,
+                                            decision,
+                                        )
+                                    };
+                                    drop(active);
+                                    let _ = reply.send(result);
+                                }
                                 command => backlog.push_back(command),
                             }
                         }
@@ -1287,6 +1411,15 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 drain_unregistered_asks(
                     &mut ask_user_requests,
                     "askuser request was cancelled because the run ended",
+                );
+                cancel_pending_tool_permissions(
+                    &mut pending_tool_permissions,
+                    &hub,
+                    "tool permission request was cancelled because the run ended",
+                );
+                drain_unregistered_tool_permissions(
+                    tool_permission_requests.as_mut(),
+                    "tool permission request was cancelled because the run ended",
                 );
                 {
                     let mut active = active_run.lock().expect("active run lock poisoned");
@@ -1419,6 +1552,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         last_usage: agent.last_usage(),
                         cumulative_usage: agent.cumulative_usage(),
                         capability_mode: agent.capability_mode(),
+                        permission_rules: agent.tool_permission_rules().to_vec(),
                     })
                 } else {
                     Err(AgentHandleError::Busy {
@@ -1457,6 +1591,16 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     ask_id,
                 }));
             }
+            AgentCommand::DecideToolPermission {
+                permission_id,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err(AgentHandleError::ToolPermissionNotPending {
+                    session_id: hub.session_id,
+                    permission_id,
+                }));
+            }
             AgentCommand::Shutdown { reply } => {
                 shutdown_reply = Some(reply);
                 closing = true;
@@ -1477,6 +1621,10 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
     drain_unregistered_asks(
         &mut ask_user_requests,
         "askuser request was cancelled because the agent is closing",
+    );
+    drain_unregistered_tool_permissions(
+        tool_permission_requests.as_mut(),
+        "tool permission request was cancelled because the agent is closing",
     );
     if let Some(subagents) = subagents {
         subagents.shutdown("parent agent actor stopped").await;
@@ -1500,6 +1648,15 @@ async fn receive_subagent_event(
 async fn receive_parent_mailbox_wake(mailbox: Option<&AgentMailboxSender>) -> bool {
     match mailbox {
         Some(mailbox) => mailbox.wait_for_wake().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn receive_tool_permission_request(
+    receiver: &mut Option<mpsc::Receiver<PendingToolPermissionRequest>>,
+) -> Option<PendingToolPermissionRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -1758,6 +1915,121 @@ fn drain_unregistered_asks(
     }
 }
 
+fn register_pending_tool_permission(
+    pending_permissions: &mut HashMap<ToolPermissionId, PendingToolPermissionRequest>,
+    hub: &EventHub,
+    request: PendingToolPermissionRequest,
+) {
+    let permission_id = request.prompt.permission_id;
+    if let Some(previous) = pending_permissions.insert(permission_id, request) {
+        let _ = previous.reply.send(ToolPermissionDecision::Deny {
+            message: "tool permission request ID was reused".to_owned(),
+        });
+        hub.tool_permission_cancelled(permission_id);
+    }
+    let prompt = pending_permissions
+        .get(&permission_id)
+        .expect("the tool permission request was just inserted")
+        .prompt
+        .clone();
+    hub.tool_permission_requested(prompt);
+}
+
+fn resolve_pending_tool_permission(
+    pending_permissions: &mut HashMap<ToolPermissionId, PendingToolPermissionRequest>,
+    hub: &EventHub,
+    permission_id: ToolPermissionId,
+    decision: ToolPermissionDecision,
+) -> Result<(), AgentHandleError> {
+    const MAX_DENIAL_MESSAGE_BYTES: usize = 4_096;
+
+    let Some(pending) = pending_permissions.get(&permission_id) else {
+        return Err(AgentHandleError::ToolPermissionNotPending {
+            session_id: hub.session_id,
+            permission_id,
+        });
+    };
+    let decision = match decision {
+        ToolPermissionDecision::AllowOnce => ToolPermissionDecision::AllowOnce,
+        ToolPermissionDecision::AllowForSession { rule } => {
+            if !pending.prompt.suggestions.contains(&rule) {
+                return Err(AgentHandleError::InvalidToolPermissionDecision {
+                    message: "the remembered rule was not one of the server suggestions".to_owned(),
+                });
+            }
+            ToolPermissionDecision::AllowForSession { rule }
+        }
+        ToolPermissionDecision::Deny { message } => {
+            let message = message.trim();
+            if message.len() > MAX_DENIAL_MESSAGE_BYTES {
+                return Err(AgentHandleError::InvalidToolPermissionDecision {
+                    message: format!(
+                        "the denial message is {} bytes; maximum is {MAX_DENIAL_MESSAGE_BYTES}",
+                        message.len()
+                    ),
+                });
+            }
+            ToolPermissionDecision::Deny {
+                message: message.to_owned(),
+            }
+        }
+    };
+    let allowed = !matches!(decision, ToolPermissionDecision::Deny { .. });
+    let pending = pending_permissions
+        .remove(&permission_id)
+        .expect("the validated tool permission request must still be pending");
+    if pending.reply.send(decision).is_err() {
+        hub.tool_permission_cancelled(permission_id);
+        return Err(AgentHandleError::ToolPermissionNotPending {
+            session_id: hub.session_id,
+            permission_id,
+        });
+    }
+    hub.tool_permission_resolved(permission_id, allowed);
+    Ok(())
+}
+
+fn cancel_pending_tool_permissions(
+    pending_permissions: &mut HashMap<ToolPermissionId, PendingToolPermissionRequest>,
+    hub: &EventHub,
+    message: &str,
+) {
+    for (permission_id, pending) in pending_permissions.drain() {
+        let _ = pending.reply.send(ToolPermissionDecision::Deny {
+            message: message.to_owned(),
+        });
+        hub.tool_permission_cancelled(permission_id);
+    }
+}
+
+fn cancel_pending_tool_permission(
+    pending_permissions: &mut HashMap<ToolPermissionId, PendingToolPermissionRequest>,
+    hub: &EventHub,
+    permission_id: ToolPermissionId,
+    decision: ToolPermissionDecision,
+) -> bool {
+    let Some(pending) = pending_permissions.remove(&permission_id) else {
+        return false;
+    };
+    let _ = pending.reply.send(decision);
+    hub.tool_permission_cancelled(permission_id);
+    true
+}
+
+fn drain_unregistered_tool_permissions(
+    permission_requests: Option<&mut mpsc::Receiver<PendingToolPermissionRequest>>,
+    message: &str,
+) {
+    let Some(permission_requests) = permission_requests else {
+        return;
+    };
+    while let Ok(pending) = permission_requests.try_recv() {
+        let _ = pending.reply.send(ToolPermissionDecision::Deny {
+            message: message.to_owned(),
+        });
+    }
+}
+
 fn run_is_stopping(control: &AgentRunControl, hub: &EventHub) -> bool {
     control.is_stopped()
         || matches!(
@@ -1816,6 +2088,16 @@ fn fail_pending_command(command: AgentCommand, hub: &EventHub) {
             let _ = reply.send(Err(AgentHandleError::AskUserNotPending {
                 session_id: hub.session_id,
                 ask_id,
+            }));
+        }
+        AgentCommand::DecideToolPermission {
+            permission_id,
+            reply,
+            ..
+        } => {
+            let _ = reply.send(Err(AgentHandleError::ToolPermissionNotPending {
+                session_id: hub.session_id,
+                permission_id,
             }));
         }
         AgentCommand::Shutdown { reply } => {
@@ -2029,6 +2311,7 @@ impl EventHub {
             state.cumulative_usage = agent.cumulative_usage();
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
             state.subagents = subagents
                 .map(SubagentRuntime::snapshots)
                 .unwrap_or_default()
@@ -2081,6 +2364,7 @@ impl EventHub {
             state.active_run_id = Some(run_id);
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
         });
     }
 
@@ -2109,12 +2393,47 @@ impl EventHub {
         });
     }
 
+    fn tool_permission_requested(&self, request: ToolPermissionPrompt) {
+        self.publish(
+            RuntimeEventKind::ToolPermissionRequested {
+                request: request.clone(),
+            },
+            |state| state.pending_tool_permissions.push(request),
+        );
+    }
+
+    fn tool_permission_resolved(&self, permission_id: ToolPermissionId, allowed: bool) {
+        self.publish(
+            RuntimeEventKind::ToolPermissionResolved {
+                permission_id,
+                allowed,
+            },
+            |state| {
+                state
+                    .pending_tool_permissions
+                    .retain(|request| request.permission_id != permission_id);
+            },
+        );
+    }
+
+    fn tool_permission_cancelled(&self, permission_id: ToolPermissionId) {
+        self.publish(
+            RuntimeEventKind::ToolPermissionCancelled { permission_id },
+            |state| {
+                state
+                    .pending_tool_permissions
+                    .retain(|request| request.permission_id != permission_id);
+            },
+        );
+    }
+
     fn run_completed(&self, run_id: RunId, status: AgentStatus) {
         self.publish(RuntimeEventKind::RunCompleted { run_id }, |state| {
             state.status = status;
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
         });
     }
 
@@ -2124,6 +2443,7 @@ impl EventHub {
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
         });
     }
 
@@ -2133,6 +2453,7 @@ impl EventHub {
             state.active_run_id = None;
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
         });
     }
 
@@ -2178,6 +2499,7 @@ impl EventHub {
             state.status = AgentStatus::Closing;
             state.draft = None;
             state.pending_asks.clear();
+            state.pending_tool_permissions.clear();
         });
     }
 
@@ -2246,6 +2568,7 @@ impl EventHub {
                 state.queued_runs = 0;
                 state.draft = None;
                 state.pending_asks.clear();
+                state.pending_tool_permissions.clear();
             },
         );
     }
@@ -2598,6 +2921,15 @@ pub enum AgentHandleError {
     #[error("invalid askuser answer: {message}")]
     InvalidAskUserAnswer { message: String },
 
+    #[error("session {session_id} is not waiting for tool permission request {permission_id}")]
+    ToolPermissionNotPending {
+        session_id: SessionId,
+        permission_id: ToolPermissionId,
+    },
+
+    #[error("invalid tool permission decision: {message}")]
+    InvalidToolPermissionDecision { message: String },
+
     #[error("agent operation for session {session_id} failed: {message}")]
     Operation {
         session_id: SessionId,
@@ -2637,6 +2969,7 @@ mod tests {
             context_usage: None,
             cumulative_usage: TokenUsage::default(),
             pending_asks: Vec::new(),
+            pending_tool_permissions: Vec::new(),
             subagents: Vec::new(),
             last_event_sequence: 0,
         });
@@ -2668,6 +3001,43 @@ mod tests {
                 after_message_count: Some(2),
                 message: None,
             })
+        );
+    }
+
+    #[test]
+    fn blank_tool_permission_denial_is_left_for_the_library_default() {
+        let hub = test_hub();
+        let permission_id = ToolPermissionId::new();
+        let (reply, response) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            permission_id,
+            PendingToolPermissionRequest {
+                prompt: ToolPermissionPrompt {
+                    permission_id,
+                    call: phi::ToolCall::new("call-1", "bash", serde_json::json!({})),
+                    effect: phi::ToolEffect::ExternalSideEffect,
+                    capability_mode: CapabilityMode::WorkspaceEdit,
+                    suggestions: Vec::new(),
+                },
+                reply,
+            },
+        )]);
+
+        resolve_pending_tool_permission(
+            &mut pending,
+            &hub,
+            permission_id,
+            ToolPermissionDecision::Deny {
+                message: "  \n".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.blocking_recv().unwrap(),
+            ToolPermissionDecision::Deny {
+                message: String::new(),
+            }
         );
     }
 

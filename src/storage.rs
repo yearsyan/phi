@@ -21,6 +21,7 @@ use tokio::{
 use crate::{
     Workspace,
     context::DEFAULT_CONTEXT_COMPACTION_BOUNDARY_MESSAGE,
+    permission::ToolPermissionRule,
     tool::CapabilityMode,
     types::{Message, MessageVisibility, Role, TokenUsage},
 };
@@ -52,6 +53,10 @@ pub struct SessionSnapshot {
     /// capability modes were introduced.
     #[serde(default)]
     pub capability_mode: CapabilityMode,
+    /// Session-scoped grants approved for invocations above the automatic
+    /// capability boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_rules: Vec<ToolPermissionRule>,
 }
 
 /// One completed compaction boundary in [`SessionHistory`].
@@ -179,6 +184,7 @@ impl SessionSnapshot {
             last_usage: None,
             cumulative_usage: TokenUsage::default(),
             capability_mode: CapabilityMode::default(),
+            permission_rules: Vec::new(),
         })
     }
 
@@ -430,6 +436,7 @@ enum StoredSessionEventRef<'a> {
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         capability_mode: CapabilityMode,
+        permission_rules: &'a [ToolPermissionRule],
     },
     Replace {
         messages: &'a [Message],
@@ -437,6 +444,7 @@ enum StoredSessionEventRef<'a> {
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         capability_mode: CapabilityMode,
+        permission_rules: &'a [ToolPermissionRule],
     },
     ReplaceTail {
         from: usize,
@@ -445,6 +453,7 @@ enum StoredSessionEventRef<'a> {
         last_usage: Option<TokenUsage>,
         cumulative_usage: TokenUsage,
         capability_mode: CapabilityMode,
+        permission_rules: &'a [ToolPermissionRule],
     },
 }
 
@@ -459,6 +468,8 @@ enum StoredSessionEvent {
         cumulative_usage: TokenUsage,
         #[serde(default)]
         capability_mode: CapabilityMode,
+        #[serde(default)]
+        permission_rules: Vec<ToolPermissionRule>,
     },
     Replace {
         messages: Vec<Message>,
@@ -468,6 +479,8 @@ enum StoredSessionEvent {
         cumulative_usage: TokenUsage,
         #[serde(default)]
         capability_mode: CapabilityMode,
+        #[serde(default)]
+        permission_rules: Vec<ToolPermissionRule>,
     },
     ReplaceTail {
         from: usize,
@@ -478,6 +491,8 @@ enum StoredSessionEvent {
         cumulative_usage: TokenUsage,
         #[serde(default)]
         capability_mode: CapabilityMode,
+        #[serde(default)]
+        permission_rules: Vec<ToolPermissionRule>,
     },
 }
 
@@ -495,6 +510,7 @@ struct LogCursor {
     last_usage: Option<TokenUsage>,
     cumulative_usage: TokenUsage,
     capability_mode: CapabilityMode,
+    permission_rules: Vec<ToolPermissionRule>,
     valid_len: usize,
     file_len: usize,
     ends_with_newline: bool,
@@ -502,7 +518,14 @@ struct LogCursor {
 
 impl LogCursor {
     fn from_parsed(parsed: &ParsedLog) -> Self {
-        let (message_count, workspace, last_usage, cumulative_usage, capability_mode) = parsed
+        let (
+            message_count,
+            workspace,
+            last_usage,
+            cumulative_usage,
+            capability_mode,
+            permission_rules,
+        ) = parsed
             .snapshot
             .as_ref()
             .map(|snapshot| {
@@ -512,6 +535,7 @@ impl LogCursor {
                     snapshot.last_usage,
                     snapshot.cumulative_usage,
                     snapshot.capability_mode,
+                    snapshot.permission_rules.clone(),
                 )
             })
             .unwrap_or((
@@ -520,6 +544,7 @@ impl LogCursor {
                 None,
                 TokenUsage::default(),
                 CapabilityMode::default(),
+                Vec::new(),
             ));
         Self {
             message_count,
@@ -527,6 +552,7 @@ impl LogCursor {
             last_usage,
             cumulative_usage,
             capability_mode,
+            permission_rules,
             valid_len: parsed.valid_len,
             file_len: parsed.file_len,
             ends_with_newline: parsed.ends_with_newline,
@@ -572,6 +598,7 @@ impl SessionStorage for DiskSessionStorage {
                     last_usage: session.last_usage,
                     cumulative_usage: session.cumulative_usage,
                     capability_mode: session.capability_mode,
+                    permission_rules: &session.permission_rules,
                 }
             }
             _ => StoredSessionEventRef::Replace {
@@ -580,6 +607,7 @@ impl SessionStorage for DiskSessionStorage {
                 last_usage: session.last_usage,
                 cumulative_usage: session.cumulative_usage,
                 capability_mode: session.capability_mode,
+                permission_rules: &session.permission_rules,
             },
         };
         let prior_message_count = parsed
@@ -661,6 +689,7 @@ impl SessionStorage for DiskSessionStorage {
             && cursor.last_usage == session.last_usage
             && cursor.cumulative_usage == session.cumulative_usage
             && cursor.capability_mode == session.capability_mode
+            && cursor.permission_rules == session.permission_rules
             && cursor.valid_len == cursor.file_len
         {
             return Ok(());
@@ -678,6 +707,7 @@ impl SessionStorage for DiskSessionStorage {
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
             capability_mode: session.capability_mode,
+            permission_rules: &session.permission_rules,
         };
         let cursor = append_record(
             &path,
@@ -755,6 +785,7 @@ impl SessionStorage for DiskSessionStorage {
             last_usage: session.last_usage,
             cumulative_usage: session.cumulative_usage,
             capability_mode: session.capability_mode,
+            permission_rules: &session.permission_rules,
         };
         let cursor = append_record(
             &path,
@@ -794,48 +825,55 @@ async fn append_record(
     prior_message_count: usize,
     inject_post_write_sync_failure: bool,
 ) -> Result<LogCursor, StorageError> {
-    let (message_count, workspace, last_usage, cumulative_usage, capability_mode) = match &event {
-        StoredSessionEventRef::Append {
-            messages,
-            workspace,
-            last_usage,
-            cumulative_usage,
-            capability_mode,
-        } => (
-            prior_message_count + messages.len(),
-            (*workspace).cloned(),
-            *last_usage,
-            *cumulative_usage,
-            *capability_mode,
-        ),
-        StoredSessionEventRef::Replace {
-            messages,
-            workspace,
-            last_usage,
-            cumulative_usage,
-            capability_mode,
-        } => (
-            messages.len(),
-            (*workspace).cloned(),
-            *last_usage,
-            *cumulative_usage,
-            *capability_mode,
-        ),
-        StoredSessionEventRef::ReplaceTail {
-            from,
-            messages,
-            workspace,
-            last_usage,
-            cumulative_usage,
-            capability_mode,
-        } => (
-            from + messages.len(),
-            (*workspace).cloned(),
-            *last_usage,
-            *cumulative_usage,
-            *capability_mode,
-        ),
-    };
+    let (message_count, workspace, last_usage, cumulative_usage, capability_mode, permission_rules) =
+        match &event {
+            StoredSessionEventRef::Append {
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                capability_mode,
+                permission_rules,
+            } => (
+                prior_message_count + messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *capability_mode,
+                permission_rules.to_vec(),
+            ),
+            StoredSessionEventRef::Replace {
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                capability_mode,
+                permission_rules,
+            } => (
+                messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *capability_mode,
+                permission_rules.to_vec(),
+            ),
+            StoredSessionEventRef::ReplaceTail {
+                from,
+                messages,
+                workspace,
+                last_usage,
+                cumulative_usage,
+                capability_mode,
+                permission_rules,
+            } => (
+                from + messages.len(),
+                (*workspace).cloned(),
+                *last_usage,
+                *cumulative_usage,
+                *capability_mode,
+                permission_rules.to_vec(),
+            ),
+        };
     let mut bytes = serde_json::to_vec(&StoredSessionRecordRef {
         format_version: DISK_FORMAT_VERSION,
         session_id,
@@ -896,6 +934,7 @@ async fn append_record(
         last_usage,
         cumulative_usage,
         capability_mode,
+        permission_rules,
         valid_len: file_len,
         file_len,
         ends_with_newline: true,
@@ -1009,6 +1048,7 @@ fn apply_record(
             last_usage,
             cumulative_usage,
             capability_mode,
+            permission_rules,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
@@ -1018,6 +1058,7 @@ fn apply_record(
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 capability_mode: CapabilityMode::default(),
+                permission_rules: Vec::new(),
             });
             if workspace.is_some() {
                 session.workspace = workspace;
@@ -1026,6 +1067,7 @@ fn apply_record(
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
             session.capability_mode = capability_mode;
+            session.permission_rules = permission_rules;
         }
         StoredSessionEvent::Replace {
             messages,
@@ -1033,6 +1075,7 @@ fn apply_record(
             last_usage,
             cumulative_usage,
             capability_mode,
+            permission_rules,
         } => {
             let mut replacement = snapshot.take().unwrap_or_else(|| SessionSnapshot {
                 id: session_id.to_owned(),
@@ -1042,12 +1085,14 @@ fn apply_record(
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 capability_mode: CapabilityMode::default(),
+                permission_rules: Vec::new(),
             });
             replace_replayed_messages(&mut replacement, messages);
             replacement.workspace = workspace;
             replacement.last_usage = last_usage;
             replacement.cumulative_usage = cumulative_usage;
             replacement.capability_mode = capability_mode;
+            replacement.permission_rules = permission_rules;
             *snapshot = Some(replacement);
         }
         StoredSessionEvent::ReplaceTail {
@@ -1057,6 +1102,7 @@ fn apply_record(
             last_usage,
             cumulative_usage,
             capability_mode,
+            permission_rules,
         } => {
             let session = snapshot.get_or_insert_with(|| SessionSnapshot {
                 id: session_id.to_owned(),
@@ -1066,6 +1112,7 @@ fn apply_record(
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 capability_mode: CapabilityMode::default(),
+                permission_rules: Vec::new(),
             });
             if workspace.is_some() {
                 session.workspace = workspace;
@@ -1083,6 +1130,7 @@ fn apply_record(
             session.last_usage = last_usage;
             session.cumulative_usage = cumulative_usage;
             session.capability_mode = capability_mode;
+            session.permission_rules = permission_rules;
         }
     }
     Ok(())
@@ -1197,6 +1245,10 @@ mod tests {
             last_usage: Some(TokenUsage::new(10, 2, 1)),
             cumulative_usage: TokenUsage::new(20, 5, 2),
             capability_mode: CapabilityMode::WorkspaceEdit,
+            permission_rules: vec![ToolPermissionRule::new(
+                "bash",
+                Some("git status *".to_owned()),
+            )],
         }
     }
 
@@ -1227,6 +1279,7 @@ mod tests {
 
         assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
         assert_eq!(snapshot.workspace, None);
+        assert!(snapshot.permission_rules.is_empty());
     }
 
     #[tokio::test]
@@ -1273,6 +1326,7 @@ mod tests {
         let snapshot = storage.load("legacy-disk").await.unwrap().unwrap();
         assert_eq!(snapshot.capability_mode, CapabilityMode::FullAccess);
         assert_eq!(snapshot.workspace, None);
+        assert!(snapshot.permission_rules.is_empty());
     }
 
     #[tokio::test]
@@ -1409,9 +1463,22 @@ mod tests {
         assert_eq!(records[0]["messages"].as_array().unwrap().len(), 1);
         assert_eq!(records[1]["messages"].as_array().unwrap().len(), 1);
 
-        // An unchanged checkpoint is a no-op rather than an empty log record.
+        // A rule-only checkpoint emits an empty append record so session
+        // authorization stays durable without rewriting the transcript.
+        session.permission_rules.push(ToolPermissionRule::new(
+            "bash",
+            Some("git status *".to_owned()),
+        ));
         storage.save_incremental(&session, 2).await.unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+        assert_eq!(
+            storage.load(&session.id).await.unwrap(),
+            Some(session.clone())
+        );
+
+        // An unchanged checkpoint is a no-op rather than another empty record.
+        storage.save_incremental(&session, 2).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -1426,7 +1493,7 @@ mod tests {
 
         assert_eq!(storage.load(&session.id).await.unwrap(), Some(session));
         let records = std::fs::read_to_string(path).unwrap();
-        assert_eq!(records.lines().count(), 3);
+        assert_eq!(records.lines().count(), 4);
         assert!(
             records
                 .lines()

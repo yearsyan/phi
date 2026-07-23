@@ -184,6 +184,7 @@ class SessionController extends ChangeNotifier {
   int queuedRuns = 0;
   AssistantDraft? draft;
   List<AskUserRequest> pendingAsks = [];
+  List<ToolPermissionPrompt> pendingToolPermissions = [];
   List<SubagentSummary> subagents = [];
   List<PublicMessage> history = [];
   List<CompactionMarker> compactions = [];
@@ -480,6 +481,7 @@ class SessionController extends ChangeNotifier {
     queuedRuns = 0;
     draft = null;
     pendingAsks = [];
+    pendingToolPermissions = [];
     subagents = [];
     history = [];
     compactions = [];
@@ -541,6 +543,7 @@ class SessionController extends ChangeNotifier {
     queuedRuns = session.queuedRuns;
     draft = session.draft;
     pendingAsks = session.pendingAsks;
+    pendingToolPermissions = session.pendingToolPermissions;
     subagents = session.subagents;
     history = List.of(session.history);
     compactions = [
@@ -619,11 +622,27 @@ class SessionController extends ChangeNotifier {
       case 'askuser_answered':
       case 'askuser_cancelled':
         pendingAsks.removeWhere((ask) => ask.askId == event.askId);
+      case 'tool_permission_requested':
+        final request = event.toolPermissionRequest;
+        if (request != null) {
+          pendingToolPermissions
+            ..removeWhere(
+              (pending) => pending.permissionId == request.permissionId,
+            )
+            ..add(request);
+        }
+      case 'tool_permission_resolved':
+      case 'tool_permission_cancelled':
+        pendingToolPermissions.removeWhere(
+          (request) => request.permissionId == event.permissionId,
+        );
       case 'operation_failed':
         _pushNotice('${event.json['operation']}: ${event.message}');
       case 'actor_crashed':
         fatalError = (code: 'actor_crashed', message: event.message ?? '');
         status = SessionStatus.idle;
+        pendingAsks = [];
+        pendingToolPermissions = [];
       case 'subagents_resynced':
         subagents = (event.json['subagents'] as List? ?? const [])
             .whereType<Map<String, dynamic>>()
@@ -1057,6 +1076,14 @@ class SessionController extends ChangeNotifier {
 
   bool answerAsk(String askId, List<Json> answers) =>
       _send(ClientCommand.answerAskUser(_requestId('answer'), askId, answers));
+
+  bool decideToolPermission(String permissionId, Json decision) => _send(
+    ClientCommand.decideToolPermission(
+      _requestId('permission'),
+      permissionId,
+      decision,
+    ),
+  );
 
   void setModel(String model) {
     final value = model.trim();

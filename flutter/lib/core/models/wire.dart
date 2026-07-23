@@ -445,6 +445,51 @@ class AskUserRequest {
   );
 }
 
+class ToolPermissionRule {
+  const ToolPermissionRule({required this.toolName, this.pattern});
+
+  final String toolName;
+  final String? pattern;
+
+  static ToolPermissionRule fromJson(Json json) => ToolPermissionRule(
+    toolName: json['tool_name'] as String? ?? '',
+    pattern: json['pattern'] as String?,
+  );
+
+  Json toJson() => {
+    'tool_name': toolName,
+    if (pattern != null) 'pattern': pattern,
+  };
+
+  String get label => pattern == null ? toolName : '$toolName($pattern)';
+}
+
+class ToolPermissionPrompt {
+  const ToolPermissionPrompt({
+    required this.permissionId,
+    required this.call,
+    required this.effect,
+    required this.capabilityMode,
+    this.suggestions = const [],
+  });
+
+  final String permissionId;
+  final ToolCall call;
+  final String effect;
+  final String capabilityMode;
+  final List<ToolPermissionRule> suggestions;
+
+  static ToolPermissionPrompt fromJson(Json json) => ToolPermissionPrompt(
+    permissionId: json['permission_id'] as String? ?? '',
+    call: ToolCall.fromJson(_asJson(json['call'])),
+    effect: json['effect'] as String? ?? '',
+    capabilityMode: json['capability_mode'] as String? ?? '',
+    suggestions: _asJsonList(
+      json['suggestions'],
+    ).map(ToolPermissionRule.fromJson).toList(),
+  );
+}
+
 class SubagentSummary {
   const SubagentSummary({
     required this.agentId,
@@ -539,6 +584,7 @@ class SessionDto {
     this.contextCompactions = const [],
     this.draft,
     this.pendingAsks = const [],
+    this.pendingToolPermissions = const [],
     this.skills = const [],
     this.subagents = const [],
     this.usage = const Usage(),
@@ -560,6 +606,7 @@ class SessionDto {
   final List<ContextCompactionStatus> contextCompactions;
   final AssistantDraft? draft;
   final List<AskUserRequest> pendingAsks;
+  final List<ToolPermissionPrompt> pendingToolPermissions;
   final List<SkillSummary> skills;
   final List<SubagentSummary> subagents;
   final Usage usage;
@@ -593,6 +640,9 @@ class SessionDto {
     pendingAsks: _asJsonList(
       json['pending_asks'],
     ).map(AskUserRequest.fromJson).toList(),
+    pendingToolPermissions: _asJsonList(
+      json['pending_tool_permissions'],
+    ).map(ToolPermissionPrompt.fromJson).toList(),
     skills: _asJsonList(json['skills']).map(SkillSummary.fromJson).toList(),
     subagents: _asJsonList(
       json['subagents'],
@@ -612,6 +662,7 @@ class SessionDto {
     List<ContextCompactionStatus>? contextCompactions,
     AssistantDraft? Function()? draft,
     List<AskUserRequest>? pendingAsks,
+    List<ToolPermissionPrompt>? pendingToolPermissions,
     List<SkillSummary>? skills,
     List<SubagentSummary>? subagents,
     Usage? usage,
@@ -633,6 +684,8 @@ class SessionDto {
     contextCompactions: contextCompactions ?? this.contextCompactions,
     draft: draft != null ? draft() : this.draft,
     pendingAsks: pendingAsks ?? this.pendingAsks,
+    pendingToolPermissions:
+        pendingToolPermissions ?? this.pendingToolPermissions,
     skills: skills ?? this.skills,
     subagents: subagents ?? this.subagents,
     usage: usage ?? this.usage,
@@ -947,6 +1000,7 @@ class WireEvent {
   String? get title => json['title'] as String?;
   String? get message => json['message'] as String?;
   String? get askId => json['ask_id'] as String?;
+  String? get permissionId => json['permission_id'] as String?;
   String? get capabilityMode => json['capability_mode'] as String?;
   String? get agentId => json['agent_id'] as String?;
 
@@ -963,6 +1017,10 @@ class WireEvent {
 
   AskUserRequest? get askRequest => json['request'] is Map
       ? AskUserRequest.fromJson(_asJson(json['request']))
+      : null;
+
+  ToolPermissionPrompt? get toolPermissionRequest => json['request'] is Map
+      ? ToolPermissionPrompt.fromJson(_asJson(json['request']))
       : null;
 
   ToolCall? get toolCall =>
@@ -1184,6 +1242,17 @@ class ClientCommand {
     'request_id': requestId,
     'ask_id': askId,
     'answers': answers,
+  });
+
+  factory ClientCommand.decideToolPermission(
+    String requestId,
+    String permissionId,
+    Json decision,
+  ) => ClientCommand._({
+    'type': 'decide_tool_permission',
+    'request_id': requestId,
+    'permission_id': permissionId,
+    'decision': decision,
   });
 
   factory ClientCommand.ping(String requestId) =>

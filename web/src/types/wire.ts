@@ -74,6 +74,11 @@ export type ReasoningEffort =
   | 'max';
 
 export type CapabilityMode = 'read_only' | 'workspace_edit' | 'full_access';
+export type ToolEffect =
+  | 'read_only'
+  | 'internal'
+  | 'workspace_write'
+  | 'external_side_effect';
 
 export type SessionStatus =
   | 'awaiting_first_prompt'
@@ -290,6 +295,24 @@ export interface AskUserAnswer {
   custom_text: string | null;
 }
 
+export interface ToolPermissionRule {
+  tool_name: string;
+  pattern?: string;
+}
+
+export interface ToolPermissionPrompt {
+  permission_id: string;
+  call: ToolCall;
+  effect: ToolEffect;
+  capability_mode: CapabilityMode;
+  suggestions: ToolPermissionRule[];
+}
+
+export type ToolPermissionDecision =
+  | { type: 'allow_once' }
+  | { type: 'allow_for_session'; rule: ToolPermissionRule }
+  | { type: 'deny'; message?: string };
+
 /* -------------------------------------------------------------------------- */
 /* Session snapshot DTO                                                       */
 /* -------------------------------------------------------------------------- */
@@ -311,6 +334,7 @@ export interface SessionDto {
   context_compaction?: ContextCompactionStatus;
   draft: AssistantDraft | null;
   pending_asks: AskUserRequest[];
+  pending_tool_permissions?: ToolPermissionPrompt[];
   skills?: readonly SkillSummary[];
   subagents: SubagentSummary[];
   usage: Usage;
@@ -384,6 +408,13 @@ export type EventDto =
   | { type: 'askuser_requested'; request: AskUserRequest }
   | { type: 'askuser_answered'; ask_id: string }
   | { type: 'askuser_cancelled'; ask_id: string }
+  | { type: 'tool_permission_requested'; request: ToolPermissionPrompt }
+  | {
+      type: 'tool_permission_resolved';
+      permission_id: string;
+      allowed: boolean;
+    }
+  | { type: 'tool_permission_cancelled'; permission_id: string }
   | { type: 'operation_failed'; operation: string; message: string }
   | { type: 'actor_crashed'; message: string }
   | {
@@ -591,6 +622,12 @@ export type ClientCommand =
       request_id: string;
       ask_id: string;
       answers: AskUserAnswer[];
+    }
+  | {
+      type: 'decide_tool_permission';
+      request_id: string;
+      permission_id: string;
+      decision: ToolPermissionDecision;
     }
   | { type: 'ping'; request_id: string };
 

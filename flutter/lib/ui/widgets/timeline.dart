@@ -6,9 +6,10 @@ import '../../i18n/strings.dart';
 import '../../state/session_controller.dart';
 import 'ask_card.dart';
 import 'markdown_view.dart';
+import 'permission_card.dart';
 
 /// The chat transcript: committed history, run activity, live draft and
-/// pending askuser cards, in chronological order.
+/// pending askuser and tool-permission cards, in chronological order.
 class ChatTimeline extends StatelessWidget {
   const ChatTimeline({
     super.key,
@@ -55,6 +56,7 @@ class ChatTimeline extends StatelessWidget {
                       entry: entries[index],
                       onFork: onFork,
                       onAnswerAsk: controller.answerAsk,
+                      onPermissionDecision: controller.decideToolPermission,
                     ),
                   ),
                 ),
@@ -207,6 +209,9 @@ class ChatTimeline extends StatelessWidget {
     for (final ask in c.pendingAsks) {
       entries.add(_AskEntry(ask));
     }
+    for (final request in c.pendingToolPermissions) {
+      entries.add(_PermissionEntry(request));
+    }
 
     return entries;
   }
@@ -272,6 +277,11 @@ class _AskEntry extends _Entry {
   final AskUserRequest request;
 }
 
+class _PermissionEntry extends _Entry {
+  const _PermissionEntry(this.request);
+  final ToolPermissionPrompt request;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Entry rendering                                                           */
 /* ------------------------------------------------------------------------- */
@@ -281,11 +291,13 @@ class _EntryWidget extends StatelessWidget {
     required this.entry,
     required this.onFork,
     required this.onAnswerAsk,
+    required this.onPermissionDecision,
   });
 
   final _Entry entry;
   final void Function(int historyIndex) onFork;
   final bool Function(String askId, List<Json> answers) onAnswerAsk;
+  final bool Function(String permissionId, Json decision) onPermissionDecision;
 
   @override
   Widget build(BuildContext context) {
@@ -332,6 +344,12 @@ class _EntryWidget extends StatelessWidget {
       _AskEntry(request: final request) => AskCard(
         request: request,
         onSubmit: (answers) => onAnswerAsk(request.askId, answers),
+      ),
+      _PermissionEntry(request: final request) => PermissionCard(
+        key: ValueKey(request.permissionId),
+        request: request,
+        onDecision: (decision) =>
+            onPermissionDecision(request.permissionId, decision),
       ),
     };
   }

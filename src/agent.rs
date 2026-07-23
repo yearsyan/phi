@@ -16,6 +16,10 @@ use crate::{
     error::{AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError},
     hook::{Hook, HookRegistry, LlmResponseContext, TurnEndContext, TurnStartContext},
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
+    permission::{
+        MAX_TOOL_PERMISSION_RULES, ToolPermissionApprover, ToolPermissionDecision,
+        ToolPermissionRequest, ToolPermissionRule,
+    },
     provider::LlmProvider,
     storage::{
         SessionHistory, SessionSnapshot, SessionStorage, StorageError, validate_session_id,
@@ -421,6 +425,8 @@ pub struct AgentBuilder {
     max_parallel_tools: usize,
     capability_mode: CapabilityMode,
     tool_policy: ToolPolicy,
+    permission_approver: Option<Arc<dyn ToolPermissionApprover>>,
+    permission_rules: Vec<ToolPermissionRule>,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
     context_compactor: Option<Arc<dyn ContextCompactor>>,
@@ -441,6 +447,8 @@ impl AgentBuilder {
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             capability_mode: CapabilityMode::default(),
             tool_policy: ToolPolicy::default(),
+            permission_approver: None,
+            permission_rules: Vec::new(),
             generation_config: GenerationConfig::default(),
             max_context_tokens: None,
             context_compactor: None,
@@ -536,6 +544,42 @@ impl AgentBuilder {
     /// Applies a name-based allow/deny policy to ordinary tools.
     pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
         self.tool_policy = tool_policy;
+        self
+    }
+
+    /// Installs a host callback for tool calls outside the automatic
+    /// [`CapabilityMode`] boundary.
+    pub fn tool_permission_approver(
+        mut self,
+        approver: impl ToolPermissionApprover + 'static,
+    ) -> Self {
+        self.permission_approver = Some(Arc::new(approver));
+        self
+    }
+
+    /// Shared-object form of [`Self::tool_permission_approver`].
+    pub fn shared_tool_permission_approver(
+        mut self,
+        approver: Arc<dyn ToolPermissionApprover>,
+    ) -> Self {
+        self.permission_approver = Some(approver);
+        self
+    }
+
+    /// Installs pre-authorized session rules. Invalid or duplicate rules are
+    /// discarded conservatively; runtime additions return explicit errors.
+    pub fn tool_permission_rules(
+        mut self,
+        rules: impl IntoIterator<Item = ToolPermissionRule>,
+    ) -> Self {
+        for rule in rules {
+            if self.permission_rules.len() >= MAX_TOOL_PERMISSION_RULES {
+                break;
+            }
+            if rule.validate().is_ok() && !self.permission_rules.contains(&rule) {
+                self.permission_rules.push(rule);
+            }
+        }
         self
     }
 
@@ -649,6 +693,8 @@ impl AgentBuilder {
             max_parallel_tools: self.max_parallel_tools,
             capability_mode: self.capability_mode,
             tool_policy: self.tool_policy,
+            permission_approver: self.permission_approver,
+            permission_rules: self.permission_rules,
             mandatory_tools: HashSet::new(),
             generation_config: self.generation_config,
             max_context_tokens: self.max_context_tokens,
@@ -679,6 +725,8 @@ pub struct Agent {
     max_parallel_tools: usize,
     capability_mode: CapabilityMode,
     tool_policy: ToolPolicy,
+    permission_approver: Option<Arc<dyn ToolPermissionApprover>>,
+    permission_rules: Vec<ToolPermissionRule>,
     mandatory_tools: HashSet<String>,
     generation_config: GenerationConfig,
     max_context_tokens: Option<u64>,
@@ -798,9 +846,53 @@ impl Agent {
         &self.tool_policy
     }
 
+    pub fn tool_permission_rules(&self) -> &[ToolPermissionRule] {
+        &self.permission_rules
+    }
+
     /// Replaces the name-based tool policy while the agent is idle.
     pub fn set_tool_policy(&mut self, tool_policy: ToolPolicy) {
         self.tool_policy = tool_policy;
+    }
+
+    /// Replaces the host callback used for permission prompts. The Agent owner
+    /// must call this only while the Agent is idle.
+    pub fn set_tool_permission_approver(
+        &mut self,
+        approver: impl ToolPermissionApprover + 'static,
+    ) {
+        self.permission_approver = Some(Arc::new(approver));
+    }
+
+    pub fn set_shared_tool_permission_approver(
+        &mut self,
+        approver: Arc<dyn ToolPermissionApprover>,
+    ) {
+        self.permission_approver = Some(approver);
+    }
+
+    pub fn clear_tool_permission_approver(&mut self) {
+        self.permission_approver = None;
+    }
+
+    /// Adds a remembered capability exception in memory. The next checkpoint
+    /// persists it for an attached session.
+    pub fn add_tool_permission_rule(
+        &mut self,
+        rule: ToolPermissionRule,
+    ) -> Result<bool, ToolError> {
+        rule.validate()
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        if self.permission_rules.contains(&rule) {
+            return Ok(false);
+        }
+        if self.permission_rules.len() >= MAX_TOOL_PERMISSION_RULES {
+            return Err(ToolError::new(format!(
+                "tool permission rule limit reached ({MAX_TOOL_PERMISSION_RULES})"
+            )));
+        }
+        self.permission_rules.push(rule);
+        Ok(true)
     }
 
     /// Changes capability in memory. The next checkpoint will persist it.
@@ -914,6 +1006,15 @@ impl Agent {
             self.last_usage = snapshot.last_usage;
             self.cumulative_usage = snapshot.cumulative_usage;
             self.capability_mode = snapshot.capability_mode;
+            self.permission_rules.clear();
+            for rule in snapshot.permission_rules {
+                if self.permission_rules.len() >= MAX_TOOL_PERMISSION_RULES {
+                    break;
+                }
+                if rule.validate().is_ok() && !self.permission_rules.contains(&rule) {
+                    self.permission_rules.push(rule);
+                }
+            }
             self.context_usage = self.last_usage.and_then(|usage| {
                 self.max_context_tokens
                     .map(|max_tokens| ContextUsage::from_usage(max_tokens, usage))
@@ -1337,7 +1438,12 @@ impl Agent {
                     checkpoint = AgentCheckpoint::capture(self);
 
                     let outcome = self
-                        .execute_tool_calls_controlled(tool_calls, &control, tool_batch_permissions)
+                        .execute_tool_calls_controlled(
+                            tool_calls,
+                            &control,
+                            tool_batch_permissions,
+                            &mut checkpoint,
+                        )
                         .await;
                     let results = outcome
                         .executions
@@ -1491,21 +1597,24 @@ impl Agent {
             .filter(|(name, tool)| {
                 self.tool_policy
                     .allows(name, self.mandatory_tools.contains(*name))
-                    && capability_mode.allows(tool.effect())
+                    && self.tool_can_be_requested(name, tool.as_ref(), capability_mode)
             })
             .map(|(_, tool)| tool.definition())
             .collect()
     }
 
-    fn tool_is_allowed(
+    fn tool_can_be_requested(
         &self,
         name: &str,
-        effect: ToolEffect,
+        tool: &dyn Tool,
         capability_mode: CapabilityMode,
     ) -> bool {
-        self.tool_policy
-            .allows(name, self.mandatory_tools.contains(name))
-            && capability_mode.allows(effect)
+        capability_mode.allows(tool.effect())
+            || self.permission_approver.is_some()
+            || self
+                .permission_rules
+                .iter()
+                .any(|rule| rule.tool_name == name)
     }
 
     fn enforce_request_policy(
@@ -1515,7 +1624,10 @@ impl Agent {
     ) {
         request.tools.retain(|definition| {
             self.tools.get(&definition.name).is_some_and(|tool| {
-                self.tool_is_allowed(&definition.name, tool.effect(), capability_mode)
+                self.tool_policy.allows(
+                    &definition.name,
+                    self.mandatory_tools.contains(&definition.name),
+                ) && self.tool_can_be_requested(&definition.name, tool.as_ref(), capability_mode)
             })
         });
     }
@@ -1717,6 +1829,7 @@ impl Agent {
             last_usage: self.last_usage,
             cumulative_usage: self.cumulative_usage,
             capability_mode: self.capability_mode,
+            permission_rules: self.permission_rules.clone(),
         };
         if let Some(unchanged_message_count) = session.replace_from {
             session
@@ -1734,11 +1847,165 @@ impl Agent {
         Ok(())
     }
 
-    async fn execute_tool_calls_controlled(
+    fn invocation_requires_permission(
         &self,
+        call: &ToolCall,
+        permissions: ToolBatchPermissions,
+    ) -> bool {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return false;
+        };
+        let name_allowed = self
+            .tool_policy
+            .allows(&call.name, self.mandatory_tools.contains(&call.name));
+        let effect = tool.effect_for(&call.arguments);
+        name_allowed
+            && self.permission_approver.is_some()
+            && !self.permission_rule_allows_call(call)
+            && (!permissions.allows(effect) || !self.capability_mode.allows(effect))
+    }
+
+    fn permission_rule_allows_call(&self, call: &ToolCall) -> bool {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return false;
+        };
+        self.permission_rules.iter().any(|rule| {
+            rule.tool_name == call.name
+                && rule
+                    .pattern
+                    .as_ref()
+                    .is_none_or(|pattern| tool.matches_permission_pattern(&call.arguments, pattern))
+        })
+    }
+
+    fn permission_suggestions(tool: &dyn Tool, call: &ToolCall) -> Vec<ToolPermissionRule> {
+        let mut suggestions = Vec::new();
+        for pattern in tool.permission_rule_suggestions(&call.arguments) {
+            if suggestions.len() >= 8 {
+                break;
+            }
+            let rule = ToolPermissionRule::new(call.name.clone(), Some(pattern));
+            if rule.validate().is_ok()
+                && tool.matches_permission_pattern(
+                    &call.arguments,
+                    rule.pattern.as_deref().unwrap_or_default(),
+                )
+                && !suggestions.contains(&rule)
+            {
+                suggestions.push(rule);
+            }
+        }
+        suggestions
+    }
+
+    async fn authorize_tool_invocation(
+        &mut self,
+        call: &Arc<ToolCall>,
+        frozen: ToolBatchPermissions,
+        control: &AgentRunControl,
+        checkpoint: &mut AgentCheckpoint,
+    ) -> Option<InvocationAuthorization> {
+        let Some(tool) = self.tools.get(&call.name).cloned() else {
+            return Some(InvocationAuthorization::Allowed(
+                ToolInvocationPermissions {
+                    frozen,
+                    live_capability_mode: self.capability_mode,
+                    name_allowed: true,
+                    capability_override: false,
+                },
+            ));
+        };
+        let name_allowed = self
+            .tool_policy
+            .allows(&call.name, self.mandatory_tools.contains(&call.name));
+        let effect = tool.effect_for(&call.arguments);
+        let mut authorization = ToolInvocationPermissions {
+            frozen,
+            live_capability_mode: self.capability_mode,
+            name_allowed,
+            capability_override: self.permission_rule_allows_call(call),
+        };
+        if !name_allowed
+            || authorization.capability_override
+            || (frozen.allows(effect) && self.capability_mode.allows(effect))
+        {
+            return Some(InvocationAuthorization::Allowed(authorization));
+        }
+
+        let Some(approver) = self.permission_approver.clone() else {
+            return Some(InvocationAuthorization::Allowed(authorization));
+        };
+        let suggestions = Self::permission_suggestions(tool.as_ref(), call);
+        let request = ToolPermissionRequest {
+            call: Arc::unwrap_or_clone(Arc::clone(call)),
+            effect,
+            capability_mode: self.capability_mode,
+            suggestions: suggestions.clone(),
+            cancellation: control.tool_cancellation(),
+        };
+        let decision = tokio::select! {
+            biased;
+            _ = control.stopped() => return None,
+            decision = approver.decide(request) => decision,
+        };
+        match decision {
+            ToolPermissionDecision::AllowOnce => {
+                authorization.capability_override = true;
+                Some(InvocationAuthorization::Allowed(authorization))
+            }
+            ToolPermissionDecision::AllowForSession { rule } => {
+                if !suggestions.contains(&rule)
+                    || rule.tool_name != call.name
+                    || rule.pattern.as_ref().is_some_and(|pattern| {
+                        !tool.matches_permission_pattern(&call.arguments, pattern)
+                    })
+                {
+                    return Some(InvocationAuthorization::Denied(ToolOutput::error(
+                        "tool permission host returned a rule that does not cover this invocation",
+                    )));
+                }
+                let inserted = match self.add_tool_permission_rule(rule.clone()) {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        return Some(InvocationAuthorization::Denied(ToolOutput::error(
+                            error.to_string(),
+                        )));
+                    }
+                };
+                if inserted && let Err(error) = self.synchronize_session().await {
+                    self.permission_rules.retain(|candidate| candidate != &rule);
+                    return Some(InvocationAuthorization::Denied(ToolOutput::error(format!(
+                        "could not persist remembered tool permission; the tool was not executed: {error}"
+                    ))));
+                }
+                if inserted {
+                    // The remembered grant is now durable. Move the rollback
+                    // point forward so a later result-save failure cannot make
+                    // the live Agent disagree with the stored session.
+                    *checkpoint = AgentCheckpoint::capture(self);
+                }
+                authorization.capability_override = true;
+                Some(InvocationAuthorization::Allowed(authorization))
+            }
+            ToolPermissionDecision::Deny { message } => {
+                let message = message.trim();
+                Some(InvocationAuthorization::Denied(ToolOutput::error(
+                    if message.is_empty() {
+                        "tool permission denied by the user".to_owned()
+                    } else {
+                        format!("tool permission denied by the user: {message}")
+                    },
+                )))
+            }
+        }
+    }
+
+    async fn execute_tool_calls_controlled(
+        &mut self,
         calls: Vec<Arc<ToolCall>>,
         control: &AgentRunControl,
         permissions: ToolBatchPermissions,
+        checkpoint: &mut AgentCheckpoint,
     ) -> ToolExecutionOutcome {
         let visible_tool_results = Arc::new(
             self.messages
@@ -1748,7 +2015,11 @@ impl Agent {
         );
         // Internal tools are coordination barriers and must complete before
         // later calls in the same batch begin.
-        let execution_mode = if permissions.requires_sequential(&calls, &self.tools) {
+        let execution_mode = if permissions.requires_sequential(&calls, &self.tools)
+            || calls
+                .iter()
+                .any(|call| self.invocation_requires_permission(call, permissions))
+        {
             ToolExecutionMode::Sequential
         } else {
             self.tool_execution
@@ -1774,13 +2045,24 @@ impl Agent {
                         visible_tool_results.clone(),
                         self.capability_mode,
                     );
-                    let name_allowed = self
-                        .tool_policy
-                        .allows(&call.name, self.mandatory_tools.contains(&call.name));
-                    let authorization = ToolInvocationPermissions {
-                        frozen: permissions,
-                        live_capability_mode: self.capability_mode,
-                        name_allowed,
+                    let authorization = match self
+                        .authorize_tool_invocation(&call, permissions, control, checkpoint)
+                        .await
+                    {
+                        Some(InvocationAuthorization::Allowed(authorization)) => authorization,
+                        Some(InvocationAuthorization::Denied(output)) => {
+                            let executed = ExecutedTool { call, output };
+                            self.emit_tool_end(&executed);
+                            results[index] = executed;
+                            continue;
+                        }
+                        None => {
+                            self.emit_tool_end(&results[index]);
+                            return ToolExecutionOutcome {
+                                executions: results,
+                                stopped: true,
+                            };
+                        }
                     };
                     let execution = Self::execute_one(
                         self.tools.get(&call.name),
@@ -1841,10 +2123,12 @@ impl Agent {
                         let name_allowed = self
                             .tool_policy
                             .allows(&call.name, self.mandatory_tools.contains(&call.name));
+                        let capability_override = self.permission_rule_allows_call(&call);
                         let authorization = ToolInvocationPermissions {
                             frozen: permissions,
                             live_capability_mode: capability_mode,
                             name_allowed,
+                            capability_override,
                         };
                         let context = self.tool_execution_context(
                             &call,
@@ -1928,8 +2212,9 @@ impl Agent {
                 Some(tool) => {
                     let effect = tool.effect_for(&arguments);
                     if !authorization.name_allowed
-                        || !authorization.frozen.allows(effect)
-                        || !authorization.live_capability_mode.allows(effect)
+                        || (!authorization.capability_override
+                            && (!authorization.frozen.allows(effect)
+                                || !authorization.live_capability_mode.allows(effect)))
                     {
                         ToolOutput::error(format!(
                             "tool {:?} is not available under the current policy boundary (request capability: {:?}, batch capability: {:?}, current capability: {:?}, effect: {effect:?})",
@@ -2135,6 +2420,12 @@ struct ToolInvocationPermissions {
     frozen: ToolBatchPermissions,
     live_capability_mode: CapabilityMode,
     name_allowed: bool,
+    capability_override: bool,
+}
+
+enum InvocationAuthorization {
+    Allowed(ToolInvocationPermissions),
+    Denied(ToolOutput),
 }
 
 impl ToolBatchPermissions {
@@ -2199,6 +2490,7 @@ struct AgentCheckpoint {
     consecutive_auto_compaction_failures: u8,
     cumulative_usage: TokenUsage,
     capability_mode: CapabilityMode,
+    permission_rules: Vec<ToolPermissionRule>,
 }
 
 impl AgentCheckpoint {
@@ -2212,6 +2504,7 @@ impl AgentCheckpoint {
             consecutive_auto_compaction_failures: agent.consecutive_auto_compaction_failures,
             cumulative_usage: agent.cumulative_usage,
             capability_mode: agent.capability_mode,
+            permission_rules: agent.permission_rules.clone(),
         }
     }
 
@@ -2224,6 +2517,7 @@ impl AgentCheckpoint {
         agent.consecutive_auto_compaction_failures = self.consecutive_auto_compaction_failures;
         agent.cumulative_usage = self.cumulative_usage;
         agent.capability_mode = agent.capability_mode.safest(self.capability_mode);
+        agent.permission_rules.clone_from(&self.permission_rules);
     }
 }
 
@@ -2671,6 +2965,29 @@ mod tests {
         executions: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct RecordingPermissionApprover {
+        decisions: Arc<Mutex<VecDeque<ToolPermissionDecision>>>,
+        requests: Arc<Mutex<Vec<RecordedPermissionRequest>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedPermissionRequest {
+        call: ToolCall,
+        effect: ToolEffect,
+        capability_mode: CapabilityMode,
+        suggestions: Vec<ToolPermissionRule>,
+    }
+
+    impl RecordingPermissionApprover {
+        fn new(decisions: impl IntoIterator<Item = ToolPermissionDecision>) -> Self {
+            Self {
+                decisions: Arc::new(Mutex::new(decisions.into_iter().collect())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
     struct ReadOnlyTool;
 
     struct ArgumentEffectTool {
@@ -2862,6 +3179,28 @@ mod tests {
         async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
             self.executions.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput::success("side effect completed"))
+        }
+    }
+
+    #[async_trait]
+    impl ToolPermissionApprover for RecordingPermissionApprover {
+        async fn decide(&self, request: ToolPermissionRequest) -> ToolPermissionDecision {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(RecordedPermissionRequest {
+                    call: request.call,
+                    effect: request.effect,
+                    capability_mode: request.capability_mode,
+                    suggestions: request.suggestions,
+                });
+            self.decisions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ToolPermissionDecision::Deny {
+                    message: "test approver had no decision".to_owned(),
+                })
         }
     }
 
@@ -3908,6 +4247,7 @@ mod tests {
                 last_usage: Some(TokenUsage::new(40, 5, 0)),
                 cumulative_usage: TokenUsage::new(40, 5, 0),
                 capability_mode: CapabilityMode::default(),
+                permission_rules: Vec::new(),
             })
             .await
             .unwrap();
@@ -3957,6 +4297,7 @@ mod tests {
                 last_usage: None,
                 cumulative_usage: TokenUsage::default(),
                 capability_mode: CapabilityMode::default(),
+                permission_rules: Vec::new(),
             })
             .await
             .unwrap();
@@ -4655,6 +4996,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_violation_can_be_approved_once_after_the_unknown_journal_is_saved() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let approver = RecordingPermissionApprover::new([ToolPermissionDecision::AllowOnce]);
+        let approval_requests = Arc::clone(&approver.requests);
+        let storage = RecordingStorage::default();
+        let provider = RecordingQueueProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-count",
+                        "count",
+                        json!({}),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+            requests: Arc::clone(&provider_requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build()
+            .with_session("permission-allow-once", storage.clone())
+            .await
+            .unwrap();
+
+        agent.prompt("run it").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(
+            provider_requests.lock().unwrap()[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "count")
+        );
+        let approval_requests = approval_requests.lock().unwrap();
+        assert_eq!(approval_requests.len(), 1);
+        assert_eq!(approval_requests[0].call.id, "call-count");
+        assert_eq!(approval_requests[0].effect, ToolEffect::ExternalSideEffect);
+        assert_eq!(
+            approval_requests[0].capability_mode,
+            CapabilityMode::WorkspaceEdit
+        );
+        assert_eq!(
+            approval_requests[0].suggestions,
+            [ToolPermissionRule::new("count", Some("{}".to_owned()))]
+        );
+        assert!(storage.snapshots.lock().unwrap().iter().any(|snapshot| {
+            snapshot.messages.iter().any(|message| {
+                message.tool_call_id.as_deref() == Some("call-count")
+                    && message.text_content() == Some(UNKNOWN_TOOL_RESULT)
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn remembered_permission_rule_applies_to_later_matching_calls_in_the_session() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let rule = ToolPermissionRule::new("count", Some("{}".to_owned()));
+        let approver =
+            RecordingPermissionApprover::new([ToolPermissionDecision::AllowForSession {
+                rule: rule.clone(),
+            }]);
+        let approval_requests = Arc::clone(&approver.requests);
+        let storage = InMemorySessionStorage::new();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![
+                        ToolCall::new("call-count-1", "count", json!({})),
+                        ToolCall::new("call-count-2", "count", json!({})),
+                    ]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build()
+            .with_session("permission-remember", storage.clone())
+            .await
+            .unwrap();
+
+        agent.prompt("run twice").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(approval_requests.lock().unwrap().len(), 1);
+        assert_eq!(agent.tool_permission_rules(), std::slice::from_ref(&rule));
+        assert_eq!(
+            storage
+                .load("permission-remember")
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_rules,
+            [rule]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_permission_returns_an_error_result_without_executing_the_tool() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let approver = RecordingPermissionApprover::new([ToolPermissionDecision::Deny {
+            message: "not now".to_owned(),
+        }]);
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-denied",
+                        "count",
+                        json!({}),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build();
+
+        agent.prompt("run it").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let result = agent
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-denied"))
+            .unwrap();
+        assert!(result.tool_result_is_error);
+        assert!(result.text_content().unwrap().contains("not now"));
+    }
+
+    #[tokio::test]
+    async fn explicit_name_policy_denial_cannot_be_overridden_by_an_approver() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let approver = RecordingPermissionApprover::new([ToolPermissionDecision::AllowOnce]);
+        let approval_requests = Arc::clone(&approver.requests);
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-policy-denied",
+                        "count",
+                        json!({}),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool_policy(ToolPolicy::allow_only(["inspect"]))
+            .tool(ReadOnlyTool)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build();
+
+        agent.prompt("forge a denied tool call").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(approval_requests.lock().unwrap().is_empty());
+        let result = agent
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-policy-denied"))
+            .unwrap();
+        assert!(result.tool_result_is_error);
+        assert!(result.text_content().unwrap().contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn remembered_permission_is_not_used_when_its_persistence_fails() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let rule = ToolPermissionRule::new("count", Some("{}".to_owned()));
+        let approver =
+            RecordingPermissionApprover::new([ToolPermissionDecision::AllowForSession { rule }]);
+        let storage = FailOnSaveStorage::new(3);
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-persist-denied",
+                        "count",
+                        json!({}),
+                    )]),
+                    usage: None,
+                },
+                ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                },
+            ])),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build()
+            .with_session("permission-persistence-failure", storage.clone())
+            .await
+            .unwrap();
+
+        agent.prompt("run it").await.unwrap();
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(agent.tool_permission_rules().is_empty());
+        let result = agent
+            .messages()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-persist-denied"))
+            .unwrap();
+        assert!(result.tool_result_is_error);
+        assert!(result.text_content().unwrap().contains("could not persist"));
+        assert!(storage.snapshot().unwrap().permission_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_permission_survives_a_later_tool_result_save_failure() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let rule = ToolPermissionRule::new("count", Some("{}".to_owned()));
+        let approver =
+            RecordingPermissionApprover::new([ToolPermissionDecision::AllowForSession {
+                rule: rule.clone(),
+            }]);
+        // User prompt, unknown journal, and permission rule saves succeed; the
+        // fourth save of the real tool result fails.
+        let storage = FailOnSaveStorage::new(4);
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([ProviderResponse {
+                message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                    "call-result-save-failure",
+                    "count",
+                    json!({}),
+                )]),
+                usage: None,
+            }])),
+        };
+        let mut agent = Agent::builder(provider)
+            .capability_mode(CapabilityMode::WorkspaceEdit)
+            .tool(CountingTool {
+                executions: Arc::clone(&executions),
+            })
+            .tool_permission_approver(approver)
+            .build()
+            .with_session("permission-result-save-failure", storage.clone())
+            .await
+            .unwrap();
+
+        assert!(agent.prompt("run it").await.is_err());
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.tool_permission_rules(), std::slice::from_ref(&rule));
+        let durable = storage.snapshot().unwrap();
+        assert_eq!(durable.permission_rules, [rule]);
+        for messages in [&durable.messages, agent.messages()] {
+            let result = messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("call-result-save-failure"))
+                .unwrap();
+            assert_eq!(result.text_content(), Some(UNKNOWN_TOOL_RESULT));
+        }
+    }
+
+    #[tokio::test]
     async fn invocation_effect_is_checked_at_execution_time() {
         let executions = Arc::new(AtomicUsize::new(0));
         let provider = RecordingQueueProvider {
@@ -4878,6 +5516,7 @@ mod tests {
                 last_usage: Some(TokenUsage::new(100, 20, 0)),
                 cumulative_usage: TokenUsage::new(250, 50, 0),
                 capability_mode: CapabilityMode::WorkspaceEdit,
+                permission_rules: Vec::new(),
             })
             .await
             .unwrap();

@@ -277,6 +277,22 @@ const en = {
   'ask.submit': 'Submit answer',
   'ask.submitting': 'Submitting…',
 
+  // Tool permission card
+  'permission.badge': 'permission',
+  'permission.title': 'The assistant needs permission',
+  'permission.summary':
+    '%{tool} wants to perform an action outside the current mode.',
+  'permission.effect': 'effect',
+  'permission.effect.readOnly': 'read only',
+  'permission.effect.internal': 'internal',
+  'permission.effect.workspaceWrite': 'workspace write',
+  'permission.effect.external': 'external side effect',
+  'permission.mode': 'mode',
+  'permission.rule': 'Remembered rule',
+  'permission.deny': 'Deny',
+  'permission.allowOnce': 'Allow once',
+  'permission.allowSession': 'Allow for session',
+
   // Settings
   'settings.title': 'Settings',
   'settings.eyebrow': 'Workspace connection',
@@ -611,6 +627,20 @@ const zh: Record<TranslationKey, string> = {
   'ask.previewPlaceholder': '选择一个选项以预览',
   'ask.submit': '提交回答',
   'ask.submitting': '提交中…',
+
+  'permission.badge': '权限',
+  'permission.title': '助手需要你的授权',
+  'permission.summary': '%{tool} 想执行超出当前模式权限范围的操作。',
+  'permission.effect': '影响范围',
+  'permission.effect.readOnly': '只读',
+  'permission.effect.internal': '内部操作',
+  'permission.effect.workspaceWrite': '工作区写入',
+  'permission.effect.external': '外部副作用',
+  'permission.mode': '当前模式',
+  'permission.rule': '会话记忆规则',
+  'permission.deny': '拒绝',
+  'permission.allowOnce': '仅允许本次',
+  'permission.allowSession': '本会话内允许',
 
   'settings.title': '设置',
   'settings.eyebrow': '工作区连接',

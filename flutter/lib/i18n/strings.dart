@@ -9,6 +9,14 @@ String capabilityModeLabel(S s, String mode) => switch (mode) {
   _ => s.capabilityWorkspaceEdit,
 };
 
+String toolEffectLabel(S s, String effect) => switch (effect) {
+  'read_only' => s.permissionEffectReadOnly,
+  'internal' => s.permissionEffectInternal,
+  'workspace_write' => s.permissionEffectWorkspaceWrite,
+  'external_side_effect' => s.permissionEffectExternal,
+  _ => effect,
+};
+
 /// Localized reasoning-effort label shown by the composer and its menu.
 String reasoningEffortLabel(S s, String? effort) => switch (effort) {
   null => s.reasoningDefault,
@@ -208,6 +216,23 @@ class S {
   String get otherHint => _t('Other…', '其他…');
   String get answer => _t('Answer', '回答');
   String get sent => _t('Sent', '已发送');
+
+  /* -------------------------- permission card -------------------------- */
+  String get permissionTitle => _t('Permission required', '需要授权');
+  String permissionSummary(String tool) => _t(
+    '$tool wants to perform an action outside the current mode.',
+    '$tool 想执行超出当前模式权限范围的操作。',
+  );
+  String permissionDetails(String effect, String mode) =>
+      _t('Effect: $effect · Mode: $mode', '影响范围：$effect · 当前模式：$mode');
+  String get permissionEffectReadOnly => _t('read only', '只读');
+  String get permissionEffectInternal => _t('internal', '内部操作');
+  String get permissionEffectWorkspaceWrite => _t('workspace write', '工作区写入');
+  String get permissionEffectExternal => _t('external side effect', '外部副作用');
+  String get permissionRule => _t('Remembered rule', '会话记忆规则');
+  String get permissionDeny => _t('Deny', '拒绝');
+  String get permissionAllowOnce => _t('Allow once', '仅允许本次');
+  String get permissionAllowSession => _t('Allow for session', '本会话内允许');
 
   /* --------------------------- workspace picker -------------------------- */
   String get noWorkspaceDefault =>

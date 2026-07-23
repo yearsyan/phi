@@ -11,7 +11,8 @@ use phi::{
     ProviderRetryReason, ProviderState, ReasoningEffort, Role, SkillDiagnostic, SkillInvocation,
     SkillMetadata, SubagentEvent, SubagentEventKind, SubagentNotification,
     SubagentResourceFinalization, SubagentResourceInfo, SubagentRunOutcome, SubagentSnapshot,
-    SubagentState, TokenUsage, ToolCall, ToolProgress, ValidatedSubagentOutput,
+    SubagentState, TokenUsage, ToolCall, ToolPermissionDecision, ToolPermissionRule, ToolProgress,
+    ValidatedSubagentOutput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +22,7 @@ use crate::{
         AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
         AskUserId, AskUserRequest, AssistantDraft, ContextCompactionPhase, ContextCompactionView,
         NamePolicy, PromptDefinition, PromptMode, RunId, RuntimeEvent, RuntimeEventKind, SessionId,
-        SubagentSummary, ToolCallDraft,
+        SubagentSummary, ToolCallDraft, ToolPermissionId, ToolPermissionPrompt,
     },
     scheduled_task::{
         CreateScheduledTask, ScheduledIntervalUnit, ScheduledRunOutcome, ScheduledTask,
@@ -533,6 +534,11 @@ pub enum ClientCommand {
         ask_id: AskUserId,
         answers: Vec<AskUserAnswer>,
     },
+    DecideToolPermission {
+        request_id: String,
+        permission_id: ToolPermissionId,
+        decision: ToolPermissionDecisionDto,
+    },
     Ping {
         request_id: String,
     },
@@ -548,7 +554,33 @@ impl ClientCommand {
             | Self::SetReasoningEffort { request_id, .. }
             | Self::SetCapabilityMode { request_id, .. }
             | Self::AnswerAskUser { request_id, .. }
+            | Self::DecideToolPermission { request_id, .. }
             | Self::Ping { request_id } => request_id,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolPermissionDecisionDto {
+    AllowOnce {},
+    AllowForSession {
+        rule: ToolPermissionRule,
+    },
+    Deny {
+        #[serde(default)]
+        message: Option<String>,
+    },
+}
+
+impl ToolPermissionDecisionDto {
+    pub fn into_decision(self) -> ToolPermissionDecision {
+        match self {
+            Self::AllowOnce {} => ToolPermissionDecision::AllowOnce,
+            Self::AllowForSession { rule } => ToolPermissionDecision::AllowForSession { rule },
+            Self::Deny { message } => ToolPermissionDecision::Deny {
+                message: message.unwrap_or_default(),
+            },
         }
     }
 }
@@ -765,6 +797,8 @@ pub struct SessionDto {
     pub draft: Option<AssistantDraftDto>,
     pub pending_asks: Vec<AskUserRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_tool_permissions: Vec<ToolPermissionPrompt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillSummaryDto>,
     pub subagents: Vec<SubagentSummaryDto>,
     pub usage: UsageDto,
@@ -800,6 +834,7 @@ impl From<&AgentView> for SessionDto {
                 .map(ContextCompactionStatusDto::from),
             draft: view.draft.as_ref().map(AssistantDraftDto::from),
             pending_asks: view.pending_asks.clone(),
+            pending_tool_permissions: view.pending_tool_permissions.clone(),
             skills: Vec::new(),
             subagents: view
                 .subagents
@@ -1390,6 +1425,16 @@ pub enum EventDto {
     AskUserCancelled {
         ask_id: AskUserId,
     },
+    ToolPermissionRequested {
+        request: ToolPermissionPrompt,
+    },
+    ToolPermissionResolved {
+        permission_id: ToolPermissionId,
+        allowed: bool,
+    },
+    ToolPermissionCancelled {
+        permission_id: ToolPermissionId,
+    },
     OperationFailed {
         operation: String,
         message: String,
@@ -1557,6 +1602,19 @@ impl EventDto {
             RuntimeEventKind::AskUserRequested { request } => Self::AskUserRequested { request },
             RuntimeEventKind::AskUserAnswered { ask_id } => Self::AskUserAnswered { ask_id },
             RuntimeEventKind::AskUserCancelled { ask_id } => Self::AskUserCancelled { ask_id },
+            RuntimeEventKind::ToolPermissionRequested { request } => {
+                Self::ToolPermissionRequested { request }
+            }
+            RuntimeEventKind::ToolPermissionResolved {
+                permission_id,
+                allowed,
+            } => Self::ToolPermissionResolved {
+                permission_id,
+                allowed,
+            },
+            RuntimeEventKind::ToolPermissionCancelled { permission_id } => {
+                Self::ToolPermissionCancelled { permission_id }
+            }
             RuntimeEventKind::OperationFailed { operation, message } => {
                 Self::OperationFailed { operation, message }
             }
@@ -2145,6 +2203,55 @@ mod tests {
             serde_json::json!({
                 "type": "capability_mode_changed",
                 "capability_mode": "full_access"
+            })
+        );
+    }
+
+    #[test]
+    fn tool_permission_command_and_events_use_stable_wire_names() {
+        let permission_id = ToolPermissionId::new();
+        let command: ClientCommand = serde_json::from_value(serde_json::json!({
+            "type": "decide_tool_permission",
+            "request_id": "permission-1",
+            "permission_id": permission_id,
+            "decision": {
+                "type": "allow_for_session",
+                "rule": { "tool_name": "bash", "pattern": "ls *" }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            ClientCommand::DecideToolPermission {
+                request_id,
+                permission_id: current,
+                decision: ToolPermissionDecisionDto::AllowForSession { rule },
+            } if request_id == "permission-1"
+                && current == permission_id
+                && rule == ToolPermissionRule::new("bash", Some("ls *".to_owned()))
+        ));
+
+        assert!(
+            serde_json::from_value::<ClientCommand>(serde_json::json!({
+                "type": "decide_tool_permission",
+                "request_id": "permission-wide",
+                "permission_id": permission_id,
+                "decision": { "type": "allow_once", "unexpected": true }
+            }))
+            .is_err()
+        );
+
+        let event = serde_json::to_value(EventDto::ToolPermissionResolved {
+            permission_id,
+            allowed: true,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "type": "tool_permission_resolved",
+                "permission_id": permission_id,
+                "allowed": true
             })
         );
     }

@@ -37,6 +37,7 @@ import type {
   TokenUsage,
   ToolCall,
   ToolCallDraft,
+  ToolPermissionPrompt,
   ToolProgress,
   Usage,
 } from '../types/wire.ts';
@@ -133,6 +134,7 @@ export interface SessionState {
   /** Live assistant draft (uncommitted). */
   draft: AssistantDraft | null;
   pendingAsks: AskUserRequest[];
+  pendingToolPermissions: ToolPermissionPrompt[];
   subagents: SubagentSummary[];
   history: PublicMessage[];
   /** UI-only status boundaries; compacted transcript content is never shown. */
@@ -164,6 +166,7 @@ export const initialSessionState: SessionState = {
   queuedRuns: 0,
   draft: null,
   pendingAsks: [],
+  pendingToolPermissions: [],
   subagents: [],
   history: [],
   compactions: [],
@@ -280,6 +283,7 @@ function fromSnapshot(
     queuedRuns: session.queued_runs,
     draft: cloneDraft(session.draft),
     pendingAsks: session.pending_asks,
+    pendingToolPermissions: session.pending_tool_permissions ?? [],
     subagents: session.subagents,
     history: session.history,
     compactions,
@@ -678,6 +682,26 @@ function applyEvent(
         ),
       };
 
+    case 'tool_permission_requested':
+      return {
+        ...state,
+        pendingToolPermissions: [
+          ...state.pendingToolPermissions.filter(
+            (request) => request.permission_id !== event.request.permission_id,
+          ),
+          event.request,
+        ],
+      };
+
+    case 'tool_permission_resolved':
+    case 'tool_permission_cancelled':
+      return {
+        ...state,
+        pendingToolPermissions: state.pendingToolPermissions.filter(
+          (request) => request.permission_id !== event.permission_id,
+        ),
+      };
+
     case 'operation_failed':
       return {
         ...state,
@@ -689,6 +713,8 @@ function applyEvent(
         ...state,
         fatalError: { code: 'actor_crashed', message: event.message },
         status: 'idle',
+        pendingAsks: [],
+        pendingToolPermissions: [],
       };
 
     case 'subagents_resynced':

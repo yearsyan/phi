@@ -11,7 +11,8 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
 - **Chat** — streaming assistant text with markdown + syntax highlighting,
   collapsible reasoning blocks, expandable tool-call rows (streaming args,
   progress lines, results, error states), per-turn activity summaries,
-  compaction dividers, `askuser` question cards, queued prompts, stop,
+  compaction dividers, `askuser` question cards, tool-permission approval
+  cards, queued prompts, stop,
   fork-from-reply, auto-generated titles, context-usage meter.
 - **In-session controls** — capability mode, model, reasoning effort,
   `/compact`, user-invocable skills via the slash palette.

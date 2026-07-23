@@ -17,6 +17,7 @@ import { FolderIcon, GearIcon, MenuIcon, SparkIcon } from '../common/Icons.tsx';
 import { AskCard } from './AskCard.tsx';
 import styles from './Chat.module.css';
 import { Composer } from './Composer.tsx';
+import { PermissionCard } from './PermissionCard.tsx';
 import { Timeline } from './Timeline.tsx';
 import { WorkspacePicker, workspaceName } from './WorkspacePicker.tsx';
 
@@ -62,6 +63,7 @@ export function Chat({
     sendPrompt,
     stop,
     answerAsk,
+    decideToolPermission,
     setModel,
     setReasoningEffort,
     setCapabilityMode,
@@ -120,7 +122,10 @@ export function Chat({
   const empty = timeline.items.length === 0;
   const isNewSession =
     empty && state.sessionId === null && connectionPhase === 'ready';
-  const hasPanels = state.pendingAsks.length > 0 || state.notices.length > 0;
+  const hasPanels =
+    state.pendingAsks.length > 0 ||
+    state.pendingToolPermissions.length > 0 ||
+    state.notices.length > 0;
   const activeProfileId = state.profileId ?? profileId;
   const displayedModel =
     state.config?.model ??
@@ -274,6 +279,13 @@ export function Chat({
             <div className={styles.panels}>
               {state.pendingAsks.map((ask) => (
                 <AskCard key={ask.ask_id} request={ask} onAnswer={answerAsk} />
+              ))}
+              {state.pendingToolPermissions.map((request) => (
+                <PermissionCard
+                  key={request.permission_id}
+                  request={request}
+                  onDecision={decideToolPermission}
+                />
               ))}
               {state.notices.slice(-4).map((notice, index, visible) => {
                 const sourceIndex =

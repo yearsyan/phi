@@ -4,6 +4,7 @@ mod ask_user;
 mod factory;
 mod id;
 mod registry;
+mod tool_permission;
 mod worktree;
 
 pub use actor::{
@@ -23,6 +24,7 @@ pub use factory::{
     AgentBuildRequest, AgentFactory, AgentFactoryError, BuiltAgent, ConfiguredAgentFactory,
     UnconfiguredAgentFactory, normalize_provider_config,
 };
-pub use id::{AskUserId, RunId, SessionId};
+pub use id::{AskUserId, RunId, SessionId, ToolPermissionId};
 pub use registry::{AgentRegistry, RegistryError, ShutdownFailure};
+pub use tool_permission::ToolPermissionPrompt;
 pub(crate) use worktree::WorktreeManager;

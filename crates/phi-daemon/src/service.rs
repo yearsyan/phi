@@ -447,6 +447,7 @@ impl ApplicationService {
             DEFAULT_AGENT_PROFILE_ID.to_owned(),
             None,
             None,
+            true,
         )
         .await
     }
@@ -462,6 +463,7 @@ impl ApplicationService {
             agent_profile_id.into(),
             capability_mode,
             None,
+            true,
         )
         .await
     }
@@ -478,6 +480,27 @@ impl ApplicationService {
             agent_profile_id.into(),
             capability_mode,
             Some(workspace),
+            true,
+        )
+        .await
+    }
+
+    /// Prepares a background session that cannot wait for a client approval.
+    /// Tools above its capability boundary remain unavailable instead of
+    /// creating an indefinitely pending permission request.
+    pub(crate) async fn prepare_noninteractive_session_configured_in_workspace(
+        &self,
+        profile_id: impl Into<String>,
+        agent_profile_id: impl Into<String>,
+        capability_mode: Option<CapabilityMode>,
+        workspace: Workspace,
+    ) -> Result<PreparedSession, ServiceError> {
+        self.prepare_session_with_options(
+            profile_id.into(),
+            agent_profile_id.into(),
+            capability_mode,
+            Some(workspace),
+            false,
         )
         .await
     }
@@ -494,6 +517,7 @@ impl ApplicationService {
             DEFAULT_AGENT_PROFILE_ID.to_owned(),
             None,
             Some(workspace),
+            true,
         )
         .await
     }
@@ -504,6 +528,7 @@ impl ApplicationService {
         agent_profile_id: String,
         capability_mode: Option<CapabilityMode>,
         workspace: Option<Workspace>,
+        interactive_tool_permissions: bool,
     ) -> Result<PreparedSession, ServiceError> {
         let _lifecycle = self.enter().await?;
         let session_id = SessionId::new();
@@ -532,7 +557,7 @@ impl ApplicationService {
             }
             .into());
         }
-        let handle = self.spawn_handle(session_id, built);
+        let handle = self.spawn_handle(session_id, built, interactive_tool_permissions);
         self.prepared
             .lock()
             .await
@@ -689,7 +714,7 @@ impl ApplicationService {
         if agent_profile_migrated {
             record.agent_profile = Some(built.agent_profile.clone());
         }
-        let handle = self.spawn_handle(session_id, built);
+        let handle = self.spawn_handle(session_id, built, true);
         if let Err(error) = handle
             .initialize(
                 record.clone(),
@@ -1008,11 +1033,16 @@ impl ApplicationService {
         &self.registry
     }
 
-    fn spawn_handle(&self, session_id: SessionId, mut built: BuiltAgent) -> AgentHandle {
+    fn spawn_handle(
+        &self,
+        session_id: SessionId,
+        mut built: BuiltAgent,
+        interactive_tool_permissions: bool,
+    ) -> AgentHandle {
         let subagents = self
             .subagents_enabled
             .then(|| self.install_subagents(session_id, &mut built));
-        AgentHandle::spawn_configured_with_skills_and_subagents(
+        AgentHandle::spawn_configured_with_skills_subagents_and_tool_permissions(
             session_id,
             built.agent,
             built.profile_id,
@@ -1021,6 +1051,7 @@ impl ApplicationService {
             built.reasoning_effort,
             built.skills,
             subagents,
+            interactive_tool_permissions,
         )
     }
 

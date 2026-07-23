@@ -5,6 +5,7 @@ pub mod context;
 pub mod error;
 pub mod hook;
 pub mod mcp;
+pub mod permission;
 pub mod provider;
 pub mod skills;
 pub mod storage;
@@ -35,6 +36,12 @@ pub use hook::{
 pub use mcp::{
     DEFAULT_MCP_CONNECT_TIMEOUT, DEFAULT_MCP_REQUEST_TIMEOUT, McpClient, McpClientOptions,
     McpHttpConfig, McpServerInfo, McpStdioConfig,
+};
+pub use permission::{
+    MAX_TOOL_PERMISSION_NAME_BYTES, MAX_TOOL_PERMISSION_PATTERN_BYTES, MAX_TOOL_PERMISSION_RULES,
+    MAX_TOOL_PERMISSION_TARGET_BYTES, ToolPermissionApprover, ToolPermissionDecision,
+    ToolPermissionRequest, ToolPermissionRule, ToolPermissionRuleError, escape_permission_pattern,
+    matches_permission_pattern,
 };
 pub use provider::{
     AnthropicMessagesProvider, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT,

@@ -12,6 +12,7 @@ import type {
   ReasoningEffort,
   ServerMessage,
   SkillInvocation,
+  ToolPermissionDecision,
 } from '../types/wire.ts';
 import type { SessionSocket } from '../ws/connection.ts';
 import { attachSession, openNewSession } from '../ws/sessionConnection.ts';
@@ -47,6 +48,10 @@ export interface DaemonSessionControls {
   sendPrompt: (text: string, skill?: SkillInvocation) => boolean;
   stop: () => void;
   answerAsk: (askId: string, answers: AskUserAnswer[]) => boolean;
+  decideToolPermission: (
+    permissionId: string,
+    decision: ToolPermissionDecision,
+  ) => boolean;
   setModel: (model: string) => void;
   setReasoningEffort: (effort: ReasoningEffort | null) => void;
   setCapabilityMode: (mode: CapabilityMode) => void;
@@ -400,6 +405,17 @@ export function useDaemonSession(
     [send],
   );
 
+  const decideToolPermission = useCallback(
+    (permissionId: string, decision: ToolPermissionDecision): boolean =>
+      send({
+        type: 'decide_tool_permission',
+        request_id: nextRequestId('permission'),
+        permission_id: permissionId,
+        decision,
+      }),
+    [send],
+  );
+
   const setModel = useCallback(
     (model: string) => {
       const value = model.trim();
@@ -464,6 +480,7 @@ export function useDaemonSession(
     sendPrompt,
     stop,
     answerAsk,
+    decideToolPermission,
     setModel,
     setReasoningEffort,
     setCapabilityMode,

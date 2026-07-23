@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use crate::{
     Workspace,
     error::ToolError,
+    permission::{escape_permission_pattern, matches_permission_pattern},
     types::{Content, ContentPart, ToolDefinition},
 };
 
@@ -524,6 +525,30 @@ pub trait Tool: Send + Sync {
     /// execution use this argument-aware value.
     fn effect_for(&self, _arguments: &Value) -> ToolEffect {
         self.effect()
+    }
+
+    /// Stable, user-visible value used by remembered permission rules.
+    ///
+    /// Tools with a natural authorization key (for example a shell command or
+    /// file path) should override this. The provider-neutral fallback is the
+    /// compact JSON argument object.
+    fn permission_target(&self, arguments: &Value) -> String {
+        arguments.to_string()
+    }
+
+    /// Returns whether one remembered pattern covers this invocation.
+    fn matches_permission_pattern(&self, arguments: &Value, pattern: &str) -> bool {
+        matches_permission_pattern(pattern, &self.permission_target(arguments))
+    }
+
+    /// Suggests argument patterns a host may offer for a session-scoped grant.
+    ///
+    /// The default is an exact match. Hosts must not silently broaden this to a
+    /// tool-wide rule.
+    fn permission_rule_suggestions(&self, arguments: &Value) -> Vec<String> {
+        vec![escape_permission_pattern(
+            &self.permission_target(arguments),
+        )]
     }
 
     /// Classifies this invocation for in-batch scheduling.
