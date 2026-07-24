@@ -20,6 +20,7 @@ mod auth;
 mod dto;
 mod http;
 mod scheduled_task;
+mod web;
 mod workspace;
 mod ws;
 
@@ -94,12 +95,8 @@ pub fn router(state: AppState) -> Router {
     Router::<AppState>::new()
         .merge(protected_http)
         .merge(ws::routes())
-        .fallback(not_found)
+        .fallback(web::serve_embedded_web_client)
         .with_state(state)
-}
-
-async fn not_found() -> StatusCode {
-    StatusCode::NOT_FOUND
 }
 
 #[derive(Debug)]

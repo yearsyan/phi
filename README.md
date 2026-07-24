@@ -976,7 +976,18 @@ query 和 fragment 的绝对 HTTP(S) URL。
 
 ### Web client
 
-`web/` 提供 React/Vite 客户端。开发服务器会把 `/v1` HTTP 与 WebSocket 请求代理到
+`web/` 提供 React/Vite 客户端。daemon 编译时会把 `web/dist` 嵌入二进制（类似 Go
+`embed.FS`），发布后启动单个 `phi-daemon` 即可在同一地址同时提供 Web 界面与
+HTTP/WebSocket API；`/v1` 保持纯 API 语义，其他 GET/HEAD 路径返回嵌入文件，未知
+客户端路由回退到 `index.html`。发布前应先后构建两端：
+
+```bash
+cd web && pnpm install && pnpm build && cd ..
+cargo build --release -p phi-daemon
+```
+
+debug 构建在运行时从磁盘读取 `web/dist`；`web/dist` 从未构建过时，daemon 嵌入并
+提供一个占位页面。开发时仍可分别启动：开发服务器会把 `/v1` HTTP 与 WebSocket 请求代理到
 默认的 `http://127.0.0.1:8787` daemon。可用 `PHI_WEB_DAEMON_PROXY_TARGET` 覆盖目标；
 连接使用自签名证书的 TLS daemon 时，应通过 `NODE_EXTRA_CA_CERTS` 显式信任证书：
 

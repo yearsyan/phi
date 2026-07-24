@@ -331,6 +331,33 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
 
 `GET /v1/sessions` 不会为了统计离线 session 而加载全部 transcript。因此 `offline` session 的 `message_count` 为 `null`，不代表磁盘历史为空。
 
+## 内置 Web 客户端静态服务
+
+daemon 编译时把 `web/dist`（`pnpm build` 产物）以类似 Go `embed.FS` 的方式嵌入
+二进制，启动后在同一监听地址上直接提供 Web 客户端，无需单独的静态服务器：
+
+- 不匹配任何 `/v1` 路由的 GET/HEAD 请求按路径返回嵌入文件；`/` 返回 `index.html`。
+- 找不到的客户端路由回退到 `index.html`（SPA history 路由）；路径最后一段含 `.`
+  的 asset 类请求找不到时返回 `404`，不会错误地返回 HTML shell。
+- `/v1` 及 `/v1/*` 保持纯 API 语义：未知路径仍返回 `404`，鉴权与 JSON 错误不变；
+  非 GET/HEAD 请求返回 `405`。
+- `assets/` 下由 Vite 生成的带内容哈希的文件返回
+  `Cache-Control: public, max-age=31536000, immutable`；其他文件（含 `index.html`）
+  返回 `Cache-Control: no-cache`，重新部署后立即生效。
+- 静态服务与 HTTP/WebSocket API 共用同一地址；启用 TLS 时走同一 listener。
+
+发布单个 daemon 二进制时应先构建前端再编译：
+
+```bash
+cd web && pnpm install && pnpm build && cd ..
+cargo build --release -p phi-daemon
+```
+
+`web/dist` 不存在时 build.rs 会生成占位 `index.html`（提示先构建前端），因此不构建
+前端也能编译 daemon。debug 构建在运行时从磁盘读取 `web/dist`，前端重建后无需重编
+daemon；release 构建把文件真正嵌入二进制，build.rs 已监听 dist 内容变化，`pnpm
+build` 后的下一次 `cargo build` 会自动重新嵌入。
+
 ## HTTP API
 
 除 WebSocket upgrade 和不存在的 fallback 路径外，所有 `/v1` HTTP 接口都要求长期 key：
