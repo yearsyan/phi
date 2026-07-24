@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Flutter builds CMake's INSTALL target. CMake's NuGet resolver only sees
+    package references attached directly to the requested target, so restore
+    the runner before INSTALL resolves and builds its project references.
+  -->
+  <Target
+      Name="RestorePhiWindowsAppSdkPackages"
+      BeforeTargets="ResolveProjectReferences"
+      Condition="'$(MSBuildProjectName)' == 'INSTALL'">
+    <Exec
+        Command="&quot;$(MSBuildToolsPath)\MSBuild.exe&quot; &quot;$(MSBuildThisFileDirectory)runner\@BINARY_NAME@.vcxproj&quot; /t:Restore /p:Configuration=$(Configuration) /p:Platform=$(Platform) /v:minimal" />
+  </Target>
+</Project>

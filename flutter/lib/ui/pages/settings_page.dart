@@ -118,6 +118,25 @@ class SettingsPage extends StatelessWidget {
                       }
                     },
                   ),
+                  const SizedBox(height: 16),
+                  const Divider(),
+                  const SizedBox(height: 12),
+                  Text(s.about, style: theme.textTheme.titleSmall),
+                  const SizedBox(height: 8),
+                  Card(
+                    clipBehavior: Clip.antiAlias,
+                    child: ListTile(
+                      leading: const Icon(Icons.description_outlined),
+                      title: Text(s.openSourceLicenses),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => showLicensePage(
+                        context: context,
+                        applicationName: s.appTitle,
+                        applicationLegalese: s.thirdPartyLegalese,
+                        useRootNavigator: true,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),

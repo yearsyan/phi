@@ -10,8 +10,10 @@ add_executable(${BINARY_NAME} WIN32
   "flutter_window.cpp"
   "image_attachment_picker.cpp"
   "main.cpp"
+  "title_bar_overlay.cpp"
   "utils.cpp"
   "win32_window.cpp"
+  "window_controls.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -20,6 +22,23 @@ add_executable(${BINARY_NAME} WIN32
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+
+# AppWindowTitleBar provides the Windows title-bar overlay while preserving the
+# system caption buttons. Keep the Windows App SDK component self-contained so
+# unpackaged Flutter builds do not require a separately installed runtime.
+set_property(TARGET ${BINARY_NAME} PROPERTY VS_PACKAGE_REFERENCES
+  "Microsoft.WindowsAppSDK.InteractiveExperiences_1.8.260125001;Microsoft.Windows.CppWinRT_2.0.230706.1")
+set_property(TARGET ${BINARY_NAME} PROPERTY
+  VS_GLOBAL_WindowsPackageType "None")
+set_property(TARGET ${BINARY_NAME} PROPERTY
+  VS_GLOBAL_WindowsAppSDKSelfContained "true")
+# CMake's native vcxproj generator leaves TargetFrameworkMoniker empty, while
+# NuGet restores native packages as "native,Version=v0.0". Keep MSBuild's
+# package asset resolution on the same target.
+set_property(TARGET ${BINARY_NAME} PROPERTY
+  VS_GLOBAL_TargetFrameworkMoniker "native,Version=v0.0")
+set_property(TARGET ${BINARY_NAME} PROPERTY
+  VS_GLOBAL_NuGetTargetMoniker "native,Version=v0.0")
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")

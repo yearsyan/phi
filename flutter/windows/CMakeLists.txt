@@ -2,9 +2,24 @@
 cmake_minimum_required(VERSION 3.14)
 project(phi_client LANGUAGES CXX)
 
+# CMake 3.23+ can restore VS_PACKAGE_REFERENCES before native compilation.
+# Older supported generators ignore this variable and can still restore through
+# Visual Studio/MSBuild.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.23")
+  set(CMAKE_VS_NUGET_PACKAGE_RESTORE ON CACHE BOOL
+    "Restore Windows App SDK PackageReferences before building." FORCE)
+endif()
+
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
 set(BINARY_NAME "phi_client")
+
+# Make Windows App SDK PackageReference restore work when Flutter requests
+# CMake's aggregate INSTALL target instead of the runner target directly.
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/windows_app_sdk_restore.targets.in"
+  "${CMAKE_BINARY_DIR}/Directory.Build.targets"
+  @ONLY)
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.

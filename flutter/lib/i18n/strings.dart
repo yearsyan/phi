@@ -56,6 +56,10 @@ class S {
   String get copy => _t('Copy', '复制');
   String get settings => _t('Settings', '设置');
   String get appTitle => _t('Phi', 'Phi');
+  String get minimizeWindow => _t('Minimize', '最小化');
+  String get maximizeWindow => _t('Maximize', '最大化');
+  String get restoreWindow => _t('Restore', '还原');
+  String get closeWindow => _t('Close window', '关闭窗口');
 
   /* ----------------------------- home shell ------------------------------ */
   String get selectSessionHint =>
@@ -345,6 +349,12 @@ class S {
       _t('Default capability mode for new sessions', '新会话的默认能力模式');
   String get language => _t('Language', '语言');
   String get languageSystem => _t('System', '跟随系统');
+  String get about => _t('About', '关于');
+  String get openSourceLicenses => _t('Open-source licenses', '开源许可证');
+  String get thirdPartyLegalese => _t(
+    'Bundled fonts and third-party software retain their respective licenses.',
+    '内置字体和第三方软件保留各自的许可证。',
+  );
 
   /* ------------------------------ usage detail --------------------------- */
   String get contextUsageTitle => _t('Context usage', '上下文用量');

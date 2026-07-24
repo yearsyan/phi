@@ -9,6 +9,7 @@
 #include "win32_window.h"
 
 class ImageAttachmentPicker;
+class WindowControls;
 
 // A window that hosts the Flutter view and the runner-owned platform channels.
 class FlutterWindow : public Win32Window {
@@ -33,6 +34,9 @@ class FlutterWindow : public Win32Window {
 
   // Native Windows image file picker exposed to the shared Dart composer.
   std::unique_ptr<ImageAttachmentPicker> image_attachment_picker_;
+
+  // Native window operations used by the Flutter-rendered title bar.
+  std::unique_ptr<WindowControls> window_controls_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

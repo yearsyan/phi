@@ -1026,6 +1026,16 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 prepared session、attach/resync 和 sequence gap 语义。应用包含 session/chat、workspace、
 scheduled task、askuser、工具权限审批、模型与 capability 控制，当前平台工程覆盖 Android、iOS、macOS、
 Windows 与 HarmonyOS/OpenHarmony。Provider 配置仍由 Web 客户端或 HTTP API 管理。
+应用随包提供未裁剪的 Noto Sans SC 可变字体，以统一各平台的中英文界面字形和
+100–900 字重；字体按 SIL Open Font License 1.1 再分发，并可从 Settings → About →
+Open-source licenses 查看完整许可证。
+Windows 客户端使用 Windows App SDK `AppWindowTitleBar` 的 Title Bar Overlay
+把 Flutter 内容延伸至标题栏区域，自绘图标、标题和背景；系统继续原生绘制并处理
+最小化、最大化/还原和关闭按钮。客户端根据系统上报的 `RightInset` 精确留位，
+从而保留原生 hover、辅助功能与 Windows 11 Snap Layout。标准可调整大小窗口样式
+继续提供四边和四角缩放；窗口另有一条物理像素的柔和轮廓和轻微分层的标题栏底色。
+最小尺寸为 DPI 感知的 640×480 逻辑像素，最大化客户区和 DWM 可见边界限制在
+当前显示器工作区内。
 GitHub 每次 push 会构建并上传 `phi-client-windows-x64` Actions artifact，还会使用 Actions
 secrets 中的专用 Android release key 构建仅含 ARM64 ABI 的包、验签并上传
 `phi-client-android-release.apk`；依赖、签名变量和本地构建方式见

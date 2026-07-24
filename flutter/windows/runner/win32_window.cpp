@@ -3,7 +3,10 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
+#include <algorithm>
+
 #include "resource.h"
+#include "title_bar_overlay.h"
 
 namespace {
 
@@ -15,7 +18,22 @@ namespace {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+
 constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
+
+// AppWindowTitleBar extends Flutter into the title bar while preserving the
+// standard window capabilities and system-owned caption controls.
+constexpr DWORD kTitleBarOverlayWindowStyle = WS_OVERLAPPEDWINDOW;
+static_assert((kTitleBarOverlayWindowStyle & WS_CAPTION) == WS_CAPTION);
+
+constexpr int kMinimumWindowWidth = 640;
+constexpr int kMinimumWindowHeight = 480;
+constexpr UINT kDefaultDpi = 96;
+constexpr COLORREF kLightDwmBorderColor = RGB(190, 190, 194);
+constexpr COLORREF kDarkDwmBorderColor = RGB(72, 72, 76);
 
 /// Registry key for app theme preference.
 ///
@@ -35,6 +53,24 @@ using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 // scale factor.
 int Scale(int source, double scale_factor) {
   return static_cast<int>(source * scale_factor);
+}
+
+UINT WindowDpi(HWND window) {
+  const UINT dpi = GetDpiForWindow(window);
+  return dpi == 0 ? kDefaultDpi : dpi;
+}
+
+bool GetMonitorBounds(HWND window, RECT* monitor_bounds, RECT* work_area) {
+  const HMONITOR monitor =
+      MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (!GetMonitorInfo(monitor, &monitor_info)) {
+    return false;
+  }
+  *monitor_bounds = monitor_info.rcMonitor;
+  *work_area = monitor_info.rcWork;
+  return true;
 }
 
 // Dynamically loads EnableNonClientDpiScaling from the User32 module.
@@ -132,7 +168,7 @@ bool Win32Window::Create(const std::wstring& title,
   double scale_factor = dpi / 96.0;
 
   HWND window = CreateWindow(
-      window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
+      window_class, title.c_str(), kTitleBarOverlayWindowStyle,
       Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
       Scale(size.width, scale_factor), Scale(size.height, scale_factor), nullptr,
       nullptr, GetModuleHandle(nullptr), this);
@@ -141,12 +177,16 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  title_bar_overlay_enabled_ = EnableTitleBarOverlay(window);
   UpdateTheme(window);
 
   return OnCreate();
 }
 
 bool Win32Window::Show() {
+  if (title_bar_overlay_enabled_) {
+    UpdateTitleBarOverlayLayout(window_handle_);
+  }
   return ShowWindow(window_handle_, SW_SHOWNORMAL);
 }
 
@@ -175,6 +215,27 @@ LRESULT Win32Window::MessageHandler(HWND hwnd,
                                     WPARAM const wparam,
                                     LPARAM const lparam) noexcept {
   switch (message) {
+    case WM_GETMINMAXINFO: {
+      auto* constraints = reinterpret_cast<MINMAXINFO*>(lparam);
+      RECT monitor_bounds{};
+      RECT work_area{};
+      if (GetMonitorBounds(hwnd, &monitor_bounds, &work_area)) {
+        constraints->ptMaxPosition.x = work_area.left - monitor_bounds.left;
+        constraints->ptMaxPosition.y = work_area.top - monitor_bounds.top;
+        constraints->ptMaxSize.x = work_area.right - work_area.left;
+        constraints->ptMaxSize.y = work_area.bottom - work_area.top;
+      }
+
+      const UINT dpi = WindowDpi(hwnd);
+      constraints->ptMinTrackSize.x = std::max<LONG>(
+          constraints->ptMinTrackSize.x,
+          MulDiv(kMinimumWindowWidth, dpi, kDefaultDpi));
+      constraints->ptMinTrackSize.y = std::max<LONG>(
+          constraints->ptMinTrackSize.y,
+          MulDiv(kMinimumWindowHeight, dpi, kDefaultDpi));
+      return 0;
+    }
+
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -190,6 +251,9 @@ LRESULT Win32Window::MessageHandler(HWND hwnd,
 
       SetWindowPos(hwnd, nullptr, new_rect_size->left, new_rect_size->top,
                    new_width, new_height, SWP_NOZORDER | SWP_NOACTIVATE);
+      if (title_bar_overlay_enabled_) {
+        UpdateTitleBarOverlayLayout(hwnd);
+      }
 
       return 0;
     }
@@ -200,16 +264,20 @@ LRESULT Win32Window::MessageHandler(HWND hwnd,
         MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
                    rect.bottom - rect.top, TRUE);
       }
+      if (title_bar_overlay_enabled_) {
+        UpdateTitleBarOverlayLayout(hwnd);
+      }
       return 0;
     }
 
     case WM_ACTIVATE:
-      if (child_content_ != nullptr) {
+      if (LOWORD(wparam) != WA_INACTIVE && child_content_ != nullptr) {
         SetFocus(child_content_);
       }
-      return 0;
+      break;
 
     case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_DWMCOMPOSITIONCHANGED:
       UpdateTheme(hwnd);
       return 0;
   }
@@ -224,6 +292,7 @@ void Win32Window::Destroy() {
     DestroyWindow(window_handle_);
     window_handle_ = nullptr;
   }
+  title_bar_overlay_enabled_ = false;
   if (g_active_window_count == 0) {
     WindowClassRegistrar::GetInstance()->UnregisterWindowClass();
   }
@@ -269,15 +338,20 @@ void Win32Window::OnDestroy() {
 }
 
 void Win32Window::UpdateTheme(HWND const window) {
-  DWORD light_mode;
+  DWORD light_mode = 1;
   DWORD light_mode_size = sizeof(light_mode);
   LSTATUS result = RegGetValue(HKEY_CURRENT_USER, kGetPreferredBrightnessRegKey,
                                kGetPreferredBrightnessRegValue,
                                RRF_RT_REG_DWORD, nullptr, &light_mode,
                                &light_mode_size);
+  const bool dark_mode = result == ERROR_SUCCESS && light_mode == 0;
+  const COLORREF border_color =
+      dark_mode ? kDarkDwmBorderColor : kLightDwmBorderColor;
+  DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &border_color,
+                        sizeof(border_color));
 
   if (result == ERROR_SUCCESS) {
-    BOOL enable_dark_mode = light_mode == 0;
+    BOOL enable_dark_mode = dark_mode;
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
                           &enable_dark_mode, sizeof(enable_dark_mode));
   }

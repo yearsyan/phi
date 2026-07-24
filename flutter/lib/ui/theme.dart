@@ -8,6 +8,9 @@ import 'package:flutter/material.dart';
 class AppTheme {
   AppTheme._();
 
+  /// Full, unsubsetted Simplified Chinese variable font bundled with the app.
+  static const textFontFamily = 'NotoSansSC';
+
   /* ------------------------------ palette -------------------------------- */
 
   static const lightAccent = Color(0xFF007AFF);
@@ -110,7 +113,7 @@ class AppTheme {
             .apply(
               bodyColor: label,
               displayColor: label,
-              fontFamilyFallback: const ['.AppleSystemUIFont', 'PingFang SC'],
+              fontFamily: textFontFamily,
             );
 
     final flatButtonShape = RoundedRectangleBorder(

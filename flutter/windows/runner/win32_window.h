@@ -94,6 +94,9 @@ class Win32Window {
 
   // Window handle for hosted content.
   HWND child_content_ = nullptr;
+
+  // True when AppWindowTitleBar owns the title-bar overlay and caption UI.
+  bool title_bar_overlay_enabled_ = false;
 };
 
 #endif  // RUNNER_WIN32_WINDOW_H_

@@ -26,6 +26,25 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
 Provider configuration is intentionally not included (managed via the web
 client or `PUT /v1/providers`).
 
+## Bundled font and licensing
+
+The app bundles the complete, unmodified Noto Sans SC variable font so Latin
+and Simplified Chinese UI text use one consistent family on every supported
+platform. Its `wght` axis covers weights 100–900; the uncompressed font asset
+adds about 17.8 MB to the source asset bundle.
+
+Noto Sans SC is redistributed under the SIL Open Font License 1.1. The
+copyright notice, pinned Google Fonts revision, SHA-256 digest, and full
+license are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Users can read the license in the app under **Settings → About → Open-source
+licenses**.
+
+The self-contained Windows build also bundles the Microsoft Windows App SDK
+license terms and the Microsoft.Windows.CppWinRT MIT license. Their pinned
+NuGet versions, sources, and bundled license paths are recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and shown on the same
+in-app license page.
+
 ## Architecture
 
 ```
@@ -116,6 +135,26 @@ multi-image attachment flow as Android, backed by the native file picker and
 Windows Imaging Component. Selected images are oriented, resized, converted to
 JPEG, and compressed before entering the daemon prompt. QR scanning remains
 mobile-only.
+
+The Windows runner uses Windows App SDK `AppWindowTitleBar` with
+`ExtendsContentIntoTitleBar` enabled. Flutter renders the app icon, title, and
+background in the title-bar area, while Windows keeps native ownership of the
+minimize, maximize/restore, and close buttons. Flutter reserves the reported
+`RightInset`, so it never places interactive content beneath those controls.
+Native hover, accessibility, the maximize-button Snap Layout flyout, and the
+standard four-edge/four-corner resize behavior are preserved. The remaining
+title area is registered as a system drag region; the Flutter gesture remains
+as a fallback.
+
+The runner references Windows App SDK Interactive Experiences 1.8 and
+Microsoft.Windows.CppWinRT through NuGet. Flutter builds request CMake's
+aggregate `INSTALL` target, so a generated MSBuild hook restores these packages
+before the runner is evaluated. The selected Windows App SDK component is
+self-contained in the application bundle. A subtle one-physical-pixel outline
+and lightly differentiated title surface keep the floating window distinct
+from content behind it. The DPI-aware minimum window size is 640×480 logical
+pixels; when maximized, both the client area and DWM visible frame match the
+current monitor's work area.
 
 On every GitHub push, `.github/workflows/build-windows-client-release.yml`
 builds this release bundle with Flutter 3.44.6 and uploads the

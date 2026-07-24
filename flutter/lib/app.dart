@@ -4,6 +4,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'state/app_state.dart';
 import 'ui/home_shell.dart';
 import 'ui/theme.dart';
+import 'ui/widgets/windows_title_bar.dart';
 
 /// Root widget: injects [AppState] and builds the adaptive shell.
 class PhiApp extends StatelessWidget {
@@ -39,6 +40,8 @@ class PhiApp extends StatelessWidget {
             ],
             theme: AppTheme.light(),
             darkTheme: AppTheme.dark(),
+            builder: (context, child) =>
+                WindowsWindowFrame(child: child ?? const SizedBox.shrink()),
             home: const HomeShell(),
           );
         },
