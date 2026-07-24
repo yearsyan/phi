@@ -11,6 +11,14 @@ class AppTheme {
   /// Full, unsubsetted Simplified Chinese variable font bundled with the app.
   static const textFontFamily = 'NotoSansSC';
 
+  static final PageTransitionsTheme _pageTransitionsTheme =
+      PageTransitionsTheme(
+        builders: <TargetPlatform, PageTransitionsBuilder>{
+          ...const PageTransitionsTheme().builders,
+          TargetPlatform.windows: const WindowsPageTransitionsBuilder(),
+        },
+      );
+
   /* ------------------------------ palette -------------------------------- */
 
   static const lightAccent = Color(0xFF007AFF);
@@ -126,6 +134,7 @@ class AppTheme {
       colorScheme: scheme,
       scaffoldBackgroundColor: background,
       textTheme: textTheme,
+      pageTransitionsTheme: _pageTransitionsTheme,
       splashFactory: InkSparkle.constantTurbulenceSeedSplashFactory,
       highlightColor: fill.withAlpha(80),
       hoverColor: fill.withAlpha(60),
@@ -326,6 +335,47 @@ class AppTheme {
           color: isDark ? darkLabel : darkLabel,
           fontSize: 12,
         ),
+      ),
+    );
+  }
+}
+
+/// A compact desktop route transition without the default full-page zoom.
+class WindowsPageTransitionsBuilder extends PageTransitionsBuilder {
+  const WindowsPageTransitionsBuilder();
+
+  static const forwardDuration = Duration(milliseconds: 180);
+  static const backwardDuration = Duration(milliseconds: 140);
+  static const _beginOffset = Offset(0.012, 0);
+
+  @override
+  Duration get transitionDuration => forwardDuration;
+
+  @override
+  Duration get reverseTransitionDuration => backwardDuration;
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    final progress = CurvedAnimation(
+      parent: animation,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+    return FadeTransition(
+      opacity: progress,
+      child: SlideTransition(
+        position: Tween<Offset>(
+          begin: _beginOffset,
+          end: Offset.zero,
+        ).animate(progress),
+        transformHitTests: false,
+        child: child,
       ),
     );
   }
