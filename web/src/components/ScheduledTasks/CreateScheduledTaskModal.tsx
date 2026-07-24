@@ -125,6 +125,10 @@ export function CreateScheduledTaskModal({
         intervalEvery <= maxIntervalValue(intervalUnit);
   const canCreate =
     name.trim().length > 0 && prompt.trim().length > 0 && scheduleIsValid;
+  const selectedAgentProfileMcp =
+    agentProfiles.find(
+      (profile) => profile.agent_profile_id === selectedAgentProfile,
+    )?.mcp_profile_ids ?? [];
 
   const submit = async () => {
     if (!canCreate || submitting) return;
@@ -283,6 +287,13 @@ export function CreateScheduledTaskModal({
                   </option>
                 ))}
               </select>
+              <small>
+                {selectedAgentProfileMcp.length > 0
+                  ? t('scheduled.field.agentProfileMcp', {
+                      profiles: selectedAgentProfileMcp.join(', '),
+                    })
+                  : t('scheduled.field.agentProfileNoMcp')}
+              </small>
             </label>
 
             <label className={styles.field}>

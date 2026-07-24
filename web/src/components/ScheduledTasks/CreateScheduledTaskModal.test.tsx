@@ -82,6 +82,56 @@ describe('CreateScheduledTaskModal', () => {
     );
   });
 
+  it('shows the MCP profiles linked by the selected agent profile', async () => {
+    apiMocks.listAgentProfiles.mockResolvedValue({
+      agent_profiles: [
+        {
+          agent_profile_id: 'default',
+          mcp_profile_ids: ['search', 'filesystem'],
+        },
+      ],
+    });
+    render(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onCreate={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText('MCP: search, filesystem')).toBeTruthy(),
+    );
+  });
+
+  it('explains that MCP tools come from the agent profile when none are linked', async () => {
+    render(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onCreate={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          'No MCP linked. MCP tools come from the Agent Profile; configure them in Settings.',
+        ),
+      ).toBeTruthy(),
+    );
+  });
+
   it('switches to an interval schedule', async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
     render(

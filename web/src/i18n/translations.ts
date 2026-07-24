@@ -116,6 +116,9 @@ const en = {
   'scheduled.field.promptPlaceholder': 'Enter the task prompt',
   'scheduled.field.provider': 'Provider profile',
   'scheduled.field.agentProfile': 'Agent Profile',
+  'scheduled.field.agentProfileMcp': 'MCP: %{profiles}',
+  'scheduled.field.agentProfileNoMcp':
+    'No MCP linked. MCP tools come from the Agent Profile; configure them in Settings.',
   'scheduled.field.capability': 'Access',
   'scheduled.field.schedule': 'Schedule',
   'scheduled.capability.profile': 'Use Agent Profile default',
@@ -600,6 +603,9 @@ const zh: Record<TranslationKey, string> = {
   'scheduled.field.promptPlaceholder': '输入任务提示词',
   'scheduled.field.provider': 'Provider profile',
   'scheduled.field.agentProfile': 'Agent Profile',
+  'scheduled.field.agentProfileMcp': '关联 MCP：%{profiles}',
+  'scheduled.field.agentProfileNoMcp':
+    '未关联 MCP。定时任务通过 Agent Profile 引用 MCP，可在设置页配置。',
   'scheduled.field.capability': '权限',
   'scheduled.field.schedule': '定时设置',
   'scheduled.capability.profile': '使用 Agent Profile 默认值',
