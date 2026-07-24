@@ -3,9 +3,12 @@ import type {
   AgentProfilesResponse,
   CreateScheduledTaskRequest,
   ForkPosition,
+  McpProfileResponse,
+  McpProfilesResponse,
   ProviderResponse,
   ProvidersResponse,
   PutAgentProfileRequest,
+  PutMcpProfileRequest,
   PutProviderRequest,
   ScheduledTask,
   ScheduledTasksResponse,
@@ -226,6 +229,35 @@ export function putAgentProfile(
 ): Promise<AgentProfileResponse> {
   return http<AgentProfileResponse>(
     `/v1/agent-profiles/${encodeURIComponent(agentProfileId)}`,
+    authKey,
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
+}
+
+export function listMcpProfiles(authKey: string): Promise<McpProfilesResponse> {
+  return http<McpProfilesResponse>('/v1/mcp-profiles', authKey, {
+    method: 'GET',
+  });
+}
+
+export function getMcpProfile(
+  authKey: string,
+  mcpProfileId: string,
+): Promise<McpProfileResponse> {
+  return http<McpProfileResponse>(
+    `/v1/mcp-profiles/${encodeURIComponent(mcpProfileId)}`,
+    authKey,
+    { method: 'GET' },
+  );
+}
+
+export function putMcpProfile(
+  authKey: string,
+  mcpProfileId: string,
+  body: PutMcpProfileRequest,
+): Promise<McpProfileResponse> {
+  return http<McpProfileResponse>(
+    `/v1/mcp-profiles/${encodeURIComponent(mcpProfileId)}`,
     authKey,
     { method: 'PUT', body: JSON.stringify(body) },
   );

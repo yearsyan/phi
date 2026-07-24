@@ -13,7 +13,7 @@ use crate::{
     runtime::{AgentFactoryError, AgentHandleError},
     scheduled_task::{ScheduledTaskError, ScheduledTaskManager},
     service::ServiceError,
-    store::AgentProfileStoreError,
+    store::{AgentProfileStoreError, McpProfileStoreError},
 };
 
 mod auth;
@@ -139,11 +139,27 @@ impl ApiError {
                 StatusCode::NOT_IMPLEMENTED,
                 "agent_profile_management_unavailable",
             ),
+            ServiceError::McpProfileManagementUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
+                "mcp_profile_management_unavailable",
+            ),
             ServiceError::AgentProfileStore(AgentProfileStoreError::Validation(_))
+            | ServiceError::AgentProfileValidation(_)
+            | ServiceError::InvalidMcpProfileReference { .. }
             | ServiceError::Factory(
                 AgentFactoryError::AgentProfile(_)
-                | AgentFactoryError::AgentProfileUnavailable { .. },
+                | AgentFactoryError::AgentProfileUnavailable { .. }
+                | AgentFactoryError::McpProfileUnavailable { .. }
+                | AgentFactoryError::DuplicateMcpToolPrefix { .. }
+                | AgentFactoryError::DuplicateMcpToolName { .. },
             ) => (StatusCode::BAD_REQUEST, "invalid_agent_profile"),
+            ServiceError::McpProfileStore(McpProfileStoreError::Validation(_))
+            | ServiceError::Factory(AgentFactoryError::McpProfile(_)) => {
+                (StatusCode::BAD_REQUEST, "invalid_mcp_profile")
+            }
+            ServiceError::Factory(AgentFactoryError::McpConnection { .. }) => {
+                (StatusCode::BAD_GATEWAY, "mcp_connection_failed")
+            }
             ServiceError::Factory(
                 AgentFactoryError::InvalidProviderConfig { .. } | AgentFactoryError::Provider(_),
             ) => (StatusCode::BAD_REQUEST, "invalid_provider_config"),

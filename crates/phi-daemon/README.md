@@ -4,10 +4,13 @@
 
 当前实现的重点是 session 生命周期、排队、广播、停止和磁盘恢复。命名 Provider
 profile 管理 adapter/凭证/默认生成配置；独立的 Agent Profile 管理 prompt 编译、
-工具与 skill 筛选、初始 capability mode，以及可选 model/reasoning override。
+工具与 skill 筛选、独立 MCP Profile 引用、初始 capability mode，以及可选
+model/reasoning override。MCP Profile 保存 stdio 或 Streamable HTTP 连接及凭据；
+Agent Profile 只引用其 ID，不复制 secret。
 每个 daemon 创建的 Agent 都会获得工作区 `read`、`edit`、`write`、`bash` 能力、
-交互式 `askuser` 和可配置 subagent 工具；交互 session 还会获得越界工具审批。Skills 默认从全局与工作目录加载；MCP
-尚未通过 daemon 配置接入，需要时应提供自定义 `AgentFactory`。
+交互式 `askuser` 和可配置 subagent 工具；交互 session 还会获得越界工具审批。
+Skills 默认从全局与工作目录加载；MCP 按 Agent Profile 显式连接，未引用时不会启动
+进程或建立网络连接。
 
 ## 架构
 
@@ -21,6 +24,8 @@ flowchart LR
     ProviderProfiles --> Factory
     Service --> AgentProfiles["agent-profiles.json<br/>latest behavioral profiles"]
     AgentProfiles --> Factory
+    Service --> McpProfiles["mcp-profiles.json<br/>stdio / HTTP + credentials"]
+    McpProfiles --> Factory
     Axum --> Scheduler["ScheduledTaskManager<br/>daily / interval admission"]
     Scheduler --> Service
     Scheduler --> ScheduledStore["scheduled-tasks.json<br/>schedule + run state"]
@@ -43,7 +48,9 @@ flowchart LR
 - `bash(run_in_background=true)` 立即返回 `task_id` 与私有 `output_file`，后台进程完成后通过通用 Agent mailbox 注入 internal `<task_notification>`。通知若赶上 active run，只在下一处协议安全边界合入；若 actor 已 idle，则自动 admission 一个 mailbox-driven run。模型等待通知后用 `read` 读取文件，不需要轮询。
 - Agent 调用 `spawn_agent` 时默认等待 child 结果，设置 `run_in_background=true` 才立即返回；创建事件始终先广播给父 session 调用方。后台终态会在父 turn 的下一处协议安全边界进入 mailbox，父 Agent 已 idle 时才排队启动新 turn；progress 只广播、不唤醒。完成的 `general` child 释放 live Agent 后仍可从 durable sidechain transcript 继续。
 - Agent Profile 在 prepared Agent 构建时解析，首 prompt 激活时以完整 compiled prompt、
-  policy 和 revision pin 入 metadata；之后修改同名 profile 不会改变该 session。
+  policy、MCP Profile ID 列表和 revision pin 入 metadata；之后修改同名 Agent Profile
+  不会改变该 session。MCP endpoint、命令和凭据不复制进 metadata；进程重启恢复时按
+  pinned ID 读取当时最新的 MCP Profile。
 - `ApplicationService` 负责首个 prompt 的延迟激活、持久化 metadata、进程重启后的单飞恢复，以及 registry 生命周期。
 - `ScheduledTaskManager` 独立持有调度与运行状态，到期后调用
   `ApplicationService` 创建普通 session；它不绕过 actor 复制 Agent loop。
@@ -150,9 +157,9 @@ persona；自定义 profile 可用 `extend` 追加行为说明，或用 `full` �
 
 两个 `*_DIRS` 变量使用操作系统原生 path-list 格式（Unix/macOS 用 `:`，Windows 用 `;`），空值表示关闭该组目录。每个根目录只扫描直接子目录中的 `<name>/SKILL.md`；按“全局目录在前、工作目录在后”的顺序合并，后扫描到的同名 skill 覆盖先前版本。live session 使用创建时的不可变 catalog 快照；修改文件只影响之后创建或进程重启后恢复的 session。
 
-代理变量在 daemon 启动时读取，修改后需要重启。它们只控制 daemon 到 Provider 的出站
-HTTP(S) 请求，包括普通/child Agent 与 session 标题生成；不改变 daemon 的入站监听地址，
-也不配置 Web 开发服务器或尚未接入 daemon 的 MCP transport。协议专用变量优先于
+代理变量在 daemon 启动时读取，修改后需要重启。它们由 daemon 的 Provider HTTP client
+显式使用，包括普通/child Agent 与 session 标题生成；不改变 daemon 的入站监听地址，
+也不配置 Web 开发服务器或 MCP Profile。协议专用变量优先于
 `ALL_PROXY`，`NO_PROXY` 会应用到每一条已配置代理规则。非空代理 URL 无效时 daemon
 拒绝启动；代理 URL 和其中可能包含的凭据不会进入 `DaemonConfig` 的 Debug 或配置错误。
 例如让 HTTP 和 HTTPS Provider 都通过本机 HTTP proxy（HTTPS 使用 CONNECT）：
@@ -245,6 +252,7 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
 .phi/daemon/
 ├── provider.json
 ├── agent-profiles.json
+├── mcp-profiles.json
 ├── scheduled-tasks.json
 ├── control/
 │   └── session-<uuid>.json
@@ -258,6 +266,10 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
 - `agent-profiles.json` 保存每个 Agent Profile 的最新 definition 和独立 revision，不含
   Provider credential；Unix 同样以 `0600` 创建。没有文件时仍可读取隐式
   `default@0`。
+- `mcp-profiles.json` 保存每个 MCP Profile 的最新 stdio/Streamable HTTP 配置和独立
+  revision，包括 bearer token、自定义 header value 与 stdio environment value；
+  Unix 以 `0600` 创建。HTTP GET 只返回 `bearer_token_configured`、header name 与
+  environment key，不返回 secret value。
 - `scheduled-tasks.json` 是版本化的定时任务集合，保存调度、下次执行时间、
   最近运行状态与完整 prompt；Unix 上以 `0600` 创建。该文件可能包含敏感业务
   指令，不应公开分发。
@@ -287,6 +299,9 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
 - Agent Profile 更新只影响之后构建的 prepared/new session。prepared Agent 使用构建时
   捕获的 revision；激活后完整 resolved profile 被 pin，重启恢复不会读取同名最新版本。
   旧 metadata 缺少该字段时按内建 `default@0` 恢复，并在首次成功恢复后写回 pin。
+- MCP Profile 更新不热替换 live/prepared Agent 已连接的 client；它会影响之后创建的
+  Agent、重启后按 pinned Agent Profile 恢复的 Agent，以及定时任务的下一次执行。
+  Agent Profile pin 的是 MCP Profile ID 列表，不是 endpoint 或 secret 快照。
 - `PHI_DAEMON_WORKSPACE_DIR` 只决定新 session 的默认 workspace。旧 metadata/JSONL
   缺少 workspace 字段时，首次恢复会绑定当前默认 workspace 并补写；已有 workspace
   的 session 若被错误地用其他目录构建，library 会以 `WorkspaceMismatch` 拒绝恢复。
@@ -471,6 +486,7 @@ API key/base URL 轮换可继续恢复引用该 profile 的原 session。若改�
     "allow": ["rust-review"],
     "deny": []
   },
+  "mcp_profile_ids": ["github", "local-tools"],
   "initial_capability_mode": "workspace_edit",
   "model": "optional-profile-model",
   "reasoning_effort": "high"
@@ -481,11 +497,77 @@ API key/base URL 轮换可继续恢复引用该 profile 的原 session。若改�
 不可删除 daemon harness/workspace appendix。`tools` 和 `skills` 使用精确名称，
 `allow=null` 表示不设置 allow-list，`allow=[]` 表示不允许任何普通项，deny 最终优先。
 Agent Profile 只能收窄 daemon 已安装的能力，不能凭名称开启不存在的工具。
+`mcp_profile_ids` 按顺序引用已存在的 MCP Profile；同一 Agent 不允许重复 ID 或重复
+`tool_name_prefix`。MCP 工具名也参与 `tools.allow`/`deny`，名称形如
+`<prefix>__<server_tool_name>`。
 
 模型配置优先级为 session 显式 override > Agent Profile > Provider Profile。Provider、
 API key、base URL 和上下文预算仍只属于 Provider Profile。Profile 的
 `initial_capability_mode` 只决定新 Agent 的初值；之后的 WS capability 切换会作为
 session 状态持久化。
+
+### MCP Profile API
+
+- `GET /v1/mcp-profiles`：列出所有 MCP Profile 的公开、脱敏配置。
+- `GET /v1/mcp-profiles/{mcp_profile_id}`：读取单个 profile；不存在时返回
+  `{"configured":false,"mcp_profile":null}`。
+- `PUT /v1/mcp-profiles/{mcp_profile_id}`：创建或完整替换一个 profile，revision 按
+  ID 独立递增。无删除接口。
+
+Streamable HTTP 示例：
+
+```json
+{
+  "transport": {
+    "type": "http",
+    "url": "https://mcp.example.com/mcp",
+    "bearer_token": "<secret>",
+    "headers": {
+      "X-API-Key": "<secret>"
+    },
+    "allow_stateless": true,
+    "reinitialize_on_expired_session": true
+  },
+  "tool_name_prefix": "github",
+  "connect_timeout_secs": 30,
+  "request_timeout_secs": 60,
+  "max_output_lines": 2000,
+  "max_output_bytes": 51200
+}
+```
+
+stdio 示例：
+
+```json
+{
+  "transport": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-example"],
+    "current_dir": null,
+    "env": {
+      "MCP_TOKEN": "<secret>"
+    },
+    "clear_env": false
+  },
+  "tool_name_prefix": "local"
+}
+```
+
+`current_dir=null` 使用当前 Agent 的 workspace；相对路径相对该 workspace 解析，绝对
+路径按原值使用。`tool_name_prefix` 省略或为 `null` 时使用 MCP Profile ID。
+`request_timeout_secs=null` 表示不设置单次 MCP 请求超时。ID 与 prefix 只允许 ASCII
+字母、数字、`_` 和 `-`。连接时完成初始化与 `tools/list`；连接、初始化或工具名冲突
+失败会使 Agent 构建失败，而不会创建半配置 session。
+
+公开 HTTP 响应不会返回 `bearer_token`、header value 或 environment value。由于 PUT
+是完整替换，更新已有 profile 时必须重新提交所有仍需保留的 secret；内置 Web 设置页
+会根据返回的 header name/environment key 提示重新填写。URL、command、args 和
+current directory 属于公开配置并会由 GET 返回，不应把凭据放入这些字段。MCP server、
+stdio 子进程及其
+工具 schema/结果都应视为不可信外部输入。动态 MCP 工具保守归类为
+`external_side_effect`，只有 `full_access` 自动暴露；交互 session 可按既有审批流程
+越过较窄 capability，定时任务则不会创建审批请求。
 
 ### Scheduled Task API
 
@@ -536,6 +618,9 @@ IANA 名称。夏令时跳变导致某日本地时间不存在时，该日跳过
 换算后的间隔不能超过 10 年。创建时会校验 Provider/Agent Profile 存在；每次
 执行时再用当时的 profile 构建 Agent，所以 profile 后续更新会影响未来执行，
 而已创建 session 仍 pin 住它自己的版本。
+因此定时任务可以通过 `agent_profile_id` 指定带 MCP 引用的 Agent Profile；每次运行
+会读取最新 MCP Profile 并建立对应 HTTP/stdio 连接。后台任务没有交互审批，若要实际
+调用 MCP 工具，应把任务或 Agent Profile 的 capability 设为 `full_access`。
 
 更新只接受启用状态：
 
@@ -958,8 +1043,9 @@ const socket = new WebSocket(
 显示标题、当前 workspace 目录名和右侧设置菜单；目录的完整绝对路径保留在悬浮提示中，
 数据来自 `ready` 或最新 snapshot。
 
-内置 Web 客户端的设置页通过 `GET /v1/providers` 展示全部命名 Provider profiles，并可用
-`PUT /v1/providers/{profile_id}` 新增或更新配置；API key 只写入 daemon，不通过 GET 回显。
+内置 Web 客户端的设置页分别管理 Provider、Agent Profile 和 MCP Profile。MCP 页支持
+Streamable HTTP 与 stdio，Agent Profile 页可勾选多个 MCP Profile；API key、bearer
+token、header value 和 environment value 只写入 daemon，不通过 GET 回显。
 composer 的 Provider/model 菜单在 prepared 对话发送首个 prompt 前选择不同 profile 时，
 会保留 workspace 并重建 `/new` 连接。session 激活后，profile 项只作为模型预设：客户端
 发送 `set_model`，由 actor 在空闲状态持久化 model override，并从下一次用户请求开始使用；
@@ -1499,9 +1585,9 @@ stop 是合作式停止，不是把 session 简单截断到“最后一个数组
 
 - WebSocket origin 校验、租户与权限模型。
 - HTTP 空白 session create、prompt/stop、queued-run cancel 和队列清空。
-- MCP 与任意自定义工具的 HTTP 配置。standalone factory 已显式安装 workspace
-  `read`/`edit`/`write`/`bash`、`askuser` 和 subagent 工具；其他 library 工具仍需自定义
-  factory 接线。
+- 任意非 MCP 自定义工具的 HTTP 配置。standalone factory 已显式安装 workspace
+  `read`/`edit`/`write`/`bash`、`askuser`、subagent 工具，并按 Agent Profile 安装
+  MCP；其他 library 工具仍需自定义 factory 接线。
 - 跨 daemon 实例共享 live actor、分布式锁或事件总线；当前 mapping 与广播都是单进程的。
 - durable event cursor/replay；重连通过 snapshot 恢复，不按旧 sequence 重放。
 - 工具外部副作用的事务回滚或强制中断。

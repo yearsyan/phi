@@ -1,22 +1,24 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use phi::{
     Agent, AnthropicMessagesProvider, BuiltinTools, CapabilityMode, ContextCompactor,
-    DefaultContextCompactor, HookRegistry, LlmProvider, OpenAiChatProvider,
-    OpenAiResponsesProvider, ProviderError, ProviderEventStream, ProviderRequest, ReasoningEffort,
-    RetryConfig, SkillCatalog, SkillError, SkillsConfig, Workspace,
+    DefaultContextCompactor, HookRegistry, LlmProvider, McpClient, McpClientOptions, McpError,
+    McpHttpConfig, McpStdioConfig, OpenAiChatProvider, OpenAiResponsesProvider, ProviderError,
+    ProviderEventStream, ProviderRequest, ReasoningEffort, RetryConfig, SkillCatalog, SkillError,
+    SkillsConfig, Workspace,
 };
 use thiserror::Error;
 
 use super::SessionId;
 use super::{
-    AgentProfileValidationError, DEFAULT_AGENT_PROFILE_ID, PinnedAgentProfile,
-    compile_agent_profile,
+    AgentProfileValidationError, DEFAULT_AGENT_PROFILE_ID, McpProfile, McpProfileDefinition,
+    McpProfileValidationError, McpTransportDefinition, PinnedAgentProfile, compile_agent_profile,
 };
 use crate::store::{
-    AgentProfileStore, AgentProfileStoreError, MemoryAgentProfileStore, ProviderConfig,
-    ProviderKind, ProviderStore, ProviderStoreError,
+    AgentProfileStore, AgentProfileStoreError, McpProfileStore, McpProfileStoreError,
+    MemoryAgentProfileStore, MemoryMcpProfileStore, ProviderConfig, ProviderKind, ProviderStore,
+    ProviderStoreError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +165,7 @@ impl LlmProvider for ConfiguredProvider {
 pub struct ConfiguredAgentFactory {
     providers: Arc<dyn ProviderStore>,
     agent_profiles: Arc<dyn AgentProfileStore>,
+    mcp_profiles: Arc<dyn McpProfileStore>,
     http_client: reqwest::Client,
     skills: SkillsConfig,
     builtin_tools: Option<BuiltinTools>,
@@ -175,6 +178,7 @@ impl ConfiguredAgentFactory {
         Self {
             providers,
             agent_profiles: Arc::new(MemoryAgentProfileStore::new()),
+            mcp_profiles: Arc::new(MemoryMcpProfileStore::new()),
             http_client: reqwest::Client::new(),
             skills: SkillsConfig::disabled(),
             builtin_tools: None,
@@ -190,6 +194,11 @@ impl ConfiguredAgentFactory {
 
     pub fn agent_profile_store(mut self, agent_profiles: Arc<dyn AgentProfileStore>) -> Self {
         self.agent_profiles = agent_profiles;
+        self
+    }
+
+    pub fn mcp_profile_store(mut self, mcp_profiles: Arc<dyn McpProfileStore>) -> Self {
+        self.mcp_profiles = mcp_profiles;
         self
     }
 
@@ -252,6 +261,7 @@ impl fmt::Debug for ConfiguredAgentFactory {
             .field("skill_directories", &self.skills.directories.len())
             .field("builtin_tools_enabled", &self.builtin_tools.is_some())
             .field("agent_profile_store", &"configured")
+            .field("mcp_profile_store", &"configured")
             .field("default_workspace", &self.default_workspace)
             .field("context_compactor_factory", &"configured")
             .finish_non_exhaustive()
@@ -319,6 +329,9 @@ impl AgentFactory for ConfiguredAgentFactory {
                 .reasoning_effort
                 .or(config.reasoning_effort)
         };
+        let mcp_profiles = self
+            .resolve_mcp_profiles(&agent_profile.definition.mcp_profile_ids)
+            .await?;
 
         let provider = build_configured_provider(&config, &model, self.http_client.clone())?;
         let mut builder = Agent::builder(provider);
@@ -335,6 +348,18 @@ impl AgentFactory for ConfiguredAgentFactory {
 
         if let Some(tools) = &self.builtin_tools {
             builder = builder.builtin_tools(tools.clone().in_workspace(workspace.clone()));
+        }
+        let mut mcp_tool_names = HashSet::new();
+        for profile in mcp_profiles {
+            let client = connect_mcp_profile(&profile, &workspace).await?;
+            for definition in client.tool_definitions() {
+                if !mcp_tool_names.insert(definition.name.clone()) {
+                    return Err(AgentFactoryError::DuplicateMcpToolName {
+                        tool_name: definition.name,
+                    });
+                }
+            }
+            builder = builder.mcp_client(client);
         }
         if let Some(max_output_tokens) = config.max_output_tokens {
             builder = builder.max_tokens(max_output_tokens);
@@ -365,6 +390,102 @@ impl AgentFactory for ConfiguredAgentFactory {
             reasoning_effort,
         })
     }
+}
+
+impl ConfiguredAgentFactory {
+    async fn resolve_mcp_profiles(
+        &self,
+        profile_ids: &[String],
+    ) -> Result<Vec<McpProfile>, AgentFactoryError> {
+        let mut profiles = Vec::with_capacity(profile_ids.len());
+        let mut prefixes = HashSet::with_capacity(profile_ids.len());
+        for profile_id in profile_ids {
+            let profile = self
+                .mcp_profiles
+                .get_mcp_profile(profile_id)
+                .await?
+                .ok_or_else(|| AgentFactoryError::McpProfileUnavailable {
+                    mcp_profile_id: profile_id.clone(),
+                })?;
+            let profile = profile.normalized()?;
+            if !prefixes.insert(profile.definition.tool_name_prefix.clone()) {
+                return Err(AgentFactoryError::DuplicateMcpToolPrefix {
+                    tool_name_prefix: profile.definition.tool_name_prefix,
+                });
+            }
+            profiles.push(profile);
+        }
+        Ok(profiles)
+    }
+}
+
+async fn connect_mcp_profile(
+    profile: &McpProfile,
+    workspace: &Workspace,
+) -> Result<McpClient, AgentFactoryError> {
+    let McpProfileDefinition {
+        transport,
+        tool_name_prefix,
+        connect_timeout_secs,
+        request_timeout_secs,
+        max_output_lines,
+        max_output_bytes,
+    } = &profile.definition;
+    let mut options = McpClientOptions::default()
+        .connect_timeout(Duration::from_secs(*connect_timeout_secs))
+        .tool_name_prefix(tool_name_prefix.clone())
+        .output_limits(*max_output_lines, *max_output_bytes);
+    options = match request_timeout_secs {
+        Some(timeout) => options.request_timeout(Duration::from_secs(*timeout)),
+        None => options.without_request_timeout(),
+    };
+
+    let result = match transport {
+        McpTransportDefinition::Stdio {
+            command,
+            args,
+            current_dir,
+            env,
+            clear_env,
+        } => {
+            let current_dir = current_dir.as_deref().map_or_else(
+                || workspace.root().to_path_buf(),
+                |path| workspace.resolve(path),
+            );
+            let mut config = McpStdioConfig::new(command)
+                .args(args)
+                .current_dir(current_dir)
+                .envs(env)
+                .options(options);
+            if *clear_env {
+                config = config.clear_env();
+            }
+            McpClient::connect_stdio(config).await
+        }
+        McpTransportDefinition::Http {
+            url,
+            bearer_token,
+            headers,
+            allow_stateless,
+            reinitialize_on_expired_session,
+        } => {
+            let mut config = McpHttpConfig::new(url)
+                .allow_stateless(*allow_stateless)
+                .reinitialize_on_expired_session(*reinitialize_on_expired_session)
+                .options(options);
+            if let Some(token) = bearer_token {
+                config = config.bearer_token(token);
+            }
+            for (name, value) in headers {
+                config = config.header(name, value);
+            }
+            McpClient::connect_http(config).await
+        }
+    };
+    result.map_err(|source| AgentFactoryError::McpConnection {
+        mcp_profile_id: profile.mcp_profile_id.clone(),
+        source,
+    })
 }
 
 pub(crate) fn build_configured_provider(
@@ -472,6 +593,15 @@ pub enum AgentFactoryError {
     #[error("Agent profile {agent_profile_id:?} is not configured")]
     AgentProfileUnavailable { agent_profile_id: String },
 
+    #[error("MCP profile {mcp_profile_id:?} is not configured")]
+    McpProfileUnavailable { mcp_profile_id: String },
+
+    #[error("multiple MCP profiles use tool name prefix {tool_name_prefix:?}")]
+    DuplicateMcpToolPrefix { tool_name_prefix: String },
+
+    #[error("multiple MCP profiles expose tool name {tool_name:?}")]
+    DuplicateMcpToolName { tool_name: String },
+
     #[error("invalid Provider configuration field {field}: {message}")]
     InvalidProviderConfig {
         field: &'static str,
@@ -490,8 +620,21 @@ pub enum AgentFactoryError {
     #[error("could not load Agent Profile configuration: {0}")]
     AgentProfileStore(#[from] AgentProfileStoreError),
 
+    #[error("could not load MCP Profile configuration: {0}")]
+    McpProfileStore(#[from] McpProfileStoreError),
+
     #[error("invalid Agent Profile: {0}")]
     AgentProfile(#[from] AgentProfileValidationError),
+
+    #[error("invalid MCP Profile: {0}")]
+    McpProfile(#[from] McpProfileValidationError),
+
+    #[error("could not connect MCP profile {mcp_profile_id:?}: {source}")]
+    McpConnection {
+        mcp_profile_id: String,
+        #[source]
+        source: McpError,
+    },
 
     #[error("could not build provider: {0}")]
     Provider(#[from] ProviderError),
@@ -506,7 +649,7 @@ pub enum AgentFactoryError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -519,7 +662,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::store::{DEFAULT_PROFILE_ID, MemoryProviderStore, ProviderStore};
+    use crate::runtime::{
+        DEFAULT_MCP_CONNECT_TIMEOUT_SECS, DEFAULT_MCP_OUTPUT_BYTES, DEFAULT_MCP_OUTPUT_LINES,
+        DEFAULT_MCP_REQUEST_TIMEOUT_SECS,
+    };
+    use crate::store::{
+        DEFAULT_PROFILE_ID, McpProfileStore, MemoryMcpProfileStore, MemoryProviderStore,
+        ProviderStore,
+    };
 
     type RequestCapture = Arc<Mutex<Option<oneshot::Sender<Value>>>>;
 
@@ -603,6 +753,23 @@ mod tests {
         config.request_timeout_secs = 5;
         store.replace_provider(config).await.unwrap();
         ConfiguredAgentFactory::new(store)
+    }
+
+    fn mcp_definition(prefix: &str) -> McpProfileDefinition {
+        McpProfileDefinition {
+            transport: McpTransportDefinition::Stdio {
+                command: "test-mcp".to_owned(),
+                args: Vec::new(),
+                current_dir: None,
+                env: BTreeMap::new(),
+                clear_env: false,
+            },
+            tool_name_prefix: prefix.to_owned(),
+            connect_timeout_secs: DEFAULT_MCP_CONNECT_TIMEOUT_SECS,
+            request_timeout_secs: Some(DEFAULT_MCP_REQUEST_TIMEOUT_SECS),
+            max_output_lines: DEFAULT_MCP_OUTPUT_LINES,
+            max_output_bytes: DEFAULT_MCP_OUTPUT_BYTES,
+        }
     }
 
     #[tokio::test]
@@ -794,6 +961,54 @@ mod tests {
                 .build(&AgentBuildRequest::new(SessionId::new(), "unknown"))
                 .await,
             Err(AgentFactoryError::ProfileUnavailable { profile_id }) if profile_id == "unknown"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolves_referenced_mcp_profiles_and_rejects_missing_or_duplicate_prefixes() {
+        let mcp_profiles = Arc::new(MemoryMcpProfileStore::new());
+        mcp_profiles
+            .replace_mcp_profile("first", mcp_definition("first"))
+            .await
+            .unwrap();
+        mcp_profiles
+            .replace_mcp_profile("second", mcp_definition("second"))
+            .await
+            .unwrap();
+        let factory = configured_factory()
+            .await
+            .mcp_profile_store(mcp_profiles.clone());
+
+        let resolved = factory
+            .resolve_mcp_profiles(&["second".to_owned(), "first".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|profile| profile.mcp_profile_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+        assert!(matches!(
+            factory
+                .resolve_mcp_profiles(&["missing".to_owned()])
+                .await,
+            Err(AgentFactoryError::McpProfileUnavailable { mcp_profile_id })
+                if mcp_profile_id == "missing"
+        ));
+
+        mcp_profiles
+            .replace_mcp_profile("second", mcp_definition("first"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            factory
+                .resolve_mcp_profiles(&["first".to_owned(), "second".to_owned()])
+                .await,
+            Err(AgentFactoryError::DuplicateMcpToolPrefix {
+                tool_name_prefix
+            }) if tool_name_prefix == "first"
         ));
     }
 

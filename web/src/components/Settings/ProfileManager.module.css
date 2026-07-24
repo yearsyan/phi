@@ -1,0 +1,486 @@
+.layout {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: 270px minmax(0, 1fr);
+}
+
+.sidebar {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  padding: 20px 14px;
+  border-right: 1px solid var(--phi-border);
+  background: var(--phi-surface);
+}
+
+.sidebarHeading,
+.item,
+.addButton,
+.editorHeader,
+.badges,
+.headerActions,
+.checkboxRow {
+  display: flex;
+  align-items: center;
+}
+
+.sidebarHeading {
+  justify-content: space-between;
+  padding: 0 8px 11px;
+  color: var(--phi-text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.sidebarHeading small {
+  min-width: 22px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--phi-surface-2);
+  color: var(--phi-text-muted);
+  font-family: var(--phi-mono);
+  text-align: center;
+}
+
+.list {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.item {
+  width: 100%;
+  min-height: 58px;
+  gap: 10px;
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--phi-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.item:hover {
+  background: var(--phi-surface-hover);
+}
+
+.itemSelected {
+  border-color: var(--phi-border-strong);
+  background: var(--phi-bg-elevated);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.itemCopy {
+  display: block;
+  min-width: 0;
+  flex: 1;
+}
+
+.itemCopy strong,
+.itemCopy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itemCopy strong {
+  color: var(--phi-text-strong);
+  font-size: 12px;
+}
+
+.itemCopy small {
+  margin-top: 3px;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+}
+
+.empty {
+  margin: 0;
+  padding: 20px 10px;
+  color: var(--phi-text-dim);
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.addButton {
+  width: 100%;
+  min-height: 42px;
+  flex: 0 0 auto;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 0 11px;
+  border: 1px dashed var(--phi-border-strong);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--phi-text);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.addButton:hover {
+  border-style: solid;
+  background: var(--phi-surface-hover);
+}
+
+.editor {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--phi-bg-elevated);
+}
+
+.editorHeader {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  min-height: 82px;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 28px;
+  border-bottom: 1px solid var(--phi-border);
+  background: color-mix(in srgb, var(--phi-bg-elevated) 94%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.editorHeader p,
+.editorHeader h3 {
+  margin: 0;
+}
+
+.editorHeader p {
+  margin-bottom: 5px;
+  color: var(--phi-text-dim);
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.editorHeader h3 {
+  color: var(--phi-text-strong);
+  font-size: 22px;
+  letter-spacing: -0.025em;
+}
+
+.headerActions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.revision {
+  min-height: 28px;
+  padding: 7px 9px 0;
+  border: 1px solid var(--phi-border);
+  border-radius: 999px;
+  color: var(--phi-text-muted);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+}
+
+.saveButton {
+  height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--phi-accent);
+  border-radius: 7px;
+  background: var(--phi-accent);
+  color: var(--phi-accent-contrast);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.saveButton:hover:not(:disabled) {
+  border-color: var(--phi-accent-hover);
+  background: var(--phi-accent-hover);
+}
+
+.saveButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.body {
+  display: grid;
+  gap: 18px;
+  padding: 24px 28px 34px;
+}
+
+.field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.field > span,
+.sectionTitle {
+  color: var(--phi-text-muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--phi-border);
+  border-radius: 9px;
+  outline: 0;
+  background: var(--phi-surface);
+  color: var(--phi-text);
+  font-size: 11px;
+}
+
+.field input,
+.field select {
+  height: 42px;
+  padding: 0 12px;
+}
+
+.field textarea {
+  min-height: 92px;
+  padding: 11px 12px;
+  resize: vertical;
+  font-family: var(--phi-mono);
+  line-height: 1.55;
+}
+
+.promptField textarea {
+  min-height: 145px;
+  font-family: inherit;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  border-color: var(--phi-accent-border);
+  box-shadow: 0 0 0 3px var(--phi-accent-soft);
+}
+
+.field small,
+.sectionCopy {
+  color: var(--phi-text-dim);
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.twoColumns,
+.threeColumns {
+  display: grid;
+  gap: 12px;
+}
+
+.twoColumns {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.threeColumns {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.section {
+  display: grid;
+  gap: 13px;
+  padding: 15px;
+  border: 1px solid var(--phi-border);
+  border-radius: 9px;
+  background: var(--phi-surface);
+}
+
+.sectionHeader {
+  display: grid;
+  gap: 4px;
+}
+
+.sectionHeader p {
+  margin: 0;
+}
+
+.checkboxRow {
+  min-height: 30px;
+  gap: 8px;
+  color: var(--phi-text);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.checkboxRow input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--phi-accent);
+}
+
+.choiceGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.choice {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--phi-border);
+  border-radius: 8px;
+  background: var(--phi-bg-elevated);
+  color: var(--phi-text);
+  cursor: pointer;
+}
+
+.choice input {
+  margin-top: 2px;
+  accent-color: var(--phi-accent);
+}
+
+.choice span {
+  display: block;
+  min-width: 0;
+}
+
+.choice strong,
+.choice small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choice strong {
+  font-size: 10px;
+}
+
+.choice small {
+  margin-top: 3px;
+  color: var(--phi-text-dim);
+  font-family: var(--phi-mono);
+  font-size: 9px;
+}
+
+.transportTabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.transportTabs button {
+  min-height: 42px;
+  border: 1px solid var(--phi-border);
+  border-radius: 8px;
+  background: var(--phi-surface);
+  color: var(--phi-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.transportTabs button[aria-selected="true"] {
+  border-color: var(--phi-accent-border);
+  background: var(--phi-accent-soft);
+  color: var(--phi-accent);
+}
+
+.warning,
+.error,
+.success {
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.warning {
+  border: 1px solid var(--phi-warning);
+  background: var(--phi-warning-soft);
+  color: var(--phi-warning);
+}
+
+.error {
+  border: 1px solid var(--phi-danger);
+  background: var(--phi-danger-soft);
+  color: var(--phi-danger);
+}
+
+.success {
+  border: 1px solid var(--phi-success);
+  background: var(--phi-success-soft);
+  color: var(--phi-success);
+}
+
+@media (max-width: 800px) {
+  .layout {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar {
+    min-height: auto;
+    flex: 0 0 auto;
+    padding: 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--phi-border);
+  }
+
+  .sidebarHeading {
+    display: none;
+  }
+
+  .list {
+    display: flex;
+    padding-bottom: 3px;
+    overflow-x: auto;
+  }
+
+  .item {
+    width: 190px;
+    flex: 0 0 auto;
+    margin: 0 6px 0 0;
+  }
+
+  .empty {
+    min-width: 220px;
+  }
+
+  .addButton {
+    min-height: 38px;
+  }
+
+  .editorHeader {
+    min-height: 70px;
+    padding: 13px 18px;
+  }
+
+  .editorHeader h3 {
+    font-size: 18px;
+  }
+
+  .body {
+    padding: 18px;
+  }
+
+  .threeColumns {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .twoColumns,
+  .choiceGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .revision {
+    display: none;
+  }
+}

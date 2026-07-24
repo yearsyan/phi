@@ -7,6 +7,8 @@ use phi::{
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use super::mcp_profile::validate_mcp_profile_id;
+
 pub const DEFAULT_AGENT_PROFILE_ID: &str = "default";
 pub const DEFAULT_AGENT_PROFILE_REVISION: u64 = 0;
 pub const MAX_AGENT_PROFILE_ID_BYTES: usize = 128;
@@ -14,6 +16,7 @@ pub const MAX_AGENT_PROFILE_PROMPT_BYTES: usize = 128 * 1024;
 pub const MAX_AGENT_PROFILE_MODEL_BYTES: usize = 512;
 pub const MAX_AGENT_PROFILE_POLICY_NAMES: usize = 512;
 pub const MAX_AGENT_PROFILE_NAME_BYTES: usize = 128;
+pub const MAX_AGENT_PROFILE_MCP_PROFILES: usize = 32;
 
 /// The daemon-owned coding persona used when a profile extends the default.
 ///
@@ -115,6 +118,8 @@ pub struct AgentProfileDefinition {
     pub prompt: PromptDefinition,
     pub tools: NamePolicy,
     pub skills: NamePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_profile_ids: Vec<String>,
     pub initial_capability_mode: CapabilityMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -138,6 +143,8 @@ struct AgentProfileDefinitionInput {
     tools: NamePolicy,
     #[serde(default)]
     skills: NamePolicy,
+    #[serde(default)]
+    mcp_profile_ids: Vec<String>,
     #[serde(default, rename = "initial_agent_mode")]
     _initial_agent_mode: Option<LegacyAgentMode>,
     #[serde(default)]
@@ -158,6 +165,7 @@ impl<'de> Deserialize<'de> for AgentProfileDefinition {
             prompt: input.prompt,
             tools: input.tools,
             skills: input.skills,
+            mcp_profile_ids: input.mcp_profile_ids,
             initial_capability_mode: input.initial_capability_mode,
             model: input.model,
             reasoning_effort: input.reasoning_effort,
@@ -203,6 +211,7 @@ impl AgentProfileDefinition {
             },
             tools: self.tools.normalized("tools")?,
             skills: self.skills.normalized("skills")?,
+            mcp_profile_ids: normalize_mcp_profile_ids(&self.mcp_profile_ids)?,
             initial_capability_mode: self.initial_capability_mode,
             model,
             reasoning_effort: self.reasoning_effort,
@@ -274,6 +283,7 @@ impl fmt::Debug for PinnedAgentProfile {
                 &self.definition.skills.allow.as_ref().map(Vec::len),
             )
             .field("skill_deny_count", &self.definition.skills.deny.len())
+            .field("mcp_profile_count", &self.definition.mcp_profile_ids.len())
             .finish()
     }
 }
@@ -440,6 +450,34 @@ fn normalize_names(
     Ok(normalized)
 }
 
+fn normalize_mcp_profile_ids(
+    profile_ids: &[String],
+) -> Result<Vec<String>, AgentProfileValidationError> {
+    if profile_ids.len() > MAX_AGENT_PROFILE_MCP_PROFILES {
+        return Err(AgentProfileValidationError::TooManyMcpProfiles {
+            actual: profile_ids.len(),
+            maximum: MAX_AGENT_PROFILE_MCP_PROFILES,
+        });
+    }
+    let mut normalized = Vec::with_capacity(profile_ids.len());
+    let mut seen = BTreeSet::new();
+    for profile_id in profile_ids {
+        validate_mcp_profile_id(profile_id).map_err(|error| {
+            AgentProfileValidationError::InvalidMcpProfileId {
+                mcp_profile_id: profile_id.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if !seen.insert(profile_id.clone()) {
+            return Err(AgentProfileValidationError::DuplicateMcpProfileId {
+                mcp_profile_id: profile_id.clone(),
+            });
+        }
+        normalized.push(profile_id.clone());
+    }
+    Ok(normalized)
+}
+
 fn normalize_multiline(value: &str) -> String {
     value
         .replace("\r\n", "\n")
@@ -509,6 +547,18 @@ pub enum AgentProfileValidationError {
 
     #[error("name {name:?} appears in both {field}.allow and {field}.deny")]
     PolicyOverlap { field: &'static str, name: String },
+
+    #[error("Agent Profile has {actual} MCP profiles, maximum is {maximum}")]
+    TooManyMcpProfiles { actual: usize, maximum: usize },
+
+    #[error("invalid MCP Profile ID {mcp_profile_id:?}: {message}")]
+    InvalidMcpProfileId {
+        mcp_profile_id: String,
+        message: String,
+    },
+
+    #[error("duplicate MCP Profile ID {mcp_profile_id:?}")]
+    DuplicateMcpProfileId { mcp_profile_id: String },
 
     #[error("pinned agent profile is not normalized")]
     PinnedProfileNotNormalized,
@@ -667,6 +717,24 @@ mod tests {
         assert!(matches!(
             empty_model.normalized(),
             Err(AgentProfileValidationError::EmptyModel)
+        ));
+
+        let duplicate_mcp = AgentProfileDefinition {
+            mcp_profile_ids: vec!["github".to_owned(), "github".to_owned()],
+            ..AgentProfileDefinition::default()
+        };
+        assert!(matches!(
+            duplicate_mcp.normalized(),
+            Err(AgentProfileValidationError::DuplicateMcpProfileId { .. })
+        ));
+
+        let invalid_mcp = AgentProfileDefinition {
+            mcp_profile_ids: vec!["bad profile".to_owned()],
+            ..AgentProfileDefinition::default()
+        };
+        assert!(matches!(
+            invalid_mcp.normalized(),
+            Err(AgentProfileValidationError::InvalidMcpProfileId { .. })
         ));
     }
 

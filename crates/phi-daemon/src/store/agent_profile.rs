@@ -379,6 +379,7 @@ mod tests {
                 deny: vec!["bash".to_owned()],
             },
             skills: NamePolicy::default(),
+            mcp_profile_ids: Vec::new(),
             initial_capability_mode: CapabilityMode::ReadOnly,
             model: Some(" profile-model ".to_owned()),
             reasoning_effort: Some(ReasoningEffort::High),

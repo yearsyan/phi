@@ -9,11 +9,19 @@ import {
 } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '../../i18n/I18nProvider.tsx';
-import type { PublicProviderConfig } from '../../types/wire.ts';
+import type {
+  PublicAgentProfile,
+  PublicMcpProfile,
+  PublicProviderConfig,
+} from '../../types/wire.ts';
 import { SettingsModal } from './SettingsModal.tsx';
 
 const apiMocks = vi.hoisted(() => ({
+  listAgentProfiles: vi.fn(),
+  listMcpProfiles: vi.fn(),
   listProviders: vi.fn(),
+  putAgentProfile: vi.fn(),
+  putMcpProfile: vi.fn(),
   putProvider: vi.fn(),
 }));
 
@@ -44,10 +52,48 @@ const anthropicProvider: PublicProviderConfig = {
   revision: 2,
 };
 
+const agentProfile: PublicAgentProfile = {
+  agent_profile_id: 'reviewer',
+  revision: 1,
+  prompt: { mode: 'extend', text: 'Review carefully.' },
+  tools: { allow: null, deny: [] },
+  skills: { allow: null, deny: [] },
+  mcp_profile_ids: [],
+  initial_capability_mode: 'full_access',
+  model: null,
+  reasoning_effort: null,
+};
+
+const remoteMcpProfile: PublicMcpProfile = {
+  mcp_profile_id: 'remote',
+  revision: 1,
+  transport: {
+    type: 'http',
+    url: 'https://mcp.example.test/rpc',
+    bearer_token_configured: false,
+    header_names: [],
+    allow_stateless: true,
+    reinitialize_on_expired_session: true,
+  },
+  tool_name_prefix: 'remote',
+  connect_timeout_secs: 30,
+  request_timeout_secs: 60,
+  max_output_lines: 2000,
+  max_output_bytes: 51200,
+};
+
 describe('SettingsModal', () => {
   beforeEach(() => {
     apiMocks.listProviders.mockResolvedValue({ providers: [provider] });
+    apiMocks.listAgentProfiles.mockResolvedValue({
+      agent_profiles: [agentProfile],
+    });
+    apiMocks.listMcpProfiles.mockResolvedValue({
+      mcp_profiles: [remoteMcpProfile],
+    });
     apiMocks.putProvider.mockReset();
+    apiMocks.putAgentProfile.mockReset();
+    apiMocks.putMcpProfile.mockReset();
   });
 
   afterEach(cleanup);
@@ -259,5 +305,197 @@ describe('SettingsModal', () => {
       expect(onProviderSaved).toHaveBeenCalledWith(created);
     });
     expect(screen.getByRole('button', { name: /team-anthropic/ })).toBeTruthy();
+  });
+
+  it('attaches an MCP Profile to an Agent Profile', async () => {
+    const savedAgent = {
+      ...agentProfile,
+      revision: 2,
+      mcp_profile_ids: ['remote'],
+    };
+    apiMocks.putAgentProfile.mockResolvedValue({
+      configured: true,
+      agent_profile: savedAgent,
+    });
+    render(
+      <I18nProvider initialLocale="en">
+        <SettingsModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId=""
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onSaveAuthKey={vi.fn()}
+          onSaveProfileId={vi.fn()}
+          onSaveAgentProfileId={vi.fn()}
+          onSaveCapabilityMode={vi.fn()}
+          onProviderSaved={vi.fn()}
+          onConfigured={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent Profiles' }));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('Review carefully.')).toBeTruthy();
+    });
+    fireEvent.click(screen.getByLabelText(/remote/));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(apiMocks.putAgentProfile).toHaveBeenCalledWith(
+        'daemon-key',
+        'reviewer',
+        expect.objectContaining({
+          mcp_profile_ids: ['remote'],
+          initial_capability_mode: 'full_access',
+        }),
+      );
+    });
+  });
+
+  it('creates a Streamable HTTP MCP Profile with credentials', async () => {
+    apiMocks.listMcpProfiles.mockResolvedValue({ mcp_profiles: [] });
+    const created = {
+      ...remoteMcpProfile,
+      transport: {
+        ...remoteMcpProfile.transport,
+        bearer_token_configured: true,
+        header_names: ['x-api-key'],
+      },
+    };
+    apiMocks.putMcpProfile.mockResolvedValue({
+      configured: true,
+      mcp_profile: created,
+    });
+    render(
+      <I18nProvider initialLocale="en">
+        <SettingsModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId=""
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onSaveAuthKey={vi.fn()}
+          onSaveProfileId={vi.fn()}
+          onSaveAgentProfileId={vi.fn()}
+          onSaveCapabilityMode={vi.fn()}
+          onProviderSaved={vi.fn()}
+          onConfigured={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'MCP Profiles' }));
+    await waitFor(() => {
+      expect(apiMocks.listMcpProfiles).toHaveBeenCalledWith('daemon-key');
+    });
+    fireEvent.change(screen.getByLabelText('MCP Profile id'), {
+      target: { value: 'remote' },
+    });
+    fireEvent.change(screen.getByLabelText('Endpoint URL'), {
+      target: { value: 'https://mcp.example.test/rpc' },
+    });
+    fireEvent.change(screen.getByLabelText('Bearer token (optional)'), {
+      target: { value: 'bearer-secret' },
+    });
+    fireEvent.change(screen.getByLabelText(/Additional headers/), {
+      target: { value: 'X-API-Key: header-secret' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(apiMocks.putMcpProfile).toHaveBeenCalledWith(
+        'daemon-key',
+        'remote',
+        expect.objectContaining({
+          transport: {
+            type: 'http',
+            url: 'https://mcp.example.test/rpc',
+            bearer_token: 'bearer-secret',
+            headers: { 'X-API-Key': 'header-secret' },
+            allow_stateless: true,
+            reinitialize_on_expired_session: true,
+          },
+        }),
+      );
+    });
+  });
+
+  it('creates a local stdio MCP Profile', async () => {
+    apiMocks.listMcpProfiles.mockResolvedValue({ mcp_profiles: [] });
+    const created: PublicMcpProfile = {
+      ...remoteMcpProfile,
+      mcp_profile_id: 'local',
+      tool_name_prefix: 'local',
+      transport: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', '@example/mcp'],
+        current_dir: null,
+        env_keys: ['MCP_TOKEN'],
+        clear_env: true,
+      },
+    };
+    apiMocks.putMcpProfile.mockResolvedValue({
+      configured: true,
+      mcp_profile: created,
+    });
+    render(
+      <I18nProvider initialLocale="en">
+        <SettingsModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId=""
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onSaveAuthKey={vi.fn()}
+          onSaveProfileId={vi.fn()}
+          onSaveAgentProfileId={vi.fn()}
+          onSaveCapabilityMode={vi.fn()}
+          onProviderSaved={vi.fn()}
+          onConfigured={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'MCP Profiles' }));
+    await waitFor(() => {
+      expect(apiMocks.listMcpProfiles).toHaveBeenCalledWith('daemon-key');
+    });
+    fireEvent.change(screen.getByLabelText('MCP Profile id'), {
+      target: { value: 'local' },
+    });
+    fireEvent.click(screen.getByRole('tab', { name: 'stdio process' }));
+    fireEvent.change(screen.getByLabelText('Command'), {
+      target: { value: 'npx' },
+    });
+    fireEvent.change(screen.getByLabelText(/Arguments/), {
+      target: { value: '-y\n@example/mcp' },
+    });
+    fireEvent.change(screen.getByLabelText(/Environment variables/), {
+      target: { value: 'MCP_TOKEN=stdio-secret' },
+    });
+    fireEvent.click(
+      screen.getByLabelText('Clear the inherited process environment'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(apiMocks.putMcpProfile).toHaveBeenCalledWith(
+        'daemon-key',
+        'local',
+        expect.objectContaining({
+          transport: {
+            type: 'stdio',
+            command: 'npx',
+            args: ['-y', '@example/mcp'],
+            current_dir: null,
+            env: { MCP_TOKEN: 'stdio-secret' },
+            clear_env: true,
+          },
+        }),
+      );
+    });
   });
 });

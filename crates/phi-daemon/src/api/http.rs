@@ -8,8 +8,9 @@ use axum::{
 use super::{
     ApiError, AppState,
     dto::{
-        AgentProfileResponse, AgentProfilesResponse, ForkSessionRequest, ProviderResponse,
-        ProvidersResponse, PublicAgentProfile, PublicProviderConfig, PutAgentProfileRequest,
+        AgentProfileResponse, AgentProfilesResponse, ForkSessionRequest, McpProfileResponse,
+        McpProfilesResponse, ProviderResponse, ProvidersResponse, PublicAgentProfile,
+        PublicMcpProfile, PublicProviderConfig, PutAgentProfileRequest, PutMcpProfileRequest,
         PutProviderRequest, SessionSummaryDto, SessionsResponse, SkillDiagnosticDto,
         SkillSummaryDto, SkillsResponse, UpdateSessionRequest,
     },
@@ -21,6 +22,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v1/provider", get(get_provider).put(put_provider))
         .route("/v1/providers", get(list_providers))
         .route("/v1/agent-profiles", get(list_agent_profiles))
+        .route("/v1/mcp-profiles", get(list_mcp_profiles))
         .route(
             "/v1/agent-profiles/{agent_profile_id}",
             get(get_agent_profile).put(put_agent_profile),
@@ -28,6 +30,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v1/providers/{profile_id}",
             get(get_provider_by_id).put(put_provider_by_id),
+        )
+        .route(
+            "/v1/mcp-profiles/{mcp_profile_id}",
+            get(get_mcp_profile).put(put_mcp_profile),
         )
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{session_id}/skills", get(get_session_skills))
@@ -151,6 +157,48 @@ async fn put_agent_profile(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(AgentProfileResponse::from_profile(Some(profile))))
+}
+
+async fn list_mcp_profiles(
+    State(state): State<AppState>,
+) -> Result<Json<McpProfilesResponse>, ApiError> {
+    let mcp_profiles = state
+        .service()
+        .mcp_profiles()
+        .await
+        .map_err(ApiError::service)?
+        .into_iter()
+        .map(PublicMcpProfile::from)
+        .collect();
+    Ok(Json(McpProfilesResponse { mcp_profiles }))
+}
+
+async fn get_mcp_profile(
+    State(state): State<AppState>,
+    Path(mcp_profile_id): Path<String>,
+) -> Result<Json<McpProfileResponse>, ApiError> {
+    let profile = state
+        .service()
+        .mcp_profile(&mcp_profile_id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(McpProfileResponse::from_profile(profile)))
+}
+
+async fn put_mcp_profile(
+    State(state): State<AppState>,
+    Path(mcp_profile_id): Path<String>,
+    request: Result<Json<PutMcpProfileRequest>, JsonRejection>,
+) -> Result<Json<McpProfileResponse>, ApiError> {
+    let Json(request) =
+        request.map_err(|error| ApiError::bad_request("invalid_mcp_profile", error.body_text()))?;
+    let definition = request.into_definition(&mcp_profile_id);
+    let profile = state
+        .service()
+        .configure_mcp_profile(&mcp_profile_id, definition)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(McpProfileResponse::from_profile(Some(profile))))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<SessionsResponse>, ApiError> {

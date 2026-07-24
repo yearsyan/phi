@@ -302,7 +302,7 @@ const en = {
   'settings.connectionCopy':
     'The daemon key authorizes session access, file edits, and command execution.',
   'settings.connectionCompactCopy':
-    'Provider credentials remain stored by the daemon and are never returned.',
+    'Provider and MCP credentials remain stored by the daemon and are never returned.',
   'settings.load': 'Connect & load',
   'settings.authKey': 'Auth key',
   'settings.authKeyPlaceholder':
@@ -321,7 +321,7 @@ const en = {
   'settings.profileIdPlaceholder': 'for example: work-openai',
   'settings.showApiKey': 'Show API key',
   'settings.hideApiKey': 'Hide API key',
-  'settings.discardChanges': 'Discard unsaved Provider changes?',
+  'settings.discardChanges': 'Discard unsaved settings changes?',
   'settings.profileId': 'Profile id',
   'settings.sessionDefaults': 'New session defaults',
   'settings.sessionDefaultsCopy':
@@ -375,6 +375,126 @@ const en = {
     'Daemon auth key is required to save the provider profile.',
   'settings.errors.profileIdRequired': 'Provider profile id is required.',
   'settings.effortNone': '(none)',
+  'settings.sections': 'Settings sections',
+  'settings.tabs.providers': 'Providers',
+  'settings.tabs.agents': 'Agent Profiles',
+  'settings.tabs.mcp': 'MCP Profiles',
+  'settings.profileFooterHint':
+    'Profile changes apply when an Agent is next created or restored.',
+
+  // Agent Profile management
+  'settings.agent.profiles': 'Agent Profiles',
+  'settings.agent.profile': 'Agent Profile',
+  'settings.agent.noProfiles':
+    'Add an Agent Profile to define an agent persona.',
+  'settings.agent.add': 'Add Agent Profile',
+  'settings.agent.newProfileTitle': 'New Agent Profile',
+  'settings.agent.id': 'Agent Profile id',
+  'settings.agent.idPlaceholder': 'for example: reviewer',
+  'settings.agent.promptMode': 'Prompt mode',
+  'settings.agent.promptExtend': 'Extend the coding prompt',
+  'settings.agent.promptFull': 'Replace the coding prompt',
+  'settings.agent.prompt': 'Profile instructions',
+  'settings.agent.promptPlaceholder':
+    'Add persona, workflow, or project-specific instructions…',
+  'settings.agent.capability': 'Initial capability mode',
+  'settings.agent.toolPolicy': 'Tool policy',
+  'settings.agent.toolPolicyCopy':
+    'Use exact registered tool names. Deny entries take precedence.',
+  'settings.agent.skillPolicy': 'Skill policy',
+  'settings.agent.skillPolicyCopy':
+    'Use exact skill names. An enabled empty allow list permits none.',
+  'settings.agent.useAllowList': 'Restrict to an allow list',
+  'settings.agent.allowNames': 'Allowed names',
+  'settings.agent.denyNames': 'Denied names',
+  'settings.agent.namesPlaceholder': 'one exact name per line',
+  'settings.agent.mcpProfiles': 'MCP connections',
+  'settings.agent.mcpProfilesCopy':
+    'Each selected MCP Profile is connected when this Agent is created or restored.',
+  'settings.agent.noMcpProfiles':
+    'Create an MCP Profile first, then return here to attach it.',
+  'settings.agent.mcpCapabilityWarning':
+    'MCP tools are external side effects and require full access. Scheduled runs cannot open an approval prompt.',
+  'settings.agent.mcpCount': 'MCP',
+  'settings.agent.model': 'Model override',
+  'settings.agent.modelPlaceholder': 'Use the Provider Profile model',
+  'settings.agent.reasoning': 'Reasoning override',
+  'settings.agent.providerDefault': 'Use Provider Profile default',
+  'settings.agent.saved': 'Agent Profile saved.',
+  'settings.agent.discardChanges': 'Discard unsaved Agent Profile changes?',
+  'settings.agent.errors.idRequired': 'Agent Profile id is required.',
+  'settings.agent.errors.notConfigured':
+    'The daemon did not return the saved Agent Profile.',
+
+  // MCP Profile management
+  'settings.mcp.profiles': 'MCP Profiles',
+  'settings.mcp.profile': 'MCP Profile',
+  'settings.mcp.noProfiles':
+    'Add an MCP Profile for an HTTP or local stdio server.',
+  'settings.mcp.add': 'Add MCP Profile',
+  'settings.mcp.newProfileTitle': 'New MCP Profile',
+  'settings.mcp.id': 'MCP Profile id',
+  'settings.mcp.idPlaceholder': 'for example: github',
+  'settings.mcp.http': 'Streamable HTTP',
+  'settings.mcp.stdio': 'stdio process',
+  'settings.mcp.httpSettings': 'HTTP transport',
+  'settings.mcp.httpSettingsCopy':
+    'Connect to a Streamable HTTP MCP endpoint. Credentials stay in the daemon.',
+  'settings.mcp.url': 'Endpoint URL',
+  'settings.mcp.bearerToken': 'Bearer token (optional)',
+  'settings.mcp.secretPlaceholder': 'stored secret; re-enter when updating',
+  'settings.mcp.headers': 'Additional headers',
+  'settings.mcp.headersPlaceholder': 'X-API-Key: secret',
+  'settings.mcp.headersHint':
+    'One Name: Value pair per line. Values are never returned by the daemon.',
+  'settings.mcp.allowStateless': 'Allow stateless MCP servers',
+  'settings.mcp.reinitialize':
+    'Reinitialize when the server expires the MCP session',
+  'settings.mcp.stdioSettings': 'stdio transport',
+  'settings.mcp.stdioSettingsCopy':
+    'Start a local child process inside the Agent workspace.',
+  'settings.mcp.command': 'Command',
+  'settings.mcp.args': 'Arguments',
+  'settings.mcp.argsPlaceholder': '-y\n@modelcontextprotocol/server-example',
+  'settings.mcp.onePerLine': 'One argument per line.',
+  'settings.mcp.currentDir': 'Working directory (optional)',
+  'settings.mcp.currentDirPlaceholder':
+    'Relative to the Agent workspace; blank uses its root',
+  'settings.mcp.environment': 'Environment variables',
+  'settings.mcp.envPlaceholder': 'API_TOKEN=secret',
+  'settings.mcp.envHint':
+    'One NAME=VALUE pair per line. Values are never returned by the daemon.',
+  'settings.mcp.clearEnv': 'Clear the inherited process environment',
+  'settings.mcp.toolSettings': 'Tool exposure and limits',
+  'settings.mcp.toolSettingsCopy':
+    'A prefix keeps tool names from different MCP servers distinct.',
+  'settings.mcp.toolPrefix': 'Tool name prefix',
+  'settings.mcp.toolPrefixPlaceholder': 'defaults to the MCP Profile id',
+  'settings.mcp.toolPrefixHint':
+    'The exposed name is prefix__server_tool_name.',
+  'settings.mcp.connectTimeout': 'Connect timeout (seconds)',
+  'settings.mcp.requestTimeout': 'Request timeout (seconds)',
+  'settings.mcp.noTimeout': 'blank disables the request timeout',
+  'settings.mcp.maxOutputLines': 'Maximum output lines',
+  'settings.mcp.maxOutputBytes': 'Maximum output bytes',
+  'settings.mcp.secretUpdateWarning':
+    'The daemon redacts stored bearer tokens, headers, and environment values. Re-enter every existing secret before saving an update.',
+  'settings.mcp.saved': 'MCP Profile saved.',
+  'settings.mcp.discardChanges': 'Discard unsaved MCP Profile changes?',
+  'settings.mcp.errors.idRequired': 'MCP Profile id is required.',
+  'settings.mcp.errors.urlRequired': 'An HTTP endpoint URL is required.',
+  'settings.mcp.errors.commandRequired': 'A stdio command is required.',
+  'settings.mcp.errors.numbers':
+    'Timeouts and output limits must be positive integers; request timeout may be blank.',
+  'settings.mcp.errors.headerLine': 'Header line %{line} must use Name: Value.',
+  'settings.mcp.errors.envLine':
+    'Environment line %{line} must use NAME=VALUE.',
+  'settings.mcp.errors.bearerRequired':
+    'Re-enter the stored bearer token before updating this profile.',
+  'settings.mcp.errors.secretNameRequired':
+    'Re-enter the stored secret value for %{name}.',
+  'settings.mcp.errors.notConfigured':
+    'The daemon did not return the saved MCP Profile.',
 
   // Theme / language
   'theme.toggle': 'Toggle theme',
@@ -649,7 +769,7 @@ const zh: Record<TranslationKey, string> = {
   'settings.daemonConnection': 'Daemon 连接',
   'settings.connectionCopy': 'Daemon key 会授权会话访问、文件修改和命令执行。',
   'settings.connectionCompactCopy':
-    'Provider 凭据仅由 daemon 保存，不会在查询时返回。',
+    'Provider 与 MCP 凭据仅由 daemon 保存，不会在查询时返回。',
   'settings.load': '连接并加载',
   'settings.authKey': '鉴权密钥',
   'settings.authKeyPlaceholder': '长期 bearer key(PHI_DAEMON_AUTH_KEY_FILE)',
@@ -665,7 +785,7 @@ const zh: Record<TranslationKey, string> = {
   'settings.profileIdPlaceholder': '例如：work-openai',
   'settings.showApiKey': '显示 API key',
   'settings.hideApiKey': '隐藏 API key',
-  'settings.discardChanges': '要丢弃未保存的 Provider 更改吗？',
+  'settings.discardChanges': '要丢弃未保存的设置更改吗？',
   'settings.profileId': 'Profile id',
   'settings.sessionDefaults': '新会话默认值',
   'settings.sessionDefaultsCopy':
@@ -716,6 +836,113 @@ const zh: Record<TranslationKey, string> = {
     '保存 provider profile 需要提供 daemon 鉴权密钥。',
   'settings.errors.profileIdRequired': 'Provider profile id 不能为空。',
   'settings.effortNone': '(无)',
+  'settings.sections': '设置分类',
+  'settings.tabs.providers': 'Provider',
+  'settings.tabs.agents': 'Agent Profile',
+  'settings.tabs.mcp': 'MCP Profile',
+  'settings.profileFooterHint': 'Profile 更改将在下次创建或恢复 Agent 时生效。',
+
+  'settings.agent.profiles': 'Agent Profile 列表',
+  'settings.agent.profile': 'Agent Profile',
+  'settings.agent.noProfiles': '添加 Agent Profile 来定义独立的 Agent 角色。',
+  'settings.agent.add': '添加 Agent Profile',
+  'settings.agent.newProfileTitle': '新 Agent Profile',
+  'settings.agent.id': 'Agent Profile id',
+  'settings.agent.idPlaceholder': '例如：reviewer',
+  'settings.agent.promptMode': 'Prompt 模式',
+  'settings.agent.promptExtend': '扩展默认 coding prompt',
+  'settings.agent.promptFull': '替换默认 coding prompt',
+  'settings.agent.prompt': 'Profile 指令',
+  'settings.agent.promptPlaceholder': '添加角色、工作流或项目专属指令…',
+  'settings.agent.capability': '初始能力模式',
+  'settings.agent.toolPolicy': '工具策略',
+  'settings.agent.toolPolicyCopy':
+    '填写注册后的精确工具名；deny 的优先级高于 allow。',
+  'settings.agent.skillPolicy': 'Skill 策略',
+  'settings.agent.skillPolicyCopy':
+    '填写精确 Skill 名；启用但留空的 allow 列表表示全部禁用。',
+  'settings.agent.useAllowList': '限制为 allow 列表',
+  'settings.agent.allowNames': '允许的名称',
+  'settings.agent.denyNames': '拒绝的名称',
+  'settings.agent.namesPlaceholder': '每行一个精确名称',
+  'settings.agent.mcpProfiles': 'MCP 连接',
+  'settings.agent.mcpProfilesCopy':
+    '创建或恢复这个 Agent 时，会连接所有选中的 MCP Profile。',
+  'settings.agent.noMcpProfiles': '请先创建 MCP Profile，再回到这里关联。',
+  'settings.agent.mcpCapabilityWarning':
+    'MCP 工具属于外部副作用，需要 full access；定时任务运行时无法弹出授权确认。',
+  'settings.agent.mcpCount': '个 MCP',
+  'settings.agent.model': '模型覆盖',
+  'settings.agent.modelPlaceholder': '使用 Provider Profile 的模型',
+  'settings.agent.reasoning': 'Reasoning 覆盖',
+  'settings.agent.providerDefault': '使用 Provider Profile 默认值',
+  'settings.agent.saved': 'Agent Profile 已保存。',
+  'settings.agent.discardChanges': '要丢弃未保存的 Agent Profile 更改吗？',
+  'settings.agent.errors.idRequired': 'Agent Profile id 不能为空。',
+  'settings.agent.errors.notConfigured':
+    'Daemon 未返回已保存的 Agent Profile。',
+
+  'settings.mcp.profiles': 'MCP Profile 列表',
+  'settings.mcp.profile': 'MCP Profile',
+  'settings.mcp.noProfiles': '添加 HTTP 或本地 stdio MCP Server 配置。',
+  'settings.mcp.add': '添加 MCP Profile',
+  'settings.mcp.newProfileTitle': '新 MCP Profile',
+  'settings.mcp.id': 'MCP Profile id',
+  'settings.mcp.idPlaceholder': '例如：github',
+  'settings.mcp.http': 'Streamable HTTP',
+  'settings.mcp.stdio': 'stdio 进程',
+  'settings.mcp.httpSettings': 'HTTP transport',
+  'settings.mcp.httpSettingsCopy':
+    '连接 Streamable HTTP MCP endpoint，凭据仅保存在 daemon。',
+  'settings.mcp.url': 'Endpoint URL',
+  'settings.mcp.bearerToken': 'Bearer token（可选）',
+  'settings.mcp.secretPlaceholder': '已保存的密钥；更新时需重新输入',
+  'settings.mcp.headers': '附加 Headers',
+  'settings.mcp.headersPlaceholder': 'X-API-Key: secret',
+  'settings.mcp.headersHint':
+    '每行填写一个 Name: Value；daemon 不会返回 Value。',
+  'settings.mcp.allowStateless': '允许无状态 MCP Server',
+  'settings.mcp.reinitialize': '服务端 MCP session 过期时重新初始化',
+  'settings.mcp.stdioSettings': 'stdio transport',
+  'settings.mcp.stdioSettingsCopy': '在 Agent 工作区中启动一个本地子进程。',
+  'settings.mcp.command': '命令',
+  'settings.mcp.args': '参数',
+  'settings.mcp.argsPlaceholder': '-y\n@modelcontextprotocol/server-example',
+  'settings.mcp.onePerLine': '每行一个参数。',
+  'settings.mcp.currentDir': '工作目录（可选）',
+  'settings.mcp.currentDirPlaceholder':
+    '相对于 Agent 工作区；留空使用工作区根目录',
+  'settings.mcp.environment': '环境变量',
+  'settings.mcp.envPlaceholder': 'API_TOKEN=secret',
+  'settings.mcp.envHint': '每行填写一个 NAME=VALUE；daemon 不会返回 Value。',
+  'settings.mcp.clearEnv': '清除进程继承的环境变量',
+  'settings.mcp.toolSettings': '工具暴露与限制',
+  'settings.mcp.toolSettingsCopy': '使用前缀避免不同 MCP Server 暴露重名工具。',
+  'settings.mcp.toolPrefix': '工具名前缀',
+  'settings.mcp.toolPrefixPlaceholder': '默认使用 MCP Profile id',
+  'settings.mcp.toolPrefixHint': '最终暴露名称为 prefix__server_tool_name。',
+  'settings.mcp.connectTimeout': '连接超时（秒）',
+  'settings.mcp.requestTimeout': '请求超时（秒）',
+  'settings.mcp.noTimeout': '留空表示不限制请求时间',
+  'settings.mcp.maxOutputLines': '最大输出行数',
+  'settings.mcp.maxOutputBytes': '最大输出字节数',
+  'settings.mcp.secretUpdateWarning':
+    'Daemon 会隐藏已保存的 bearer token、header 和环境变量值；更新前必须重新填写所有已有密钥。',
+  'settings.mcp.saved': 'MCP Profile 已保存。',
+  'settings.mcp.discardChanges': '要丢弃未保存的 MCP Profile 更改吗？',
+  'settings.mcp.errors.idRequired': 'MCP Profile id 不能为空。',
+  'settings.mcp.errors.urlRequired': 'HTTP endpoint URL 不能为空。',
+  'settings.mcp.errors.commandRequired': 'stdio 命令不能为空。',
+  'settings.mcp.errors.numbers':
+    '超时和输出限制必须为正整数；请求超时可以留空。',
+  'settings.mcp.errors.headerLine':
+    'Header 第 %{line} 行必须使用 Name: Value 格式。',
+  'settings.mcp.errors.envLine':
+    '环境变量第 %{line} 行必须使用 NAME=VALUE 格式。',
+  'settings.mcp.errors.bearerRequired':
+    '更新该 profile 前请重新输入已保存的 bearer token。',
+  'settings.mcp.errors.secretNameRequired': '请重新输入 %{name} 对应的密钥值。',
+  'settings.mcp.errors.notConfigured': 'Daemon 未返回已保存的 MCP Profile。',
 
   'theme.toggle': '切换主题',
   'theme.dark': '深色',

@@ -941,6 +941,155 @@ class PublicProviderConfig {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Agent and MCP profiles                                                    */
+/* ------------------------------------------------------------------------- */
+
+class PublicAgentProfile {
+  const PublicAgentProfile({
+    required this.agentProfileId,
+    required this.revision,
+    this.promptMode = 'extend',
+    this.promptText = '',
+    this.toolAllow,
+    this.toolDeny = const [],
+    this.skillAllow,
+    this.skillDeny = const [],
+    this.mcpProfileIds = const [],
+    this.initialCapabilityMode = 'full_access',
+    this.model,
+    this.reasoningEffort,
+  });
+
+  final String agentProfileId;
+  final int revision;
+  final String promptMode;
+  final String promptText;
+  final List<String>? toolAllow;
+  final List<String> toolDeny;
+  final List<String>? skillAllow;
+  final List<String> skillDeny;
+  final List<String> mcpProfileIds;
+  final String initialCapabilityMode;
+  final String? model;
+  final String? reasoningEffort;
+
+  static PublicAgentProfile fromJson(Json json) {
+    final prompt = _asJson(json['prompt']);
+    final tools = _asJson(json['tools']);
+    final skills = _asJson(json['skills']);
+    return PublicAgentProfile(
+      agentProfileId: json['agent_profile_id'] as String? ?? 'default',
+      revision: _asInt(json['revision']),
+      promptMode: prompt['mode'] as String? ?? 'extend',
+      promptText: prompt['text'] as String? ?? '',
+      toolAllow: tools['allow'] is List
+          ? (tools['allow'] as List).whereType<String>().toList()
+          : null,
+      toolDeny: (tools['deny'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
+      skillAllow: skills['allow'] is List
+          ? (skills['allow'] as List).whereType<String>().toList()
+          : null,
+      skillDeny: (skills['deny'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
+      mcpProfileIds: (json['mcp_profile_ids'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
+      initialCapabilityMode:
+          json['initial_capability_mode'] as String? ?? 'full_access',
+      model: json['model'] as String?,
+      reasoningEffort: json['reasoning_effort'] as String?,
+    );
+  }
+}
+
+class PublicMcpTransport {
+  const PublicMcpTransport({
+    required this.type,
+    this.command,
+    this.args = const [],
+    this.currentDir,
+    this.envKeys = const [],
+    this.clearEnv = false,
+    this.url,
+    this.bearerTokenConfigured = false,
+    this.headerNames = const [],
+    this.allowStateless = true,
+    this.reinitializeOnExpiredSession = true,
+  });
+
+  final String type;
+  final String? command;
+  final List<String> args;
+  final String? currentDir;
+  final List<String> envKeys;
+  final bool clearEnv;
+  final String? url;
+  final bool bearerTokenConfigured;
+  final List<String> headerNames;
+  final bool allowStateless;
+  final bool reinitializeOnExpiredSession;
+
+  static PublicMcpTransport fromJson(Json json) => PublicMcpTransport(
+    type: json['type'] as String? ?? '',
+    command: json['command'] as String?,
+    args: (json['args'] as List? ?? const []).whereType<String>().toList(),
+    currentDir: json['current_dir'] as String?,
+    envKeys: (json['env_keys'] as List? ?? const [])
+        .whereType<String>()
+        .toList(),
+    clearEnv: json['clear_env'] as bool? ?? false,
+    url: json['url'] as String?,
+    bearerTokenConfigured: json['bearer_token_configured'] as bool? ?? false,
+    headerNames: (json['header_names'] as List? ?? const [])
+        .whereType<String>()
+        .toList(),
+    allowStateless: json['allow_stateless'] as bool? ?? true,
+    reinitializeOnExpiredSession:
+        json['reinitialize_on_expired_session'] as bool? ?? true,
+  );
+}
+
+class PublicMcpProfile {
+  const PublicMcpProfile({
+    required this.mcpProfileId,
+    required this.revision,
+    required this.transport,
+    required this.toolNamePrefix,
+    this.connectTimeoutSecs = 30,
+    this.requestTimeoutSecs = 60,
+    this.maxOutputLines = 2000,
+    this.maxOutputBytes = 51200,
+  });
+
+  final String mcpProfileId;
+  final int revision;
+  final PublicMcpTransport transport;
+  final String toolNamePrefix;
+  final int connectTimeoutSecs;
+  final int? requestTimeoutSecs;
+  final int maxOutputLines;
+  final int maxOutputBytes;
+
+  static PublicMcpProfile fromJson(Json json) => PublicMcpProfile(
+    mcpProfileId: json['mcp_profile_id'] as String? ?? '',
+    revision: _asInt(json['revision']),
+    transport: PublicMcpTransport.fromJson(_asJson(json['transport'])),
+    toolNamePrefix: json['tool_name_prefix'] as String? ?? '',
+    connectTimeoutSecs: _asInt(json['connect_timeout_secs'], 30),
+    requestTimeoutSecs: !json.containsKey('request_timeout_secs')
+        ? 60
+        : json['request_timeout_secs'] == null
+        ? null
+        : _asInt(json['request_timeout_secs'], 60),
+    maxOutputLines: _asInt(json['max_output_lines'], 2000),
+    maxOutputBytes: _asInt(json['max_output_bytes'], 51200),
+  );
+}
+
+/* ------------------------------------------------------------------------- */
 /* Workspace browsing                                                        */
 /* ------------------------------------------------------------------------- */
 

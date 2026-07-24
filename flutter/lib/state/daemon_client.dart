@@ -106,6 +106,22 @@ class DaemonClient {
         .toList();
   }
 
+  Future<List<PublicAgentProfile>> listAgentProfiles() async {
+    final json = await _requestJson('GET', '/v1/agent-profiles');
+    return (json['agent_profiles'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(PublicAgentProfile.fromJson)
+        .toList();
+  }
+
+  Future<List<PublicMcpProfile>> listMcpProfiles() async {
+    final json = await _requestJson('GET', '/v1/mcp-profiles');
+    return (json['mcp_profiles'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(PublicMcpProfile.fromJson)
+        .toList();
+  }
+
   /* ------------------------------- workspace ----------------------------- */
 
   Future<WorkspaceBrowseResponse> browseWorkspace([String? path]) async {

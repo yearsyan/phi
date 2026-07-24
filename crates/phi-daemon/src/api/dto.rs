@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     fmt,
     time::Duration,
 };
@@ -21,6 +21,8 @@ use crate::{
     runtime::{
         AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
         AskUserId, AskUserRequest, AssistantDraft, ContextCompactionPhase, ContextCompactionView,
+        DEFAULT_MCP_CONNECT_TIMEOUT_SECS, DEFAULT_MCP_OUTPUT_BYTES, DEFAULT_MCP_OUTPUT_LINES,
+        DEFAULT_MCP_REQUEST_TIMEOUT_SECS, McpProfile, McpProfileDefinition, McpTransportDefinition,
         NamePolicy, PromptDefinition, PromptMode, RunId, RuntimeEvent, RuntimeEventKind, SessionId,
         SubagentSummary, ToolCallDraft, ToolPermissionId, ToolPermissionPrompt,
     },
@@ -396,6 +398,8 @@ pub struct PutAgentProfileRequest {
     pub tools: NamePolicyDto,
     #[serde(default)]
     pub skills: NamePolicyDto,
+    #[serde(default)]
+    pub mcp_profile_ids: Vec<String>,
     #[serde(default, rename = "initial_agent_mode")]
     _initial_agent_mode: Option<LegacyAgentMode>,
     #[serde(default)]
@@ -428,6 +432,7 @@ impl From<PutAgentProfileRequest> for AgentProfileDefinition {
                 allow: request.skills.allow,
                 deny: request.skills.deny,
             },
+            mcp_profile_ids: request.mcp_profile_ids,
             initial_capability_mode: request.initial_capability_mode,
             model: request.model,
             reasoning_effort: request.reasoning_effort,
@@ -442,6 +447,7 @@ pub struct PublicAgentProfile {
     pub prompt: PromptDefinitionDto,
     pub tools: NamePolicyDto,
     pub skills: NamePolicyDto,
+    pub mcp_profile_ids: Vec<String>,
     pub initial_capability_mode: CapabilityMode,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -465,6 +471,7 @@ impl From<AgentProfile> for PublicAgentProfile {
                 allow: definition.skills.allow,
                 deny: definition.skills.deny,
             },
+            mcp_profile_ids: definition.mcp_profile_ids,
             initial_capability_mode: definition.initial_capability_mode,
             model: definition.model,
             reasoning_effort: definition.reasoning_effort,
@@ -490,6 +497,269 @@ impl AgentProfileResponse {
 #[derive(Debug, Serialize)]
 pub struct AgentProfilesResponse {
     pub agent_profiles: Vec<PublicAgentProfile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutMcpProfileRequest {
+    pub transport: PutMcpTransportRequest,
+    #[serde(default)]
+    pub tool_name_prefix: Option<String>,
+    #[serde(default = "default_mcp_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_mcp_request_timeout_secs")]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default = "default_mcp_output_lines")]
+    pub max_output_lines: usize,
+    #[serde(default = "default_mcp_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+impl fmt::Debug for PutMcpProfileRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PutMcpProfileRequest")
+            .field("transport", &self.transport)
+            .field("tool_name_prefix", &self.tool_name_prefix)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("max_output_lines", &self.max_output_lines)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .finish()
+    }
+}
+
+impl PutMcpProfileRequest {
+    pub fn into_definition(self, mcp_profile_id: &str) -> McpProfileDefinition {
+        McpProfileDefinition {
+            transport: self.transport.into(),
+            tool_name_prefix: self
+                .tool_name_prefix
+                .unwrap_or_else(|| mcp_profile_id.to_owned()),
+            connect_timeout_secs: self.connect_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+            max_output_lines: self.max_output_lines,
+            max_output_bytes: self.max_output_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PutMcpTransportRequest {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        current_dir: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        clear_env: bool,
+    },
+    Http {
+        url: String,
+        #[serde(default)]
+        bearer_token: Option<String>,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default = "default_true")]
+        allow_stateless: bool,
+        #[serde(default = "default_true")]
+        reinitialize_on_expired_session: bool,
+    },
+}
+
+impl fmt::Debug for PutMcpTransportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio {
+                command,
+                args,
+                current_dir,
+                env,
+                clear_env,
+            } => formatter
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("current_dir", current_dir)
+                .field("env_keys", &env.keys().collect::<Vec<_>>())
+                .field("clear_env", clear_env)
+                .finish(),
+            Self::Http {
+                url,
+                bearer_token,
+                headers,
+                allow_stateless,
+                reinitialize_on_expired_session,
+            } => formatter
+                .debug_struct("Http")
+                .field("url", url)
+                .field("bearer_token", &bearer_token.as_ref().map(|_| "[REDACTED]"))
+                .field("header_names", &headers.keys().collect::<Vec<_>>())
+                .field("allow_stateless", allow_stateless)
+                .field(
+                    "reinitialize_on_expired_session",
+                    reinitialize_on_expired_session,
+                )
+                .finish(),
+        }
+    }
+}
+
+impl From<PutMcpTransportRequest> for McpTransportDefinition {
+    fn from(transport: PutMcpTransportRequest) -> Self {
+        match transport {
+            PutMcpTransportRequest::Stdio {
+                command,
+                args,
+                current_dir,
+                env,
+                clear_env,
+            } => Self::Stdio {
+                command,
+                args,
+                current_dir,
+                env,
+                clear_env,
+            },
+            PutMcpTransportRequest::Http {
+                url,
+                bearer_token,
+                headers,
+                allow_stateless,
+                reinitialize_on_expired_session,
+            } => Self::Http {
+                url,
+                bearer_token,
+                headers,
+                allow_stateless,
+                reinitialize_on_expired_session,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublicMcpProfile {
+    pub mcp_profile_id: String,
+    pub revision: u64,
+    pub transport: PublicMcpTransport,
+    pub tool_name_prefix: String,
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: Option<u64>,
+    pub max_output_lines: usize,
+    pub max_output_bytes: usize,
+}
+
+impl From<McpProfile> for PublicMcpProfile {
+    fn from(profile: McpProfile) -> Self {
+        let definition = profile.definition;
+        Self {
+            mcp_profile_id: profile.mcp_profile_id,
+            revision: profile.revision,
+            transport: PublicMcpTransport::from(definition.transport),
+            tool_name_prefix: definition.tool_name_prefix,
+            connect_timeout_secs: definition.connect_timeout_secs,
+            request_timeout_secs: definition.request_timeout_secs,
+            max_output_lines: definition.max_output_lines,
+            max_output_bytes: definition.max_output_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PublicMcpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        current_dir: Option<String>,
+        env_keys: Vec<String>,
+        clear_env: bool,
+    },
+    Http {
+        url: String,
+        bearer_token_configured: bool,
+        header_names: Vec<String>,
+        allow_stateless: bool,
+        reinitialize_on_expired_session: bool,
+    },
+}
+
+impl From<McpTransportDefinition> for PublicMcpTransport {
+    fn from(transport: McpTransportDefinition) -> Self {
+        match transport {
+            McpTransportDefinition::Stdio {
+                command,
+                args,
+                current_dir,
+                env,
+                clear_env,
+            } => Self::Stdio {
+                command,
+                args,
+                current_dir,
+                env_keys: env.into_keys().collect(),
+                clear_env,
+            },
+            McpTransportDefinition::Http {
+                url,
+                bearer_token,
+                headers,
+                allow_stateless,
+                reinitialize_on_expired_session,
+            } => Self::Http {
+                url,
+                bearer_token_configured: bearer_token.is_some(),
+                header_names: headers.into_keys().collect(),
+                allow_stateless,
+                reinitialize_on_expired_session,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpProfileResponse {
+    pub configured: bool,
+    pub mcp_profile: Option<PublicMcpProfile>,
+}
+
+impl McpProfileResponse {
+    pub fn from_profile(profile: Option<McpProfile>) -> Self {
+        Self {
+            configured: profile.is_some(),
+            mcp_profile: profile.map(PublicMcpProfile::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpProfilesResponse {
+    pub mcp_profiles: Vec<PublicMcpProfile>,
+}
+
+fn default_mcp_connect_timeout_secs() -> u64 {
+    DEFAULT_MCP_CONNECT_TIMEOUT_SECS
+}
+
+fn default_mcp_request_timeout_secs() -> Option<u64> {
+    Some(DEFAULT_MCP_REQUEST_TIMEOUT_SECS)
+}
+
+fn default_mcp_output_lines() -> usize {
+    DEFAULT_MCP_OUTPUT_LINES
+}
+
+fn default_mcp_output_bytes() -> usize {
+    DEFAULT_MCP_OUTPUT_BYTES
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1892,6 +2162,46 @@ mod tests {
     }
 
     #[test]
+    fn mcp_profile_request_debug_and_public_dto_redact_transport_secrets() {
+        let bearer_secret = "canary-mcp-bearer-that-must-never-appear";
+        let header_secret = "canary-mcp-header-that-must-never-appear";
+        let request: PutMcpProfileRequest = serde_json::from_value(serde_json::json!({
+            "transport": {
+                "type": "http",
+                "url": "https://mcp.example.test/rpc",
+                "bearer_token": bearer_secret,
+                "headers": {
+                    "X-API-Key": header_secret
+                }
+            }
+        }))
+        .unwrap();
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(bearer_secret));
+        assert!(!debug.contains(header_secret));
+        assert!(debug.contains("[REDACTED]"));
+
+        let profile = McpProfile {
+            mcp_profile_id: "remote".to_owned(),
+            revision: 1,
+            definition: request.into_definition("remote").normalized().unwrap(),
+        };
+        let value = serde_json::to_value(McpProfileResponse::from_profile(Some(profile))).unwrap();
+        assert_eq!(value["mcp_profile"]["transport"]["type"], "http");
+        assert_eq!(
+            value["mcp_profile"]["transport"]["bearer_token_configured"],
+            true
+        );
+        assert_eq!(
+            value["mcp_profile"]["transport"]["header_names"],
+            serde_json::json!(["x-api-key"])
+        );
+        assert!(!value.to_string().contains(bearer_secret));
+        assert!(!value.to_string().contains(header_secret));
+    }
+
+    #[test]
     fn scheduled_task_request_debug_redacts_prompt() {
         let secret = "canary-scheduled-prompt-that-must-not-appear-in-debug";
         let request: CreateScheduledTaskRequest = serde_json::from_value(serde_json::json!({
@@ -1959,6 +2269,7 @@ mod tests {
         assert_eq!(defaults.prompt.text, "");
         assert_eq!(defaults.tools, NamePolicy::default());
         assert_eq!(defaults.skills, NamePolicy::default());
+        assert!(defaults.mcp_profile_ids.is_empty());
         assert_eq!(defaults.initial_capability_mode, CapabilityMode::FullAccess);
         assert_eq!(defaults.model, None);
         assert_eq!(defaults.reasoning_effort, None);
@@ -1976,6 +2287,7 @@ mod tests {
                 "allow": ["rust-review"],
                 "deny": []
             },
+            "mcp_profile_ids": ["github"],
             "initial_agent_mode": "plan",
             "initial_capability_mode": "workspace_edit",
             "model": "review-model",
@@ -1993,6 +2305,7 @@ mod tests {
             configured.skills.allow,
             Some(vec!["rust-review".to_owned()])
         );
+        assert_eq!(configured.mcp_profile_ids, vec!["github"]);
         assert_eq!(
             configured.initial_capability_mode,
             CapabilityMode::WorkspaceEdit
@@ -2036,6 +2349,7 @@ mod tests {
                     allow: Some(vec!["rust-review".to_owned()]),
                     deny: Vec::new(),
                 },
+                mcp_profile_ids: vec!["github".to_owned()],
                 initial_capability_mode: CapabilityMode::WorkspaceEdit,
                 model: Some("review-model".to_owned()),
                 reasoning_effort: Some(ReasoningEffort::High),
@@ -2048,6 +2362,7 @@ mod tests {
         assert_eq!(value["agent_profile"]["agent_profile_id"], "reviewer");
         assert_eq!(value["agent_profile"]["revision"], 3);
         assert_eq!(value["agent_profile"]["prompt"]["mode"], "extend");
+        assert_eq!(value["agent_profile"]["mcp_profile_ids"][0], "github");
         assert!(value["agent_profile"].get("initial_agent_mode").is_none());
         assert_eq!(
             value["agent_profile"]["initial_capability_mode"],

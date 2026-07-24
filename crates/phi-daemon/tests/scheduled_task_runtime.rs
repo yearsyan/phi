@@ -20,8 +20,8 @@ use phi::{
 use phi_daemon::{
     api::AppState,
     runtime::{
-        AgentBuildRequest, AgentFactory, AgentFactoryError, AgentRegistry, BuiltAgent,
-        compile_agent_profile, default_agent_profile,
+        AgentBuildRequest, AgentFactory, AgentFactoryError, AgentProfileDefinition, AgentRegistry,
+        BuiltAgent, compile_agent_profile, default_agent_profile,
     },
     scheduled_task::{
         ScheduledIntervalUnit, ScheduledRunOutcome, ScheduledTask, ScheduledTaskError,
@@ -80,6 +80,10 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
         Arc::new(InMemorySessionStorage::new()),
         providers,
     ));
+    service
+        .configure_agent_profile("reviewer", AgentProfileDefinition::default())
+        .await
+        .unwrap();
     let manager = Arc::new(ScheduledTaskManager::new(
         Arc::clone(&service),
         Arc::new(MemoryScheduledTaskStore::new()),
@@ -104,6 +108,7 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
             "name": "Weekday review",
             "prompt": "Review the latest workspace changes",
             "workspace": workspace.0,
+            "agent_profile_id": "reviewer",
             "schedule": {
                 "type": "daily",
                 "time": "09:00",
@@ -119,6 +124,7 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
     let created: Value = serde_json::from_slice(&create.bytes().await.unwrap()).unwrap();
     let task_id = created["task_id"].as_str().unwrap();
     assert_eq!(created["prompt"], "Review the latest workspace changes");
+    assert_eq!(created["agent_profile_id"], "reviewer");
     assert_eq!(created["schedule"]["type"], "daily");
     assert_eq!(created["schedule"]["timezone"], "Asia/Singapore");
     assert_eq!(created["revision"], 1);

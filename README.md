@@ -30,8 +30,8 @@
   `plan` 类型、sidechain transcript 恢复、模型与 reasoning override、输出契约、
   host-owned workspace isolation、双向通知和永久关闭
 - 持续工具轮次与可复用对话历史
-- 独立 `phi-daemon` 二进制：版本化 Agent Profile、session registry、HTTP 列表、
-  new/attach WebSocket、可重连的 `askuser` 与持久化定时任务调度
+- 独立 `phi-daemon` 二进制：版本化 Provider/Agent/MCP Profile、session registry、
+  HTTP 列表、new/attach WebSocket、可重连的 `askuser` 与持久化定时任务调度
 - React/Vite Web 客户端与 Flutter 客户端；Flutter 支持 Android、iOS、macOS、Windows 和 HarmonyOS/OpenHarmony
 
 ## 快速运行
@@ -64,7 +64,7 @@ DAEMON_KEY="$(cat "$HOME/.phi/daemon/auth.key")"
 curl -X PUT http://127.0.0.1:8787/v1/providers/default \
   -H "Authorization: Bearer $DAEMON_KEY" \
   -H 'content-type: application/json' \
-  -d '{"provider":"openai_chat","api_key":"...","base_url":"https://example.com/v1","model":"model-name"}'
+  -d '{"provider":"openai_chat","api_key":"...","base_url":"https://example.com/v1","model":"model-name","max_context_tokens":128000}'
 ```
 
 daemon 在交互式终端中默认显示包含连接地址和长期 key 的 App 连接二维码；请像 key 文件
@@ -908,7 +908,10 @@ HTTP/WebSocket 接口：
 - `GET /v1/providers`：列出 daemon 的命名 Provider profiles（密钥不回显）。
 - `GET/PUT /v1/providers/{profile_id}`：查询或原子更新指定 Provider profile。
 - `GET /v1/agent-profiles`、`GET/PUT /v1/agent-profiles/{agent_profile_id}`：管理
-  prompt、工具/skill 筛选、初始 capability 和生成 override；revision 按 profile 独立递增。
+  prompt、工具/skill 筛选、MCP 引用、初始 capability 和生成 override；revision 按
+  profile 独立递增。
+- `GET /v1/mcp-profiles`、`GET/PUT /v1/mcp-profiles/{mcp_profile_id}`：管理独立的
+  stdio/Streamable HTTP MCP 连接；公开响应只返回 secret 是否已配置或其键名。
 - `GET /v1/sessions`：列出已经持久化的 session；同时返回向后兼容的有序
   `sessions` 和由 daemon 按工作区投影的 `workspaces` 树。
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
@@ -988,9 +991,10 @@ NODE_EXTRA_CA_CERTS=../.phi/daemon/tls/localhost.crt \
   pnpm dev
 ```
 
-首次使用需在设置中保存 daemon 长期 key 和至少一个 Provider profile。设置页会列出
-daemon 中的全部命名 Provider profiles，可在同一界面新增配置、切换编辑并选择新对话的
-默认 profile；daemon 已保存的 API key 不会返回浏览器。已有本地配置时，页面会自动连接
+首次使用需在设置中保存 daemon 长期 key 和至少一个 Provider profile。设置页会分别列出
+Provider、Agent Profile 和 MCP Profile；MCP 支持 Streamable HTTP 与 stdio，Agent
+Profile 可关联多个 MCP。daemon 已保存的 API key、MCP bearer/header/environment
+secret 不会返回浏览器。已有本地配置时，页面会自动连接
 一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
 客户端在 `session_created` 后继续复用原 WebSocket，不会在首条消息开始时强制重连；
 连接中断后，已激活 session 会通过 attach 自动退避恢复。prompt 使用 `request_id`
@@ -1018,7 +1022,8 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 之外的安全区，避免最后一行操作贴住浮动输入框。
 侧栏的“定时任务”页面可创建每日（IANA 时区与工作日）或间隔调度，并展示
 运行中/已暂停分组、下次时间与最近结果；可暂停、恢复、立即运行、删除或打开最近
-执行产生的 session。
+执行产生的 session。任务可指定 Agent Profile，因此也会继承该 profile 引用的 MCP；
+定时运行没有交互审批，MCP 工具需要 `full_access` 才会可用。
 
 ### Flutter client
 
@@ -1065,12 +1070,13 @@ Machines 管理，并在会话页标题栏一键切换活跃机器；开发时�
 `PHI_DAEMON_URL`/`PHI_DAEMON_KEY` dart define 注入首台机器。Flutter-OH 版本、DevEco 签名和
 HAP 构建步骤见 [`flutter/README.md`](flutter/README.md)。
 
-完整 Provider/Agent Profile、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
+完整 Provider/Agent/MCP Profile、wire protocol、事件 DTO、排队与停止 checkpoint 语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。daemon factory 按
 `profile_id` 读取 Provider 配置，并按 `agent_profile_id` 编译 `extend`/`full` prompt、
 工具/skill policy、初始 capability 与可选 model/reasoning override。首 prompt 激活时
 会把完整 resolved Agent Profile 与 revision pin 到 session metadata；之后 profile
-更新只影响新 session，重启恢复仍使用原 pin。
+更新只影响新 session，重启恢复仍使用原 pin。MCP Profile 的 endpoint、命令和 secret
+独立存储；Agent Profile 只 pin 其 ID 列表，恢复与定时任务运行时读取最新 MCP 配置。
 
 standalone daemon 默认以 `PHI_DAEMON_WORKSPACE_DIR` 为根目录安装 `read`、`edit`、
 `write`、`bash` 及后台 bash task 工具。该目录是新 session 的默认 `Workspace`；

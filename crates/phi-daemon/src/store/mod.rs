@@ -1,5 +1,6 @@
 mod agent_profile;
 mod disk;
+mod mcp_profile;
 mod memory;
 mod provider;
 mod scheduled_task;
@@ -17,6 +18,9 @@ pub use agent_profile::{
     AgentProfileStore, AgentProfileStoreError, DiskAgentProfileStore, MemoryAgentProfileStore,
 };
 pub use disk::DiskControlStore;
+pub use mcp_profile::{
+    DiskMcpProfileStore, McpProfileStore, McpProfileStoreError, MemoryMcpProfileStore,
+};
 pub use memory::MemoryControlStore;
 pub use provider::{DiskProviderStore, MemoryProviderStore};
 pub use scheduled_task::{

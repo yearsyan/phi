@@ -3566,7 +3566,215 @@ async fn agent_profile_http_manages_revisions_and_configures_new_websockets() {
 }
 
 #[tokio::test]
-async fn agent_profile_http_reports_management_unavailable_for_custom_services() {
+async fn mcp_profile_http_supports_http_and_stdio_without_echoing_secrets() {
+    let providers = Arc::new(MemoryProviderStore::new());
+    providers
+        .replace_provider(phi_daemon::store::ProviderConfig::new(
+            phi_daemon::store::ProviderKind::OpenAiResponses,
+            "mcp-profile-test-secret",
+            "http://127.0.0.1:9/v1",
+            "provider-model",
+            128_000,
+        ))
+        .await
+        .unwrap();
+    let service = Arc::new(ApplicationService::managed(
+        AgentRegistry::new(),
+        Arc::new(MemoryControlStore::new()),
+        Arc::new(InMemorySessionStorage::new()),
+        providers,
+    ));
+    let (address, stop, server) = spawn_server(Arc::clone(&service)).await;
+
+    let (status, initial) = http_json(address, "GET", "/v1/mcp-profiles", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(initial["mcp_profiles"], json!([]));
+
+    let bearer_secret = "remote-bearer-must-not-be-returned";
+    let header_secret = "remote-header-must-not-be-returned";
+    let http_definition = json!({
+        "transport": {
+            "type": "http",
+            "url": "https://mcp.example.test/rpc",
+            "bearer_token": bearer_secret,
+            "headers": {
+                "X-API-Key": header_secret
+            },
+            "allow_stateless": false,
+            "reinitialize_on_expired_session": true
+        },
+        "tool_name_prefix": "remote",
+        "connect_timeout_secs": 12,
+        "request_timeout_secs": null,
+        "max_output_lines": 123,
+        "max_output_bytes": 4567
+    });
+    let (status, remote) = http_json(
+        address,
+        "PUT",
+        "/v1/mcp-profiles/remote",
+        Some(http_definition),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(remote["configured"], true);
+    assert_eq!(remote["mcp_profile"]["revision"], 1);
+    assert_eq!(remote["mcp_profile"]["transport"]["type"], "http");
+    assert_eq!(
+        remote["mcp_profile"]["transport"]["bearer_token_configured"],
+        true
+    );
+    assert_eq!(
+        remote["mcp_profile"]["transport"]["header_names"],
+        json!(["x-api-key"])
+    );
+    assert_eq!(remote["mcp_profile"]["request_timeout_secs"], json!(null));
+    assert!(!remote.to_string().contains(bearer_secret));
+    assert!(!remote.to_string().contains(header_secret));
+
+    let env_secret = "stdio-environment-must-not-be-returned";
+    let stdio_definition = json!({
+        "transport": {
+            "type": "stdio",
+            "command": "phi-missing-mcp-executable-for-test",
+            "args": ["--stdio"],
+            "current_dir": "tools",
+            "env": {
+                "MCP_TOKEN": env_secret
+            },
+            "clear_env": true
+        },
+        "tool_name_prefix": "local"
+    });
+    let (status, local) = http_json(
+        address,
+        "PUT",
+        "/v1/mcp-profiles/local",
+        Some(stdio_definition),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(local["mcp_profile"]["transport"]["type"], "stdio");
+    assert_eq!(
+        local["mcp_profile"]["transport"]["env_keys"],
+        json!(["MCP_TOKEN"])
+    );
+    assert_eq!(local["mcp_profile"]["transport"]["clear_env"], true);
+    assert!(!local.to_string().contains(env_secret));
+
+    let stored_remote = service.mcp_profile("remote").await.unwrap().unwrap();
+    let phi_daemon::runtime::McpTransportDefinition::Http {
+        bearer_token,
+        headers,
+        ..
+    } = stored_remote.definition.transport
+    else {
+        panic!("remote profile must retain its HTTP transport");
+    };
+    assert_eq!(bearer_token.as_deref(), Some(bearer_secret));
+    assert_eq!(
+        headers.get("x-api-key").map(String::as_str),
+        Some(header_secret)
+    );
+    let stored_local = service.mcp_profile("local").await.unwrap().unwrap();
+    let phi_daemon::runtime::McpTransportDefinition::Stdio { env, .. } =
+        stored_local.definition.transport
+    else {
+        panic!("local profile must retain its stdio transport");
+    };
+    assert_eq!(env.get("MCP_TOKEN").map(String::as_str), Some(env_secret));
+
+    let (status, listed) = http_json(address, "GET", "/v1/mcp-profiles", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(listed["mcp_profiles"].as_array().unwrap().len(), 2);
+    assert!(!listed.to_string().contains(bearer_secret));
+    assert!(!listed.to_string().contains(header_secret));
+    assert!(!listed.to_string().contains(env_secret));
+
+    let agent_definition = json!({
+        "mcp_profile_ids": ["remote", "local"],
+        "initial_capability_mode": "full_access"
+    });
+    let (status, agent) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/with-mcp",
+        Some(agent_definition),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        agent["agent_profile"]["mcp_profile_ids"],
+        json!(["remote", "local"])
+    );
+
+    let (status, local_only_agent) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/local-only",
+        Some(json!({
+            "mcp_profile_ids": ["local"],
+            "initial_capability_mode": "full_access"
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        local_only_agent["agent_profile"]["mcp_profile_ids"],
+        json!(["local"])
+    );
+    let mut socket = RawWebSocket::connect(address, "/v1/ws/new?agent_profile_id=local-only").await;
+    assert_eq!(socket.receive_json().await["type"], "building");
+    let build_failure = socket.receive_json().await;
+    assert_eq!(build_failure["type"], "fatal_error");
+    assert_eq!(build_failure["code"], "agent_build_failed");
+    assert!(build_failure["message"].as_str().unwrap().contains("local"));
+    drop(socket);
+
+    let (status, missing_reference) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/missing-mcp",
+        Some(json!({ "mcp_profile_ids": ["not-configured"] })),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(missing_reference["code"], "invalid_agent_profile");
+
+    let (status, duplicate_prefix) = http_json(
+        address,
+        "PUT",
+        "/v1/mcp-profiles/duplicate-prefix",
+        Some(json!({
+            "transport": {
+                "type": "stdio",
+                "command": "another-mcp"
+            },
+            "tool_name_prefix": "remote"
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(duplicate_prefix["mcp_profile"]["revision"], 1);
+    let (status, duplicate_reference) = http_json(
+        address,
+        "PUT",
+        "/v1/agent-profiles/duplicate-prefix",
+        Some(json!({
+            "mcp_profile_ids": ["remote", "duplicate-prefix"]
+        })),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(duplicate_reference["code"], "invalid_agent_profile");
+
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    assert!(service.shutdown().await.is_empty());
+}
+
+#[tokio::test]
+async fn profile_http_reports_management_unavailable_for_custom_services() {
     let service = Arc::new(test_service(
         AgentRegistry::new(),
         Arc::new(MemoryControlStore::new()),
@@ -3578,6 +3786,10 @@ async fn agent_profile_http_reports_management_unavailable_for_custom_services()
     let (status, error) = http_json(address, "GET", "/v1/agent-profiles", None).await;
     assert_eq!(status, 501);
     assert_eq!(error["code"], "agent_profile_management_unavailable");
+
+    let (status, error) = http_json(address, "GET", "/v1/mcp-profiles", None).await;
+    assert_eq!(status, 501);
+    assert_eq!(error["code"], "mcp_profile_management_unavailable");
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();

@@ -16,6 +16,8 @@ import {
   PlusIcon,
   ProviderIcon,
 } from '../common/Icons.tsx';
+import { AgentProfileManager } from './AgentProfileManager.tsx';
+import { McpProfileManager } from './McpProfileManager.tsx';
 import styles from './SettingsModal.module.css';
 
 const PROVIDERS: ProviderKind[] = [
@@ -63,6 +65,7 @@ interface ProfileFormState {
 }
 
 type BuildResult = PutProviderRequest | { errorKey: TranslationKey };
+type SettingsSection = 'providers' | 'agents' | 'mcp';
 
 const emptyForm = (profileId = ''): ProfileFormState => ({
   profileId,
@@ -127,6 +130,8 @@ export function SettingsModal({
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [section, setSection] = useState<SettingsSection>('providers');
+  const [secondaryDirty, setSecondaryDirty] = useState(false);
   const loadRevision = useRef(0);
   const profileIdInput = useRef<HTMLInputElement>(null);
 
@@ -189,8 +194,10 @@ export function SettingsModal({
   );
 
   const confirmDiscard = useCallback(
-    () => !dirty || window.confirm(t('settings.discardChanges')),
-    [dirty, t],
+    () =>
+      (!dirty && !secondaryDirty) ||
+      window.confirm(t('settings.discardChanges')),
+    [dirty, secondaryDirty, t],
   );
 
   const requestClose = useCallback(() => {
@@ -237,6 +244,19 @@ export function SettingsModal({
   const handleAddProfile = () => {
     if (!confirmDiscard()) return;
     startNewProfile();
+  };
+
+  const selectSection = (next: SettingsSection) => {
+    if (next === section) return;
+    if (
+      section !== 'providers' &&
+      secondaryDirty &&
+      !window.confirm(t('settings.discardChanges'))
+    ) {
+      return;
+    }
+    setSecondaryDirty(false);
+    setSection(next);
   };
 
   const buildBody = (): BuildResult => {
@@ -400,289 +420,340 @@ export function SettingsModal({
           </span>
         </section>
 
-        <div className={styles.providerLayout}>
-          <aside className={styles.providerSidebar}>
-            <div className={styles.sidebarHeading}>
-              <span>{t('settings.providers')}</span>
-              <small>{profiles.length}</small>
-            </div>
-            <div className={styles.providerList}>
-              {profiles.map((profile) => (
-                <button
-                  type="button"
-                  key={profile.profile_id}
-                  className={`${styles.providerItem} ${
-                    configured && form.profileId === profile.profile_id
-                      ? styles.providerItemSelected
-                      : ''
-                  }`}
-                  onClick={() => handleSelectProfile(profile)}
-                  aria-label={`${profile.profile_id}: ${profile.model}`}
-                  aria-current={
-                    configured && form.profileId === profile.profile_id
-                      ? 'true'
-                      : undefined
-                  }
-                >
-                  <span className={styles.providerItemIcon}>
-                    <ProviderIcon />
-                  </span>
-                  <span className={styles.providerItemCopy}>
-                    <strong>{profile.profile_id}</strong>
-                    <small>{profile.model}</small>
-                  </span>
-                  <i aria-hidden="true" />
-                </button>
-              ))}
-              {!loading && profiles.length === 0 && (
-                <p className={styles.noProviders}>
-                  {t('settings.noProviders')}
-                </p>
-              )}
-            </div>
-            <button
-              type="button"
-              className={styles.addProviderButton}
-              onClick={handleAddProfile}
-            >
-              <PlusIcon />
-              {t('settings.addProvider')}
-            </button>
-          </aside>
+        <nav className={styles.sectionTabs} aria-label={t('settings.sections')}>
+          <button
+            type="button"
+            aria-current={section === 'providers' ? 'page' : undefined}
+            onClick={() => selectSection('providers')}
+          >
+            {t('settings.tabs.providers')}
+          </button>
+          <button
+            type="button"
+            aria-current={section === 'agents' ? 'page' : undefined}
+            onClick={() => selectSection('agents')}
+          >
+            {t('settings.tabs.agents')}
+          </button>
+          <button
+            type="button"
+            aria-current={section === 'mcp' ? 'page' : undefined}
+            onClick={() => selectSection('mcp')}
+          >
+            {t('settings.tabs.mcp')}
+          </button>
+        </nav>
 
-          <main className={styles.providerEditor}>
-            <div className={styles.editorHeader}>
-              <div>
-                <span>{t('settings.providerProfile')}</span>
-                <h3>
-                  {configured ? form.profileId : t('settings.newProviderTitle')}
-                </h3>
+        {section === 'providers' && (
+          <div className={styles.providerLayout}>
+            <aside className={styles.providerSidebar}>
+              <div className={styles.sidebarHeading}>
+                <span>{t('settings.providers')}</span>
+                <small>{profiles.length}</small>
               </div>
-              <div className={styles.editorBadges}>
-                {configured && (
-                  <span className={styles.configuredBadge}>
-                    <CheckIcon />
-                    {t('settings.configured')}
-                  </span>
-                )}
-                {selectedIsDefault && (
-                  <span className={styles.defaultBadge}>
-                    {t('settings.defaultProvider')}
-                  </span>
+              <div className={styles.providerList}>
+                {profiles.map((profile) => (
+                  <button
+                    type="button"
+                    key={profile.profile_id}
+                    className={`${styles.providerItem} ${
+                      configured && form.profileId === profile.profile_id
+                        ? styles.providerItemSelected
+                        : ''
+                    }`}
+                    onClick={() => handleSelectProfile(profile)}
+                    aria-label={`${profile.profile_id}: ${profile.model}`}
+                    aria-current={
+                      configured && form.profileId === profile.profile_id
+                        ? 'true'
+                        : undefined
+                    }
+                  >
+                    <span className={styles.providerItemIcon}>
+                      <ProviderIcon />
+                    </span>
+                    <span className={styles.providerItemCopy}>
+                      <strong>{profile.profile_id}</strong>
+                      <small>{profile.model}</small>
+                    </span>
+                    <i aria-hidden="true" />
+                  </button>
+                ))}
+                {!loading && profiles.length === 0 && (
+                  <p className={styles.noProviders}>
+                    {t('settings.noProviders')}
+                  </p>
                 )}
               </div>
-            </div>
+              <button
+                type="button"
+                className={styles.addProviderButton}
+                onClick={handleAddProfile}
+              >
+                <PlusIcon />
+                {t('settings.addProvider')}
+              </button>
+            </aside>
 
-            <div className={styles.editorBody}>
-              {!configured && (
+            <main className={styles.providerEditor}>
+              <div className={styles.editorHeader}>
+                <div>
+                  <span>{t('settings.providerProfile')}</span>
+                  <h3>
+                    {configured
+                      ? form.profileId
+                      : t('settings.newProviderTitle')}
+                  </h3>
+                </div>
+                <div className={styles.editorBadges}>
+                  {configured && (
+                    <span className={styles.configuredBadge}>
+                      <CheckIcon />
+                      {t('settings.configured')}
+                    </span>
+                  )}
+                  {selectedIsDefault && (
+                    <span className={styles.defaultBadge}>
+                      {t('settings.defaultProvider')}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className={styles.editorBody}>
+                {!configured && (
+                  <label className={styles.field}>
+                    <span>{t('settings.profileId')}</span>
+                    <input
+                      ref={profileIdInput}
+                      value={form.profileId}
+                      placeholder={t('settings.profileIdPlaceholder')}
+                      onChange={(event) =>
+                        updateField('profileId', event.target.value)
+                      }
+                    />
+                  </label>
+                )}
+
                 <label className={styles.field}>
-                  <span>{t('settings.profileId')}</span>
+                  <span>{t('settings.baseUrl')}</span>
                   <input
-                    ref={profileIdInput}
-                    value={form.profileId}
-                    placeholder={t('settings.profileIdPlaceholder')}
+                    value={form.baseUrl}
+                    placeholder="https://api.example.com/v1"
                     onChange={(event) =>
-                      updateField('profileId', event.target.value)
+                      updateField('baseUrl', event.target.value)
                     }
                   />
                 </label>
-              )}
 
-              <label className={styles.field}>
-                <span>{t('settings.baseUrl')}</span>
-                <input
-                  value={form.baseUrl}
-                  placeholder="https://api.example.com/v1"
-                  onChange={(event) =>
-                    updateField('baseUrl', event.target.value)
-                  }
-                />
-              </label>
-
-              <label className={styles.field}>
-                <span>{t('settings.providerAdapter')}</span>
-                <select
-                  value={form.provider}
-                  onChange={(event) =>
-                    updateField('provider', event.target.value as ProviderKind)
-                  }
-                >
-                  {PROVIDERS.map((provider) => (
-                    <option key={provider} value={provider}>
-                      {providerKindLabel(provider)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className={styles.field}>
-                <span>{t('settings.apiKey')}</span>
-                <div className={styles.secretField}>
-                  <input
-                    type={apiKeyVisible ? 'text' : 'password'}
-                    value={form.apiKey}
-                    placeholder={
-                      configured
-                        ? t('settings.apiKeyRequiredToUpdate')
-                        : t('settings.apiKeyPlaceholder')
-                    }
+                <label className={styles.field}>
+                  <span>{t('settings.providerAdapter')}</span>
+                  <select
+                    value={form.provider}
                     onChange={(event) =>
-                      updateField('apiKey', event.target.value)
-                    }
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setApiKeyVisible((visible) => !visible)}
-                    aria-label={
-                      apiKeyVisible
-                        ? t('settings.hideApiKey')
-                        : t('settings.showApiKey')
+                      updateField(
+                        'provider',
+                        event.target.value as ProviderKind,
+                      )
                     }
                   >
-                    <EyeIcon />
-                  </button>
-                </div>
-              </label>
+                    {PROVIDERS.map((provider) => (
+                      <option key={provider} value={provider}>
+                        {providerKindLabel(provider)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
 
-              <label className={styles.field}>
-                <span>{t('settings.model')}</span>
-                <input
-                  value={form.model}
-                  placeholder="model-name"
-                  onChange={(event) => updateField('model', event.target.value)}
-                />
-              </label>
+                <label className={styles.field}>
+                  <span>{t('settings.apiKey')}</span>
+                  <div className={styles.secretField}>
+                    <input
+                      type={apiKeyVisible ? 'text' : 'password'}
+                      value={form.apiKey}
+                      placeholder={
+                        configured
+                          ? t('settings.apiKeyRequiredToUpdate')
+                          : t('settings.apiKeyPlaceholder')
+                      }
+                      onChange={(event) =>
+                        updateField('apiKey', event.target.value)
+                      }
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setApiKeyVisible((visible) => !visible)}
+                      aria-label={
+                        apiKeyVisible
+                          ? t('settings.hideApiKey')
+                          : t('settings.showApiKey')
+                      }
+                    >
+                      <EyeIcon />
+                    </button>
+                  </div>
+                </label>
 
-              <details className={styles.advanced}>
-                <summary>{t('settings.advanced')}</summary>
-                <div className={styles.advancedBody}>
-                  <div className={styles.threeColumns}>
-                    <NumberField
-                      label={t('settings.maxContextTokens')}
-                      value={form.maxContextTokens}
-                      onChange={(value) =>
-                        updateField('maxContextTokens', value)
-                      }
-                    />
-                    <NumberField
-                      label={t('settings.maxOutputTokens')}
-                      value={form.maxOutputTokens}
-                      onChange={(value) =>
-                        updateField('maxOutputTokens', value)
-                      }
-                    />
-                    <NumberField
-                      label={t('settings.temperature')}
-                      value={form.temperature}
-                      step="0.1"
-                      onChange={(value) => updateField('temperature', value)}
-                    />
-                  </div>
-                  <div className={styles.threeColumns}>
-                    <label className={styles.field}>
-                      <span>{t('settings.reasoningEffort')}</span>
-                      <select
-                        value={form.reasoningEffort}
-                        onChange={(event) =>
-                          updateField(
-                            'reasoningEffort',
-                            event.target.value as ReasoningEffort | '',
-                          )
-                        }
-                      >
-                        <option value="">{t('settings.effortNone')}</option>
-                        {EFFORTS.map((effort) => (
-                          <option key={effort} value={effort}>
-                            {effort}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <NumberField
-                      label={t('settings.maxRetries')}
-                      value={form.maxRetries}
-                      onChange={(value) => updateField('maxRetries', value)}
-                    />
-                    <NumberField
-                      label={t('settings.requestTimeoutSecs')}
-                      value={form.requestTimeoutSecs}
-                      onChange={(value) =>
-                        updateField('requestTimeoutSecs', value)
-                      }
-                    />
-                  </div>
-                  <NumberField
-                    label={t('settings.streamIdleTimeoutSecs')}
-                    value={form.streamIdleTimeoutSecs}
-                    onChange={(value) =>
-                      updateField('streamIdleTimeoutSecs', value)
+                <label className={styles.field}>
+                  <span>{t('settings.model')}</span>
+                  <input
+                    value={form.model}
+                    placeholder="model-name"
+                    onChange={(event) =>
+                      updateField('model', event.target.value)
                     }
                   />
-                </div>
-              </details>
+                </label>
 
-              <details className={styles.defaults}>
-                <summary>{t('settings.sessionDefaults')}</summary>
-                <div className={styles.defaultsBody}>
-                  <p>{t('settings.sessionDefaultsCopy')}</p>
-                  <div className={styles.twoColumns}>
-                    <label className={styles.field}>
-                      <span>{t('settings.agentProfileId')}</span>
-                      <input
-                        value={localAgentProfileId}
-                        placeholder={t('settings.agentProfileIdPlaceholder')}
-                        onChange={(event) =>
-                          setLocalAgentProfileId(event.target.value)
+                <details className={styles.advanced}>
+                  <summary>{t('settings.advanced')}</summary>
+                  <div className={styles.advancedBody}>
+                    <div className={styles.threeColumns}>
+                      <NumberField
+                        label={t('settings.maxContextTokens')}
+                        value={form.maxContextTokens}
+                        onChange={(value) =>
+                          updateField('maxContextTokens', value)
                         }
                       />
-                    </label>
-                    <label className={styles.field}>
-                      <span>{t('settings.capabilityMode')}</span>
-                      <select
-                        value={localCapabilityMode}
-                        onChange={(event) =>
-                          setLocalCapabilityMode(
-                            event.target.value as CapabilityMode | '',
-                          )
+                      <NumberField
+                        label={t('settings.maxOutputTokens')}
+                        value={form.maxOutputTokens}
+                        onChange={(value) =>
+                          updateField('maxOutputTokens', value)
                         }
-                      >
-                        <option value="">
-                          {t('settings.capabilityProfileDefault')}
-                        </option>
-                        <option value="read_only">
-                          {t('chat.capability.readOnly')}
-                        </option>
-                        <option value="workspace_edit">
-                          {t('chat.capability.workspaceEdit')}
-                        </option>
-                        <option value="full_access">
-                          {t('chat.capability.fullAccess')}
-                        </option>
-                      </select>
-                    </label>
+                      />
+                      <NumberField
+                        label={t('settings.temperature')}
+                        value={form.temperature}
+                        step="0.1"
+                        onChange={(value) => updateField('temperature', value)}
+                      />
+                    </div>
+                    <div className={styles.threeColumns}>
+                      <label className={styles.field}>
+                        <span>{t('settings.reasoningEffort')}</span>
+                        <select
+                          value={form.reasoningEffort}
+                          onChange={(event) =>
+                            updateField(
+                              'reasoningEffort',
+                              event.target.value as ReasoningEffort | '',
+                            )
+                          }
+                        >
+                          <option value="">{t('settings.effortNone')}</option>
+                          {EFFORTS.map((effort) => (
+                            <option key={effort} value={effort}>
+                              {effort}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <NumberField
+                        label={t('settings.maxRetries')}
+                        value={form.maxRetries}
+                        onChange={(value) => updateField('maxRetries', value)}
+                      />
+                      <NumberField
+                        label={t('settings.requestTimeoutSecs')}
+                        value={form.requestTimeoutSecs}
+                        onChange={(value) =>
+                          updateField('requestTimeoutSecs', value)
+                        }
+                      />
+                    </div>
+                    <NumberField
+                      label={t('settings.streamIdleTimeoutSecs')}
+                      value={form.streamIdleTimeoutSecs}
+                      onChange={(value) =>
+                        updateField('streamIdleTimeoutSecs', value)
+                      }
+                    />
                   </div>
-                </div>
-              </details>
+                </details>
 
-              {configured && dirty && !form.apiKey.trim() && (
-                <div className={styles.warning}>
-                  {t('settings.apiKeyUpdateWarning')}
-                </div>
-              )}
-              {error && (
-                <div className={styles.error} role="alert">
-                  {error}
-                </div>
-              )}
-              {saved && (
-                <div className={styles.success}>{t('settings.saved')}</div>
-              )}
-            </div>
-          </main>
-        </div>
+                <details className={styles.defaults}>
+                  <summary>{t('settings.sessionDefaults')}</summary>
+                  <div className={styles.defaultsBody}>
+                    <p>{t('settings.sessionDefaultsCopy')}</p>
+                    <div className={styles.twoColumns}>
+                      <label className={styles.field}>
+                        <span>{t('settings.agentProfileId')}</span>
+                        <input
+                          value={localAgentProfileId}
+                          placeholder={t('settings.agentProfileIdPlaceholder')}
+                          onChange={(event) =>
+                            setLocalAgentProfileId(event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className={styles.field}>
+                        <span>{t('settings.capabilityMode')}</span>
+                        <select
+                          value={localCapabilityMode}
+                          onChange={(event) =>
+                            setLocalCapabilityMode(
+                              event.target.value as CapabilityMode | '',
+                            )
+                          }
+                        >
+                          <option value="">
+                            {t('settings.capabilityProfileDefault')}
+                          </option>
+                          <option value="read_only">
+                            {t('chat.capability.readOnly')}
+                          </option>
+                          <option value="workspace_edit">
+                            {t('chat.capability.workspaceEdit')}
+                          </option>
+                          <option value="full_access">
+                            {t('chat.capability.fullAccess')}
+                          </option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                {configured && dirty && !form.apiKey.trim() && (
+                  <div className={styles.warning}>
+                    {t('settings.apiKeyUpdateWarning')}
+                  </div>
+                )}
+                {error && (
+                  <div className={styles.error} role="alert">
+                    {error}
+                  </div>
+                )}
+                {saved && (
+                  <div className={styles.success}>{t('settings.saved')}</div>
+                )}
+              </div>
+            </main>
+          </div>
+        )}
+
+        {section === 'agents' && (
+          <AgentProfileManager
+            authKey={localAuthKey}
+            onDirtyChange={setSecondaryDirty}
+          />
+        )}
+
+        {section === 'mcp' && (
+          <McpProfileManager
+            authKey={localAuthKey}
+            onDirtyChange={setSecondaryDirty}
+          />
+        )}
 
         <footer className={styles.footer}>
-          <p>{t('settings.footerHint')}</p>
+          <p>
+            {section === 'providers'
+              ? t('settings.footerHint')
+              : t('settings.profileFooterHint')}
+          </p>
           <div>
             <button
               type="button"
@@ -691,14 +762,16 @@ export function SettingsModal({
             >
               {t('settings.close')}
             </button>
-            <button
-              type="button"
-              className={styles.primaryButton}
-              onClick={() => void handleSave()}
-              disabled={saving || loading || !localAuthKey.trim()}
-            >
-              {saving ? t('settings.saving') : t('settings.save')}
-            </button>
+            {section === 'providers' && (
+              <button
+                type="button"
+                className={styles.primaryButton}
+                onClick={() => void handleSave()}
+                disabled={saving || loading || !localAuthKey.trim()}
+              >
+                {saving ? t('settings.saving') : t('settings.save')}
+              </button>
+            )}
           </div>
         </footer>
       </section>

@@ -3,6 +3,7 @@ mod agent_profile;
 mod ask_user;
 mod factory;
 mod id;
+mod mcp_profile;
 mod registry;
 mod tool_permission;
 mod worktree;
@@ -25,6 +26,12 @@ pub use factory::{
     UnconfiguredAgentFactory, normalize_provider_config,
 };
 pub use id::{AskUserId, RunId, SessionId, ToolPermissionId};
+pub use mcp_profile::{
+    DEFAULT_MCP_CONNECT_TIMEOUT_SECS, DEFAULT_MCP_OUTPUT_BYTES, DEFAULT_MCP_OUTPUT_LINES,
+    DEFAULT_MCP_REQUEST_TIMEOUT_SECS, MAX_MCP_PROFILE_ID_BYTES, MAX_MCP_TIMEOUT_SECS, McpProfile,
+    McpProfileDefinition, McpProfileValidationError, McpTransportDefinition,
+    validate_mcp_profile_id,
+};
 pub use registry::{AgentRegistry, RegistryError, ShutdownFailure};
 pub use tool_permission::ToolPermissionPrompt;
 pub(crate) use worktree::WorktreeManager;

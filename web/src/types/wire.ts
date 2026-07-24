@@ -681,6 +681,7 @@ export interface PutAgentProfileRequest {
   prompt?: PromptDefinitionDto;
   tools?: NamePolicyDto;
   skills?: NamePolicyDto;
+  mcp_profile_ids?: string[];
   initial_capability_mode?: CapabilityMode;
   model?: string | null;
   reasoning_effort?: ReasoningEffort | null;
@@ -692,6 +693,8 @@ export interface PublicAgentProfile {
   prompt: Required<PromptDefinitionDto>;
   tools: NamePolicyDto;
   skills: NamePolicyDto;
+  /** Missing on daemon versions that predate MCP Profile references. */
+  mcp_profile_ids?: string[];
   initial_capability_mode: CapabilityMode;
   model: string | null;
   reasoning_effort: ReasoningEffort | null;
@@ -704,6 +707,78 @@ export interface AgentProfileResponse {
 
 export interface AgentProfilesResponse {
   agent_profiles: PublicAgentProfile[];
+}
+
+export interface PutMcpStdioTransport {
+  type: 'stdio';
+  command: string;
+  args?: string[];
+  current_dir?: string | null;
+  env?: Record<string, string>;
+  clear_env?: boolean;
+}
+
+export interface PutMcpHttpTransport {
+  type: 'http';
+  url: string;
+  bearer_token?: string | null;
+  headers?: Record<string, string>;
+  allow_stateless?: boolean;
+  reinitialize_on_expired_session?: boolean;
+}
+
+export type PutMcpTransport = PutMcpStdioTransport | PutMcpHttpTransport;
+
+/** Body for `PUT /v1/mcp-profiles/{mcp_profile_id}`. */
+export interface PutMcpProfileRequest {
+  transport: PutMcpTransport;
+  tool_name_prefix?: string | null;
+  connect_timeout_secs?: number;
+  request_timeout_secs?: number | null;
+  max_output_lines?: number;
+  max_output_bytes?: number;
+}
+
+export interface PublicMcpStdioTransport {
+  type: 'stdio';
+  command: string;
+  args: string[];
+  current_dir: string | null;
+  env_keys: string[];
+  clear_env: boolean;
+}
+
+export interface PublicMcpHttpTransport {
+  type: 'http';
+  url: string;
+  bearer_token_configured: boolean;
+  header_names: string[];
+  allow_stateless: boolean;
+  reinitialize_on_expired_session: boolean;
+}
+
+export type PublicMcpTransport =
+  | PublicMcpStdioTransport
+  | PublicMcpHttpTransport;
+
+export interface PublicMcpProfile {
+  mcp_profile_id: string;
+  revision: number;
+  transport: PublicMcpTransport;
+  tool_name_prefix: string;
+  connect_timeout_secs: number;
+  request_timeout_secs: number | null;
+  max_output_lines: number;
+  max_output_bytes: number;
+}
+
+export interface McpProfileResponse {
+  configured: boolean;
+  mcp_profile: PublicMcpProfile | null;
+}
+
+export interface McpProfilesResponse {
+  mcp_profiles: PublicMcpProfile[];
 }
 
 /** Body for `PUT /v1/providers/{profile_id}`. */

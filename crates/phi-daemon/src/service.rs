@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -19,16 +22,18 @@ use tokio::{
 use crate::{
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentHandle, AgentHandleError,
-        AgentProfile, AgentProfileDefinition, AgentRegistry, AgentSummary, BuiltAgent,
-        ConfiguredAgentFactory, DEFAULT_AGENT_PROFILE_ID, QueuedRun, RegistryError, SessionId,
-        ShutdownFailure, UnconfiguredAgentFactory, WorktreeManager, compile_agent_profile,
+        AgentProfile, AgentProfileDefinition, AgentProfileValidationError, AgentRegistry,
+        AgentSummary, BuiltAgent, ConfiguredAgentFactory, DEFAULT_AGENT_PROFILE_ID, McpProfile,
+        McpProfileDefinition, QueuedRun, RegistryError, SessionId, ShutdownFailure,
+        UnconfiguredAgentFactory, WorktreeManager, compile_agent_profile,
         normalize_provider_config,
     },
     session_title::{ProviderSessionTitleGenerator, SessionTitleGenerator, SessionTitleRequest},
     store::{
         AgentProfileStore, AgentProfileStoreError, ControlStore, ControlStoreError,
-        DEFAULT_PROFILE_ID, MemoryAgentProfileStore, MemoryControlStore, ProviderConfig,
-        ProviderProfile, ProviderStore, ProviderStoreError, SessionRecord,
+        DEFAULT_PROFILE_ID, McpProfileStore, McpProfileStoreError, MemoryAgentProfileStore,
+        MemoryControlStore, MemoryMcpProfileStore, ProviderConfig, ProviderProfile, ProviderStore,
+        ProviderStoreError, SessionRecord,
     },
 };
 
@@ -42,6 +47,7 @@ pub struct ApplicationService {
     factory: Arc<dyn AgentFactory>,
     provider_store: Option<Arc<dyn ProviderStore>>,
     agent_profile_store: Option<Arc<dyn AgentProfileStore>>,
+    mcp_profile_store: Option<Arc<dyn McpProfileStore>>,
     title_generator: Option<Arc<dyn SessionTitleGenerator>>,
     title_tasks: Arc<Mutex<JoinSet<()>>>,
     title_slots: Arc<Semaphore>,
@@ -49,6 +55,12 @@ pub struct ApplicationService {
     subagent_worktrees: Option<WorktreeManager>,
     prepared: Arc<Mutex<HashMap<SessionId, AgentHandle>>>,
     lifecycle: Arc<RwLock<LifecycleState>>,
+}
+
+struct ManagedConfigurationStores {
+    provider: Arc<dyn ProviderStore>,
+    agent_profile: Arc<dyn AgentProfileStore>,
+    mcp_profile: Arc<dyn McpProfileStore>,
 }
 
 #[derive(Default)]
@@ -255,6 +267,7 @@ impl ApplicationService {
             factory,
             provider_store: None,
             agent_profile_store: None,
+            mcp_profile_store: None,
             title_generator: None,
             title_tasks: Arc::new(Mutex::new(JoinSet::new())),
             title_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_TITLE_TASKS)),
@@ -294,16 +307,21 @@ impl ApplicationService {
         let http_client = reqwest::Client::new();
         let agent_profile_store: Arc<dyn AgentProfileStore> =
             Arc::new(MemoryAgentProfileStore::new());
+        let mcp_profile_store: Arc<dyn McpProfileStore> = Arc::new(MemoryMcpProfileStore::new());
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .mcp_profile_store(Arc::clone(&mcp_profile_store))
             .http_client(http_client.clone())
             .skills_config(skills);
         Self::managed_with_configured_factory(
             registry,
             store,
             session_storage,
-            provider_store,
-            agent_profile_store,
+            ManagedConfigurationStores {
+                provider: provider_store,
+                agent_profile: agent_profile_store,
+                mcp_profile: mcp_profile_store,
+            },
             factory,
             http_client,
         )
@@ -320,8 +338,10 @@ impl ApplicationService {
         let http_client = reqwest::Client::new();
         let agent_profile_store: Arc<dyn AgentProfileStore> =
             Arc::new(MemoryAgentProfileStore::new());
+        let mcp_profile_store: Arc<dyn McpProfileStore> = Arc::new(MemoryMcpProfileStore::new());
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .mcp_profile_store(Arc::clone(&mcp_profile_store))
             .http_client(http_client.clone())
             .skills_config(skills)
             .builtin_tools(builtin_tools);
@@ -329,8 +349,11 @@ impl ApplicationService {
             registry,
             store,
             session_storage,
-            provider_store,
-            agent_profile_store,
+            ManagedConfigurationStores {
+                provider: provider_store,
+                agent_profile: agent_profile_store,
+                mcp_profile: mcp_profile_store,
+            },
             factory,
             http_client,
         )
@@ -346,12 +369,37 @@ impl ApplicationService {
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
     ) -> Self {
-        Self::managed_with_profiles_skills_and_builtin_tools_http_client(
+        let mcp_profile_store: Arc<dyn McpProfileStore> = Arc::new(MemoryMcpProfileStore::new());
+        Self::managed_with_all_profiles_skills_and_builtin_tools(
             registry,
             store,
             session_storage,
             provider_store,
             agent_profile_store,
+            mcp_profile_store,
+            skills,
+            builtin_tools,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn managed_with_all_profiles_skills_and_builtin_tools(
+        registry: AgentRegistry,
+        store: Arc<dyn ControlStore>,
+        session_storage: Arc<dyn SessionStorage>,
+        provider_store: Arc<dyn ProviderStore>,
+        agent_profile_store: Arc<dyn AgentProfileStore>,
+        mcp_profile_store: Arc<dyn McpProfileStore>,
+        skills: SkillsConfig,
+        builtin_tools: BuiltinTools,
+    ) -> Self {
+        Self::managed_with_all_profiles_skills_and_builtin_tools_http_client(
+            registry,
+            store,
+            session_storage,
+            provider_store,
+            agent_profile_store,
+            mcp_profile_store,
             skills,
             builtin_tools,
             reqwest::Client::new(),
@@ -359,18 +407,20 @@ impl ApplicationService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn managed_with_profiles_skills_and_builtin_tools_http_client(
+    pub(crate) fn managed_with_all_profiles_skills_and_builtin_tools_http_client(
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
         provider_store: Arc<dyn ProviderStore>,
         agent_profile_store: Arc<dyn AgentProfileStore>,
+        mcp_profile_store: Arc<dyn McpProfileStore>,
         skills: SkillsConfig,
         builtin_tools: BuiltinTools,
         http_client: reqwest::Client,
     ) -> Self {
         let factory = ConfiguredAgentFactory::new(Arc::clone(&provider_store))
             .agent_profile_store(Arc::clone(&agent_profile_store))
+            .mcp_profile_store(Arc::clone(&mcp_profile_store))
             .http_client(http_client.clone())
             .skills_config(skills)
             .builtin_tools(builtin_tools);
@@ -378,8 +428,11 @@ impl ApplicationService {
             registry,
             store,
             session_storage,
-            provider_store,
-            agent_profile_store,
+            ManagedConfigurationStores {
+                provider: provider_store,
+                agent_profile: agent_profile_store,
+                mcp_profile: mcp_profile_store,
+            },
             factory,
             http_client,
         )
@@ -389,19 +442,19 @@ impl ApplicationService {
         registry: AgentRegistry,
         store: Arc<dyn ControlStore>,
         session_storage: Arc<dyn SessionStorage>,
-        provider_store: Arc<dyn ProviderStore>,
-        agent_profile_store: Arc<dyn AgentProfileStore>,
+        stores: ManagedConfigurationStores,
         factory: ConfiguredAgentFactory,
         http_client: reqwest::Client,
     ) -> Self {
         let factory: Arc<dyn AgentFactory> = Arc::new(factory);
         let mut service = Self::new(registry, store, session_storage, factory);
         service.title_generator = Some(Arc::new(
-            ProviderSessionTitleGenerator::new(Arc::clone(&provider_store))
+            ProviderSessionTitleGenerator::new(Arc::clone(&stores.provider))
                 .http_client(http_client),
         ));
-        service.provider_store = Some(provider_store);
-        service.agent_profile_store = Some(agent_profile_store);
+        service.provider_store = Some(stores.provider);
+        service.agent_profile_store = Some(stores.agent_profile);
+        service.mcp_profile_store = Some(stores.mcp_profile);
         service
     }
 
@@ -436,8 +489,8 @@ impl ApplicationService {
         self
     }
 
-    /// Builds provider, tools and future MCP resources, but deliberately does
-    /// not create persistent session metadata yet.
+    /// Builds the provider, local tools, skills and referenced MCP connections,
+    /// but deliberately does not create persistent session metadata yet.
     pub async fn prepare_session(
         &self,
         profile_id: impl Into<String>,
@@ -977,6 +1030,9 @@ impl ApplicationService {
         definition: AgentProfileDefinition,
     ) -> Result<AgentProfile, ServiceError> {
         let _lifecycle = self.enter().await?;
+        let definition = definition.normalized()?;
+        self.validate_mcp_profile_references(&definition.mcp_profile_ids)
+            .await?;
         let store = self
             .agent_profile_store
             .as_ref()
@@ -984,6 +1040,70 @@ impl ApplicationService {
         Ok(store
             .replace_agent_profile(agent_profile_id.trim(), definition)
             .await?)
+    }
+
+    pub async fn mcp_profiles(&self) -> Result<Vec<McpProfile>, ServiceError> {
+        let store = self
+            .mcp_profile_store
+            .as_ref()
+            .ok_or(ServiceError::McpProfileManagementUnavailable)?;
+        Ok(store.list_mcp_profiles().await?)
+    }
+
+    pub async fn mcp_profile(
+        &self,
+        mcp_profile_id: &str,
+    ) -> Result<Option<McpProfile>, ServiceError> {
+        let store = self
+            .mcp_profile_store
+            .as_ref()
+            .ok_or(ServiceError::McpProfileManagementUnavailable)?;
+        Ok(store.get_mcp_profile(mcp_profile_id).await?)
+    }
+
+    pub async fn configure_mcp_profile(
+        &self,
+        mcp_profile_id: &str,
+        definition: McpProfileDefinition,
+    ) -> Result<McpProfile, ServiceError> {
+        let _lifecycle = self.enter().await?;
+        let store = self
+            .mcp_profile_store
+            .as_ref()
+            .ok_or(ServiceError::McpProfileManagementUnavailable)?;
+        Ok(store
+            .replace_mcp_profile(mcp_profile_id, definition)
+            .await?)
+    }
+
+    async fn validate_mcp_profile_references(
+        &self,
+        profile_ids: &[String],
+    ) -> Result<(), ServiceError> {
+        if profile_ids.is_empty() {
+            return Ok(());
+        }
+        let store = self
+            .mcp_profile_store
+            .as_ref()
+            .ok_or(ServiceError::McpProfileManagementUnavailable)?;
+        let mut prefixes = HashSet::with_capacity(profile_ids.len());
+        for profile_id in profile_ids {
+            let profile = store.get_mcp_profile(profile_id).await?.ok_or_else(|| {
+                ServiceError::InvalidMcpProfileReference {
+                    message: format!("MCP profile {profile_id:?} is not configured"),
+                }
+            })?;
+            if !prefixes.insert(profile.definition.tool_name_prefix.clone()) {
+                return Err(ServiceError::InvalidMcpProfileReference {
+                    message: format!(
+                        "multiple MCP profiles use tool name prefix {:?}",
+                        profile.definition.tool_name_prefix
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub async fn provider_configs(&self) -> Result<Vec<ProviderProfile>, ServiceError> {
@@ -1339,6 +1459,15 @@ pub enum ServiceError {
     #[error("Agent Profile management is unavailable for this embedded service")]
     AgentProfileManagementUnavailable,
 
+    #[error("MCP Profile management is unavailable for this embedded service")]
+    McpProfileManagementUnavailable,
+
+    #[error("invalid MCP Profile reference in Agent Profile: {message}")]
+    InvalidMcpProfileReference { message: String },
+
+    #[error(transparent)]
+    AgentProfileValidation(#[from] AgentProfileValidationError),
+
     #[error(transparent)]
     Factory(#[from] AgentFactoryError),
 
@@ -1353,6 +1482,9 @@ pub enum ServiceError {
 
     #[error(transparent)]
     AgentProfileStore(#[from] AgentProfileStoreError),
+
+    #[error(transparent)]
+    McpProfileStore(#[from] McpProfileStoreError),
 
     #[error(transparent)]
     Agent(#[from] AgentHandleError),

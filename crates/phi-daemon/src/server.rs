@@ -31,8 +31,8 @@ use crate::{
     service::ApplicationService,
     session_title::ProviderSessionTitleGenerator,
     store::{
-        DiskAgentProfileStore, DiskControlStore, DiskProviderStore, DiskScheduledTaskStore,
-        ProviderStore, ScheduledTaskStore,
+        DiskAgentProfileStore, DiskControlStore, DiskMcpProfileStore, DiskProviderStore,
+        DiskScheduledTaskStore, McpProfileStore, ProviderStore, ScheduledTaskStore,
     },
 };
 
@@ -40,6 +40,7 @@ const CONTROL_DIRECTORY: &str = "control";
 const SESSION_DIRECTORY: &str = "sessions";
 const PROVIDER_CONFIG_FILE: &str = "provider.json";
 const AGENT_PROFILE_CONFIG_FILE: &str = "agent-profiles.json";
+const MCP_PROFILE_CONFIG_FILE: &str = "mcp-profiles.json";
 const SCHEDULED_TASK_CONFIG_FILE: &str = "scheduled-tasks.json";
 const MAX_PENDING_TLS_HANDSHAKES: usize = 128;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -137,6 +138,9 @@ fn application_service(
     let agent_profile_store = Arc::new(DiskAgentProfileStore::new(
         data_dir.join(AGENT_PROFILE_CONFIG_FILE),
     ));
+    let mcp_profile_store: Arc<dyn McpProfileStore> = Arc::new(DiskMcpProfileStore::new(
+        data_dir.join(MCP_PROFILE_CONFIG_FILE),
+    ));
 
     let title_generator = ProviderSessionTitleGenerator::new(Arc::clone(&provider_store))
         .http_client(provider_http_client.clone());
@@ -145,12 +149,13 @@ fn application_service(
         None => title_generator,
     };
 
-    ApplicationService::managed_with_profiles_skills_and_builtin_tools_http_client(
+    ApplicationService::managed_with_all_profiles_skills_and_builtin_tools_http_client(
         AgentRegistry::new(),
         control_store,
         session_storage,
         provider_store,
         agent_profile_store,
+        mcp_profile_store,
         config.skills_config_template(),
         BuiltinTools::all(config.workspace_dir()),
         provider_http_client,
