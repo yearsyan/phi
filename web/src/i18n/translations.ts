@@ -103,7 +103,7 @@ const en = {
     'Create an automated prompt that runs in a new background session.',
   'scheduled.modal.close': 'Close scheduled task dialog',
   'scheduled.modal.notice':
-    'Scheduled runs use the selected capability policy without an interactive approval step. Access outside the workspace or unavailable network services may fail.',
+    'Scheduled runs cannot ask the user or open an interactive approval. They use the selected capability policy directly, so access outside the workspace or unavailable network services may fail.',
   'scheduled.modal.cancel': 'Cancel',
   'scheduled.modal.create': 'Create',
   'scheduled.modal.creating': 'Creating…',
@@ -120,6 +120,11 @@ const en = {
   'scheduled.field.agentProfileNoMcp':
     'No MCP linked. MCP tools come from the Agent Profile; configure them in Settings.',
   'scheduled.field.capability': 'Access',
+  'scheduled.field.outputChannel': 'Output channel',
+  'scheduled.outputChannel.none': 'No notifications',
+  'scheduled.outputChannel.hint':
+    'Send start and completion status to the selected channel.',
+  'scheduled.outputChannel.badge': 'Channel: %{channel}',
   'scheduled.field.schedule': 'Schedule',
   'scheduled.capability.profile': 'Use Agent Profile default',
   'scheduled.schedule.dailyTab': 'Daily',
@@ -305,7 +310,7 @@ const en = {
   'settings.connectionCopy':
     'The daemon key authorizes session access, file edits, and command execution.',
   'settings.connectionCompactCopy':
-    'Provider and MCP credentials remain stored by the daemon and are never returned.',
+    'Provider, MCP, and Telegram credentials remain stored by the daemon and are never returned.',
   'settings.load': 'Connect & load',
   'settings.authKey': 'Auth key',
   'settings.authKeyPlaceholder':
@@ -382,8 +387,11 @@ const en = {
   'settings.tabs.providers': 'Providers',
   'settings.tabs.agents': 'Agent Profiles',
   'settings.tabs.mcp': 'MCP Profiles',
+  'settings.tabs.channels': 'Output channels',
   'settings.profileFooterHint':
     'Profile changes apply when an Agent is next created or restored.',
+  'settings.channelFooterHint':
+    'Output channel changes apply to the next scheduled-task notification.',
 
   // Agent Profile management
   'settings.agent.profiles': 'Agent Profiles',
@@ -499,6 +507,39 @@ const en = {
   'settings.mcp.errors.notConfigured':
     'The daemon did not return the saved MCP Profile.',
 
+  // Output channel management
+  'settings.channels.list': 'Output channels',
+  'settings.channels.channel': 'Output channel',
+  'settings.channels.empty':
+    'Add a Telegram channel for scheduled-task notifications.',
+  'settings.channels.add': 'Add output channel',
+  'settings.channels.newChannel': 'New output channel',
+  'settings.channels.id': 'Output channel id',
+  'settings.channels.idPlaceholder': 'for example: telegram-alerts',
+  'settings.channels.telegram': 'Telegram',
+  'settings.channels.telegramCopy':
+    'Phi sends scheduled-task start and completion status through this bot.',
+  'settings.channels.botToken': 'Bot token',
+  'settings.channels.secretPlaceholder':
+    'stored secret; re-enter when updating',
+  'settings.channels.botTokenHint':
+    'The token is stored by the daemon and is never returned by the API.',
+  'settings.channels.chatId': 'Chat id',
+  'settings.channels.chatIdHint':
+    'Message the bot first, then use its private/group numeric chat id or a channel @username.',
+  'settings.channels.secretUpdateWarning':
+    'Saving an existing channel requires re-entering its bot token.',
+  'settings.channels.saved': 'Output channel saved.',
+  'settings.channels.test': 'Send test',
+  'settings.channels.testing': 'Sending…',
+  'settings.channels.testSent': 'Telegram test message sent.',
+  'settings.channels.discardChanges': 'Discard unsaved output channel changes?',
+  'settings.channels.errors.idRequired': 'Output channel id is required.',
+  'settings.channels.errors.tokenRequired': 'Telegram bot token is required.',
+  'settings.channels.errors.chatIdRequired': 'Telegram chat id is required.',
+  'settings.channels.errors.notConfigured':
+    'The daemon did not return the saved output channel.',
+
   // Theme / language
   'theme.toggle': 'Toggle theme',
   'theme.dark': 'Dark',
@@ -591,7 +632,7 @@ const zh: Record<TranslationKey, string> = {
     '创建自动执行的提示词，每次会在新的后台会话中运行。',
   'scheduled.modal.close': '关闭定时任务窗口',
   'scheduled.modal.notice':
-    '定时任务会直接使用所选能力策略，不会弹出交互式授权。访问工作区外文件或不可用的网络服务时，任务可能失败。',
+    '定时任务不能询问用户或弹出交互式授权，而会直接使用所选能力策略。访问工作区外文件或不可用的网络服务时，任务可能失败。',
   'scheduled.modal.cancel': '取消',
   'scheduled.modal.create': '创建',
   'scheduled.modal.creating': '正在创建…',
@@ -607,6 +648,10 @@ const zh: Record<TranslationKey, string> = {
   'scheduled.field.agentProfileNoMcp':
     '未关联 MCP。定时任务通过 Agent Profile 引用 MCP，可在设置页配置。',
   'scheduled.field.capability': '权限',
+  'scheduled.field.outputChannel': '输出频道',
+  'scheduled.outputChannel.none': '不发送通知',
+  'scheduled.outputChannel.hint': '将任务开始和结束状态发送到所选频道。',
+  'scheduled.outputChannel.badge': '频道：%{channel}',
   'scheduled.field.schedule': '定时设置',
   'scheduled.capability.profile': '使用 Agent Profile 默认值',
   'scheduled.schedule.dailyTab': '每日',
@@ -775,7 +820,7 @@ const zh: Record<TranslationKey, string> = {
   'settings.daemonConnection': 'Daemon 连接',
   'settings.connectionCopy': 'Daemon key 会授权会话访问、文件修改和命令执行。',
   'settings.connectionCompactCopy':
-    'Provider 与 MCP 凭据仅由 daemon 保存，不会在查询时返回。',
+    'Provider、MCP 与 Telegram 凭据仅由 daemon 保存，不会在查询时返回。',
   'settings.load': '连接并加载',
   'settings.authKey': '鉴权密钥',
   'settings.authKeyPlaceholder': '长期 bearer key(PHI_DAEMON_AUTH_KEY_FILE)',
@@ -846,7 +891,9 @@ const zh: Record<TranslationKey, string> = {
   'settings.tabs.providers': 'Provider',
   'settings.tabs.agents': 'Agent Profile',
   'settings.tabs.mcp': 'MCP Profile',
+  'settings.tabs.channels': '输出频道',
   'settings.profileFooterHint': 'Profile 更改将在下次创建或恢复 Agent 时生效。',
+  'settings.channelFooterHint': '输出频道更改将在下一条定时任务通知时生效。',
 
   'settings.agent.profiles': 'Agent Profile 列表',
   'settings.agent.profile': 'Agent Profile',
@@ -949,6 +996,35 @@ const zh: Record<TranslationKey, string> = {
     '更新该 profile 前请重新输入已保存的 bearer token。',
   'settings.mcp.errors.secretNameRequired': '请重新输入 %{name} 对应的密钥值。',
   'settings.mcp.errors.notConfigured': 'Daemon 未返回已保存的 MCP Profile。',
+
+  'settings.channels.list': '输出频道列表',
+  'settings.channels.channel': '输出频道',
+  'settings.channels.empty': '添加 Telegram 频道来接收定时任务通知。',
+  'settings.channels.add': '添加输出频道',
+  'settings.channels.newChannel': '新输出频道',
+  'settings.channels.id': '输出频道 id',
+  'settings.channels.idPlaceholder': '例如：telegram-alerts',
+  'settings.channels.telegram': 'Telegram',
+  'settings.channels.telegramCopy':
+    'Phi 会通过这个 bot 发送定时任务的开始和结束状态。',
+  'settings.channels.botToken': 'Bot token',
+  'settings.channels.secretPlaceholder': '已保存的密钥；更新时需重新输入',
+  'settings.channels.botTokenHint':
+    'Token 只保存在 daemon 中，API 不会将其返回。',
+  'settings.channels.chatId': 'Chat id',
+  'settings.channels.chatIdHint':
+    '请先向 bot 发送消息，再填写私聊/群组的数字 chat id 或频道 @username。',
+  'settings.channels.secretUpdateWarning':
+    '更新已有频道时必须重新输入 bot token。',
+  'settings.channels.saved': '输出频道已保存。',
+  'settings.channels.test': '发送测试',
+  'settings.channels.testing': '发送中…',
+  'settings.channels.testSent': 'Telegram 测试消息已发送。',
+  'settings.channels.discardChanges': '要丢弃未保存的输出频道更改吗？',
+  'settings.channels.errors.idRequired': '输出频道 id 不能为空。',
+  'settings.channels.errors.tokenRequired': 'Telegram bot token 不能为空。',
+  'settings.channels.errors.chatIdRequired': 'Telegram chat id 不能为空。',
+  'settings.channels.errors.notConfigured': 'Daemon 未返回已保存的输出频道。',
 
   'theme.toggle': '切换主题',
   'theme.dark': '深色',

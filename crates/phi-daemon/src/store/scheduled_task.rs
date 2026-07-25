@@ -381,6 +381,7 @@ mod tests {
             profile_id: "default".to_owned(),
             agent_profile_id: "default".to_owned(),
             capability_mode: None,
+            output_channel_id: None,
             schedule: ScheduledTaskSchedule::Interval {
                 every: 1,
                 unit: ScheduledIntervalUnit::Hours,
@@ -412,6 +413,14 @@ mod tests {
         assert_eq!(store.get_task(task.id).await.unwrap(), Some(task.clone()));
         assert!(store.delete_task(task.id).await.unwrap());
         assert!(!store.delete_task(task.id).await.unwrap());
+    }
+
+    #[test]
+    fn old_tasks_without_output_channel_remain_readable() {
+        let mut value = serde_json::to_value(task()).unwrap();
+        value.as_object_mut().unwrap().remove("output_channel_id");
+        let decoded: ScheduledTask = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.output_channel_id, None);
     }
 
     #[tokio::test]

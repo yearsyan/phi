@@ -1,14 +1,15 @@
 # phi-daemon
 
-`phi-daemon` 把 `phi::Agent` 包装成一个常驻进程：进程内维护 `session_id -> Agent actor` 映射，通过 HTTP 列出已经激活的 session，通过 WebSocket 创建、恢复、操纵 session，并把 Agent 的流式事件广播给所有 attach 的客户端。daemon 还持久化每日/间隔定时任务，在到期时为每次执行创建一个独立 session。
+`phi-daemon` 把 `phi::Agent` 包装成一个常驻进程：进程内维护 `session_id -> Agent actor` 映射，通过 HTTP 列出已经激活的 session，通过 WebSocket 创建、恢复、操纵 session，并把 Agent 的流式事件广播给所有 attach 的客户端。daemon 还持久化每日/间隔定时任务，在到期时为每次执行创建一个独立 session，并可通过 Telegram 输出频道发送开始和终态通知。
 
 当前实现的重点是 session 生命周期、排队、广播、停止和磁盘恢复。命名 Provider
 profile 管理 adapter/凭证/默认生成配置；独立的 Agent Profile 管理 prompt 编译、
 工具与 skill 筛选、独立 MCP Profile 引用、初始 capability mode，以及可选
 model/reasoning override。MCP Profile 保存 stdio 或 Streamable HTTP 连接及凭据；
 Agent Profile 只引用其 ID，不复制 secret。
-每个 daemon 创建的 Agent 都会获得工作区 `read`、`edit`、`write`、`bash` 能力、
-交互式 `askuser` 和可配置 subagent 工具；交互 session 还会获得越界工具审批。
+每个 daemon 创建的 Agent 都会获得工作区 `read`、`edit`、`write`、`bash` 能力和
+可配置 subagent 工具；交互 session 还会获得 `askuser` 和越界工具审批，定时任务
+session 则不暴露这两类交互能力。
 Skills 默认从全局与工作目录加载；MCP 按 Agent Profile 显式连接，未引用时不会启动
 进程或建立网络连接。
 
@@ -29,6 +30,10 @@ flowchart LR
     Axum --> Scheduler["ScheduledTaskManager<br/>daily / interval admission"]
     Scheduler --> Service
     Scheduler --> ScheduledStore["scheduled-tasks.json<br/>schedule + run state"]
+    Scheduler --> OutputChannels["OutputChannelManager<br/>Telegram delivery"]
+    Axum --> OutputChannels
+    OutputChannels --> OutputStore["output-channels.json<br/>chat ID + bot token"]
+    OutputChannels --> Telegram["Telegram Bot API"]
     Factory --> Provider["phi Provider adapter"]
     Registry --> Actor["one actor per live session"]
     Actor --> Agent["phi::Agent"]
@@ -43,7 +48,7 @@ flowchart LR
 - 一个 live session 只有一个 actor。actor 串行拥有 `Agent`，因此同一 session 不会并发执行两个 turn。
 - `AgentRegistry` 只保存本进程已经激活或 attach 恢复的 session。磁盘上存在、但本进程尚未 attach 的 session 在 HTTP 列表中显示为 `offline`。
 - 每个 actor 同时维护一个最新快照和一个有序广播环。多个 WebSocket attach 到同一 actor，会收到相同顺序的 live event。
-- Agent 调用 `askuser` 时，actor 保持当前 run 为 `running`，把问题放进快照并广播；任一 attach 客户端都可回答，回答后原 tool future 恢复执行。
+- 交互 session 的 Agent 调用 `askuser` 时，actor 保持当前 run 为 `running`，把问题放进快照并广播；任一 attach 客户端都可回答，回答后原 tool future 恢复执行。非交互定时任务不安装该工具。
 - 交互 session 的工具 effect 越过 capability 时，actor 同样持有审批请求并广播；断线不取消，任一 attach 客户端可仅批准本次、记住一个服务端候选规则或拒绝。显式 Agent Profile deny 仍是硬边界。
 - `bash(run_in_background=true)` 立即返回 `task_id` 与私有 `output_file`，后台进程完成后通过通用 Agent mailbox 注入 internal `<task_notification>`。通知若赶上 active run，只在下一处协议安全边界合入；若 actor 已 idle，则自动 admission 一个 mailbox-driven run。模型等待通知后用 `read` 读取文件，不需要轮询。
 - Agent 调用 `spawn_agent` 时默认等待 child 结果，设置 `run_in_background=true` 才立即返回；创建事件始终先广播给父 session 调用方。后台终态会在父 turn 的下一处协议安全边界进入 mailbox，父 Agent 已 idle 时才排队启动新 turn；progress 只广播、不唤醒。完成的 `general` child 释放 live Agent 后仍可从 durable sidechain transcript 继续。
@@ -53,7 +58,8 @@ flowchart LR
   pinned ID 读取当时最新的 MCP Profile。
 - `ApplicationService` 负责首个 prompt 的延迟激活、持久化 metadata、进程重启后的单飞恢复，以及 registry 生命周期。
 - `ScheduledTaskManager` 独立持有调度与运行状态，到期后调用
-  `ApplicationService` 创建普通 session；它不绕过 actor 复制 Agent loop。
+  `ApplicationService` 创建普通 session；它不绕过 actor 复制 Agent loop。任务可选择
+  daemon 持有的输出频道，开始和终态通知失败不会改变 Agent 或任务结果。
 - 首个 prompt 入队后，daemon 会在独立后台请求中生成 session 标题；标题更新仍回到
   actor 串行持久化并广播，不阻塞或修改主 Agent transcript。
 - `phi::SessionStorage` 保存完整 transcript 和 Provider 回放状态；WebSocket 的 public
@@ -253,6 +259,7 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
 ├── provider.json
 ├── agent-profiles.json
 ├── mcp-profiles.json
+├── output-channels.json
 ├── scheduled-tasks.json
 ├── control/
 │   └── session-<uuid>.json
@@ -270,9 +277,12 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
   revision，包括 bearer token、自定义 header value 与 stdio environment value；
   Unix 以 `0600` 创建。HTTP GET 只返回 `bearer_token_configured`、header name 与
   environment key，不返回 secret value。
+- `output-channels.json` 保存每个输出频道的最新定义和独立 revision；当前定义包含
+  Telegram bot token 与 chat ID，Unix 以 `0600` 创建。HTTP GET 只返回
+  `bot_token_configured`，不返回 token。
 - `scheduled-tasks.json` 是版本化的定时任务集合，保存调度、下次执行时间、
-  最近运行状态与完整 prompt；Unix 上以 `0600` 创建。该文件可能包含敏感业务
-  指令，不应公开分发。
+  最近运行状态、可选 `output_channel_id` 与完整 prompt；Unix 上以 `0600` 创建。
+  该文件可能包含敏感业务指令，不应公开分发。
 - `control` 保存 `session_id`、自动生成的可选 `title`、会话置顶状态、Provider
   `profile_id`、workspace、模型、reasoning effort、配置 revision，以及首 prompt
   激活时捕获的完整 pinned Agent Profile。
@@ -596,6 +606,47 @@ stdio 子进程及其
 `external_side_effect`，只有 `full_access` 自动暴露；交互 session 可按既有审批流程
 越过较窄 capability，定时任务则不会创建审批请求。
 
+### Output Channel API
+
+输出频道是 daemon 级配置，当前只支持 Telegram：
+
+- `GET /v1/output-channels`：列出公开、脱敏的输出频道。
+- `GET /v1/output-channels/{output_channel_id}`：读取单个频道；未配置时返回
+  `{"configured":false,"output_channel":null}`。
+- `PUT /v1/output-channels/{output_channel_id}`：完整替换频道配置。
+- `POST /v1/output-channels/{output_channel_id}/test`：发送测试消息，成功返回 `204`。
+
+频道 ID 只能包含 ASCII 字母、数字、`_` 和 `-`。Telegram 配置示例：
+
+```json
+{
+  "type": "telegram",
+  "bot_token": "123456789:replace-with-a-real-secret",
+  "chat_id": "-1001234567890"
+}
+```
+
+`chat_id` 可以是私聊、群组或频道的数字 ID，也可以是 Telegram 支持的
+`@channelusername`。Bot 必须已经能向目标会话发消息；频道通常还需要把 Bot 加为管理员。
+PUT 是完整替换，因此更新已有频道时仍需重新提交 bot token。公开响应形如：
+
+```json
+{
+  "configured": true,
+  "output_channel": {
+    "type": "telegram",
+    "output_channel_id": "telegram-alerts",
+    "revision": 1,
+    "bot_token_configured": true,
+    "chat_id": "-1001234567890"
+  }
+}
+```
+
+bot token 只保存在 `output-channels.json`，不会进入公开 DTO、普通 Debug 输出或
+Telegram 传输错误。应把该文件和 daemon 长期 key 同等保密；不要把 token 放进
+任务 prompt、URL、日志、测试 fixture 或客户端持久化状态。
+
 ### Scheduled Task API
 
 - `GET /v1/scheduled-tasks`：返回 `{"tasks":[...]}`，新建任务在前。
@@ -615,6 +666,7 @@ stdio 子进程及其
   "profile_id": "default",
   "agent_profile_id": "default",
   "capability_mode": "workspace_edit",
+  "output_channel_id": "telegram-alerts",
   "prompt": "检查最近一天的失败测试，总结原因和修复建议。",
   "schedule": {
     "type": "daily",
@@ -625,11 +677,12 @@ stdio 子进程及其
 }
 ```
 
-`workspace`、`profile_id` 和 `agent_profile_id` 可省略，分别使用 daemon 默认
-workspace 和 `default` profile。`capability_mode` 省略或为 `null` 时继承 Agent
-Profile 初值。时间必须是 `HH:MM`，`weekdays` 不能为空，时区必须是有效
-IANA 名称。夏令时跳变导致某日本地时间不存在时，该日跳过；回拨导致时间
-重复时，只在较早的那一次执行。
+`workspace`、`profile_id`、`agent_profile_id` 和 `output_channel_id` 可省略；前三者
+分别使用 daemon 默认 workspace 和 `default` profile，未指定输出频道时不发送通知。
+创建时会验证指定输出频道已经存在。`capability_mode` 省略或为 `null` 时继承 Agent
+Profile 初值。时间必须是 `HH:MM`，`weekdays` 不能为空，时区必须是有效 IANA 名称。
+夏令时跳变导致某日本地时间不存在时，该日跳过；回拨导致时间重复时，只在较早的
+那一次执行。
 
 间隔调度的 `unit` 支持 `minutes`、`hours` 和 `days`：
 
@@ -647,7 +700,8 @@ IANA 名称。夏令时跳变导致某日本地时间不存在时，该日跳过
 而已创建 session 仍 pin 住它自己的版本。
 因此定时任务可以通过 `agent_profile_id` 指定带 MCP 引用的 Agent Profile；每次运行
 会读取最新 MCP Profile 并建立对应 HTTP/stdio 连接。后台任务没有交互审批，若要实际
-调用 MCP 工具，应把任务或 Agent Profile 的 capability 设为 `full_access`。
+调用 MCP 工具，应把任务或 Agent Profile 的 capability 设为 `full_access`。后台任务
+也不暴露 `askuser`；需要用户决定的前置条件应直接写进定时任务 prompt。
 
 更新只接受启用状态：
 
@@ -664,13 +718,17 @@ revision 不一致返回 `409 scheduled_task_revision_conflict`。暂停或删�
 `last_run.session_id` 可用于打开结果。`last_run.outcome` 为 `running`、
 `succeeded`、`failed`、`stopped` 或 `interrupted`。同一任务不会重叠执行；
 重叠到期点会前移到下一个未来时间并增加 `skipped_runs`。daemon 停机期间
-积累多个到期点时，恢复后最多立即补一次，不会形成追赶风暴。
+积累多个到期点时，恢复后最多立即补一次，不会形成追赶风暴。配置了输出频道时，
+调度器会在开始运行时发送 `running` 通知，在得出终态后发送 `succeeded`、
+`failed`、`stopped` 或 `interrupted` 通知；终态通知在可用时包含 session ID。
+Telegram 不可达、拒绝消息或频道配置之后失效时，只记录脱敏 warning，不会把原本
+成功的 Agent run 改成失败，也不会自动重试可能已被 Telegram 接收的消息。
 
 为避免崩溃后重放一个副作用是否已发生无法确定的 prompt，调度器会在创建
 session 前先持久化下一次时间与 `running` 记录。进程重启或关闭会把未完成
 记录标为 `interrupted`，不宣称 exactly-once。daemon 进程必须持续运行才能
-准时调度；任务若调用 `askuser`，在没有 attach 客户端回答时会保持等待。定时任务不会
-创建工具权限审批请求：超出所选 capability 的工具保持不可用，以免后台执行无限等待弹窗。
+准时调度。定时任务不暴露 `askuser`，也不会创建工具权限审批请求：需要交互的工具保持
+不可用，超出所选 capability 的工具保持 fail closed，避免后台执行无限等待客户端输入。
 
 ### `GET /v1/sessions`
 
@@ -1070,9 +1128,11 @@ const socket = new WebSocket(
 显示标题、当前 workspace 目录名和右侧设置菜单；目录的完整绝对路径保留在悬浮提示中，
 数据来自 `ready` 或最新 snapshot。
 
-内置 Web 客户端的设置页分别管理 Provider、Agent Profile 和 MCP Profile。MCP 页支持
-Streamable HTTP 与 stdio，Agent Profile 页可勾选多个 MCP Profile；API key、bearer
-token、header value 和 environment value 只写入 daemon，不通过 GET 回显。
+内置 Web 客户端的设置页分别管理 Provider、Agent Profile、MCP Profile 和输出频道。
+输出频道页可保存 Telegram bot token、chat ID 并发送测试消息；MCP 页支持
+Streamable HTTP 与 stdio，Agent Profile 页可勾选多个 MCP Profile。API key、Telegram
+bot token、MCP bearer token、header value 和 environment value 只写入 daemon，
+不通过 GET 回显。
 composer 的 Provider/model 菜单在 prepared 对话发送首个 prompt 前选择不同 profile 时，
 会保留 workspace 并重建 `/new` 连接。session 激活后，profile 项只作为模型预设：客户端
 发送 `set_model`，由 actor 在空闲状态持久化 model override，并从下一次用户请求开始使用；
@@ -1383,7 +1443,7 @@ Bash pattern 是整串锚定匹配：精确命令不含通配语义，`*` 匹配
 
 ### 回答 `askuser`
 
-daemon 会给每个创建的 Agent 注入名为 `askuser` 的工具。模型调用它后，run 保持 `running`，所有 attach 客户端会收到 `askuser_requested`：
+daemon 会给每个交互 session 的 Agent 注入名为 `askuser` 的工具；非交互定时任务不会安装该工具。模型调用它后，run 保持 `running`，所有 attach 客户端会收到 `askuser_requested`：
 
 ```json
 {

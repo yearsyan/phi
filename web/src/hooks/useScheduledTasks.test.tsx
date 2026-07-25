@@ -160,6 +160,7 @@ function task(taskId: string): ScheduledTask {
     profile_id: 'default',
     agent_profile_id: 'default',
     capability_mode: null,
+    output_channel_id: null,
     schedule: {
       type: 'daily',
       time: '09:00',

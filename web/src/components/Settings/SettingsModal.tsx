@@ -18,6 +18,7 @@ import {
 } from '../common/Icons.tsx';
 import { AgentProfileManager } from './AgentProfileManager.tsx';
 import { McpProfileManager } from './McpProfileManager.tsx';
+import { OutputChannelManager } from './OutputChannelManager.tsx';
 import styles from './SettingsModal.module.css';
 
 const PROVIDERS: ProviderKind[] = [
@@ -65,7 +66,7 @@ interface ProfileFormState {
 }
 
 type BuildResult = PutProviderRequest | { errorKey: TranslationKey };
-type SettingsSection = 'providers' | 'agents' | 'mcp';
+type SettingsSection = 'providers' | 'agents' | 'mcp' | 'channels';
 
 const emptyForm = (profileId = ''): ProfileFormState => ({
   profileId,
@@ -442,6 +443,13 @@ export function SettingsModal({
           >
             {t('settings.tabs.mcp')}
           </button>
+          <button
+            type="button"
+            aria-current={section === 'channels' ? 'page' : undefined}
+            onClick={() => selectSection('channels')}
+          >
+            {t('settings.tabs.channels')}
+          </button>
         </nav>
 
         {section === 'providers' && (
@@ -748,11 +756,20 @@ export function SettingsModal({
           />
         )}
 
+        {section === 'channels' && (
+          <OutputChannelManager
+            authKey={localAuthKey}
+            onDirtyChange={setSecondaryDirty}
+          />
+        )}
+
         <footer className={styles.footer}>
           <p>
             {section === 'providers'
               ? t('settings.footerHint')
-              : t('settings.profileFooterHint')}
+              : section === 'channels'
+                ? t('settings.channelFooterHint')
+                : t('settings.profileFooterHint')}
           </p>
           <div>
             <button

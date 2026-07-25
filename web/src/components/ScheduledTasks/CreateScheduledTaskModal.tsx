@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import {
   browseWorkspace,
   listAgentProfiles,
+  listOutputChannels,
   listProviders,
 } from '../../api/http.ts';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
@@ -10,6 +11,7 @@ import type {
   CapabilityMode,
   CreateScheduledTaskRequest,
   PublicAgentProfile,
+  PublicOutputChannel,
   PublicProviderConfig,
   ScheduledIntervalUnit,
   ScheduledWeekday,
@@ -59,6 +61,10 @@ export function CreateScheduledTaskModal({
   >(capabilityMode ?? '');
   const [providers, setProviders] = useState<PublicProviderConfig[]>([]);
   const [agentProfiles, setAgentProfiles] = useState<PublicAgentProfile[]>([]);
+  const [outputChannels, setOutputChannels] = useState<PublicOutputChannel[]>(
+    [],
+  );
+  const [selectedOutputChannel, setSelectedOutputChannel] = useState('');
   const [scheduleType, setScheduleType] = useState<'daily' | 'interval'>(
     'daily',
   );
@@ -88,13 +94,22 @@ export function CreateScheduledTaskModal({
       browseWorkspace(authKey),
       listProviders(authKey),
       listAgentProfiles(authKey),
+      listOutputChannels(authKey).catch(() => ({ output_channels: [] })),
     ])
-      .then(([workspaceResponse, providerResponse, agentProfileResponse]) => {
-        if (cancelled) return;
-        setWorkspace(workspaceResponse.path);
-        setProviders(providerResponse.providers);
-        setAgentProfiles(agentProfileResponse.agent_profiles);
-      })
+      .then(
+        ([
+          workspaceResponse,
+          providerResponse,
+          agentProfileResponse,
+          outputChannelResponse,
+        ]) => {
+          if (cancelled) return;
+          setWorkspace(workspaceResponse.path);
+          setProviders(providerResponse.providers);
+          setAgentProfiles(agentProfileResponse.agent_profiles);
+          setOutputChannels(outputChannelResponse.output_channels);
+        },
+      )
       .catch((loadError) => {
         if (!cancelled) {
           setError(
@@ -156,6 +171,9 @@ export function CreateScheduledTaskModal({
     };
     if (workspace) request.workspace = workspace;
     if (selectedCapability) request.capability_mode = selectedCapability;
+    if (selectedOutputChannel) {
+      request.output_channel_id = selectedOutputChannel;
+    }
     try {
       await onCreate(request);
     } catch (createError) {
@@ -318,6 +336,29 @@ export function CreateScheduledTaskModal({
                   {t('chat.capability.fullAccess')}
                 </option>
               </select>
+            </label>
+
+            <label className={styles.field}>
+              <span>{t('scheduled.field.outputChannel')}</span>
+              <select
+                aria-label={t('scheduled.field.outputChannel')}
+                value={selectedOutputChannel}
+                onChange={(event) =>
+                  setSelectedOutputChannel(event.target.value)
+                }
+                disabled={submitting}
+              >
+                <option value="">{t('scheduled.outputChannel.none')}</option>
+                {outputChannels.map((channel) => (
+                  <option
+                    value={channel.output_channel_id}
+                    key={channel.output_channel_id}
+                  >
+                    {channel.output_channel_id} · Telegram
+                  </option>
+                ))}
+              </select>
+              <small>{t('scheduled.outputChannel.hint')}</small>
             </label>
           </div>
 

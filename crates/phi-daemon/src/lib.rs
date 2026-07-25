@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 mod connection_qr;
+pub mod output_channel;
 pub mod runtime;
 pub mod scheduled_task;
 pub mod server;

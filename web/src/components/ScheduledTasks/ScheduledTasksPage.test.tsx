@@ -118,6 +118,7 @@ function task(taskId: string, enabled: boolean): ScheduledTask {
     profile_id: 'default',
     agent_profile_id: 'default',
     capability_mode: null,
+    output_channel_id: null,
     schedule: {
       type: 'interval',
       every: 1,

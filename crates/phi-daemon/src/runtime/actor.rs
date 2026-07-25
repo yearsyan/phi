@@ -313,7 +313,7 @@ impl AgentHandle {
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
     ) -> Self {
-        Self::spawn_configured_with_skills_subagents_and_tool_permissions(
+        Self::spawn_configured_with_skills_subagents_and_interactivity(
             session_id,
             agent,
             profile_id,
@@ -327,7 +327,7 @@ impl AgentHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_configured_with_skills_subagents_and_tool_permissions(
+    pub(crate) fn spawn_configured_with_skills_subagents_and_interactivity(
         session_id: SessionId,
         mut agent: Agent,
         profile_id: impl Into<String>,
@@ -336,12 +336,17 @@ impl AgentHandle {
         reasoning_effort: Option<ReasoningEffort>,
         skills: SkillCatalog,
         subagents: Option<SubagentRuntime>,
-        interactive_tool_permissions: bool,
+        interactive: bool,
     ) -> Self {
         let stored_agent_profile = agent_profile.clone();
-        let (ask_user_tool, ask_user_requests) = AskUserTool::channel();
-        agent.add_mandatory_tool(ask_user_tool);
-        let tool_permission_requests = if interactive_tool_permissions {
+        let ask_user_requests = if interactive {
+            let (ask_user_tool, requests) = AskUserTool::channel();
+            agent.add_mandatory_tool(ask_user_tool);
+            Some(requests)
+        } else {
+            None
+        };
+        let tool_permission_requests = if interactive {
             let (approver, requests) = DaemonToolPermissionApprover::channel(COMMAND_CAPACITY);
             agent.set_tool_permission_approver(approver);
             Some(requests)
@@ -1025,7 +1030,7 @@ enum AgentCommand {
 
 struct ActorRuntime {
     commands: mpsc::Receiver<AgentCommand>,
-    ask_user_requests: mpsc::UnboundedReceiver<PendingAskUserRequest>,
+    ask_user_requests: Option<mpsc::UnboundedReceiver<PendingAskUserRequest>>,
     tool_permission_requests: Option<mpsc::Receiver<PendingToolPermissionRequest>>,
     hub: Arc<EventHub>,
     active_run: Arc<Mutex<Option<ActiveRun>>>,
@@ -1213,7 +1218,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                 let result = loop {
                     tokio::select! {
                         biased;
-                        request = ask_user_requests.recv() => {
+                        request = receive_ask_user_request(&mut ask_user_requests) => {
                             let Some(request) = request else {
                                 closing = true;
                                 control.stop();
@@ -1409,7 +1414,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     "askuser request was cancelled because the run ended",
                 );
                 drain_unregistered_asks(
-                    &mut ask_user_requests,
+                    ask_user_requests.as_mut(),
                     "askuser request was cancelled because the run ended",
                 );
                 cancel_pending_tool_permissions(
@@ -1619,7 +1624,7 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
         fail_pending_command(command, &hub);
     }
     drain_unregistered_asks(
-        &mut ask_user_requests,
+        ask_user_requests.as_mut(),
         "askuser request was cancelled because the agent is closing",
     );
     drain_unregistered_tool_permissions(
@@ -1648,6 +1653,15 @@ async fn receive_subagent_event(
 async fn receive_parent_mailbox_wake(mailbox: Option<&AgentMailboxSender>) -> bool {
     match mailbox {
         Some(mailbox) => mailbox.wait_for_wake().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn receive_ask_user_request(
+    receiver: &mut Option<mpsc::UnboundedReceiver<PendingAskUserRequest>>,
+) -> Option<PendingAskUserRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -1907,9 +1921,12 @@ fn cancel_pending_ask(
 }
 
 fn drain_unregistered_asks(
-    ask_user_requests: &mut mpsc::UnboundedReceiver<PendingAskUserRequest>,
+    ask_user_requests: Option<&mut mpsc::UnboundedReceiver<PendingAskUserRequest>>,
     message: &str,
 ) {
+    let Some(ask_user_requests) = ask_user_requests else {
+        return;
+    };
     while let Ok(pending) = ask_user_requests.try_recv() {
         let _ = pending.reply.send(Err(message.to_owned()));
     }

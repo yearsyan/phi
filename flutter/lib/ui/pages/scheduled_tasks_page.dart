@@ -256,6 +256,12 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
                 _meta(theme, Icons.schedule, _describeSchedule(task.schedule)),
                 if (task.workspace != null)
                   _meta(theme, Icons.folder_outlined, task.workspace!),
+                if (task.outputChannelId != null)
+                  _meta(
+                    theme,
+                    Icons.send_rounded,
+                    S.of(context).outputChannelValue(task.outputChannelId!),
+                  ),
                 if (task.nextRunAt != null && task.enabled)
                   _meta(
                     theme,
@@ -343,6 +349,8 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
   String? _workspace;
   String _kind = 'interval';
   String _unit = 'hours';
+  List<PublicOutputChannel> _outputChannels = const [];
+  String _outputChannelId = '';
   TimeOfDay _time = const TimeOfDay(hour: 9, minute: 0);
   final Set<String> _weekdays = {
     'monday',
@@ -352,6 +360,7 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
     'friday',
   };
   bool _submitting = false;
+  bool _loadingOutputChannels = true;
   String? _error;
 
   static const _weekdayOrder = [
@@ -363,6 +372,38 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
     'saturday',
     'sunday',
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadOutputChannels();
+  }
+
+  Future<void> _loadOutputChannels() async {
+    try {
+      final channels = await widget.app.client.listOutputChannels();
+      if (!mounted) return;
+      setState(() {
+        _outputChannels = channels;
+        _loadingOutputChannels = false;
+      });
+    } on DaemonError catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loadingOutputChannels = false;
+        if (error.statusCode != 404 &&
+            error.code != 'output_channels_unavailable') {
+          _error = S.of(context).outputChannelsLoadFailed(error);
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loadingOutputChannels = false;
+        _error = S.of(context).outputChannelsLoadFailed(error);
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -400,6 +441,7 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
         name: _name.text.trim(),
         prompt: _prompt.text.trim(),
         workspace: _workspace,
+        outputChannelId: _outputChannelId.isEmpty ? null : _outputChannelId,
         schedule: schedule,
       );
       if (mounted) Navigator.of(context).pop(true);
@@ -467,6 +509,32 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
                 ],
               ),
               const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                initialValue: _outputChannelId,
+                decoration: InputDecoration(
+                  labelText: S.of(context).outputChannel,
+                  border: const OutlineInputBorder(),
+                  isDense: true,
+                ),
+                items: [
+                  DropdownMenuItem(
+                    value: '',
+                    child: Text(S.of(context).noOutputChannel),
+                  ),
+                  for (final channel in _outputChannels)
+                    DropdownMenuItem(
+                      value: channel.outputChannelId,
+                      child: Text(
+                        '${channel.outputChannelId} · Telegram',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+                onChanged: _loadingOutputChannels || _submitting
+                    ? null
+                    : (value) => setState(() => _outputChannelId = value ?? ''),
+              ),
+              const SizedBox(height: 12),
               SegmentedButton<String>(
                 segments: [
                   ButtonSegment(

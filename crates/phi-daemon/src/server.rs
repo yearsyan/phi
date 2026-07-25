@@ -26,13 +26,15 @@ use crate::{
     api::{self, AppState},
     config::{ConfigError, DaemonConfig, TlsConfig},
     connection_qr,
+    output_channel::{OutputChannelManager, TelegramOutputChannelSender},
     runtime::AgentRegistry,
     scheduled_task::{ScheduledTaskError, ScheduledTaskManager},
     service::ApplicationService,
     session_title::ProviderSessionTitleGenerator,
     store::{
-        DiskAgentProfileStore, DiskControlStore, DiskMcpProfileStore, DiskProviderStore,
-        DiskScheduledTaskStore, McpProfileStore, ProviderStore, ScheduledTaskStore,
+        DiskAgentProfileStore, DiskControlStore, DiskMcpProfileStore, DiskOutputChannelStore,
+        DiskProviderStore, DiskScheduledTaskStore, McpProfileStore, OutputChannelStore,
+        ProviderStore, ScheduledTaskStore,
     },
 };
 
@@ -41,6 +43,7 @@ const SESSION_DIRECTORY: &str = "sessions";
 const PROVIDER_CONFIG_FILE: &str = "provider.json";
 const AGENT_PROFILE_CONFIG_FILE: &str = "agent-profiles.json";
 const MCP_PROFILE_CONFIG_FILE: &str = "mcp-profiles.json";
+const OUTPUT_CHANNEL_CONFIG_FILE: &str = "output-channels.json";
 const SCHEDULED_TASK_CONFIG_FILE: &str = "scheduled-tasks.json";
 const MAX_PENDING_TLS_HANDSHAKES: usize = 128;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,16 +58,24 @@ pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
         Some(tls) => Some(load_tls_acceptor(tls).await?),
         None => None,
     };
-    let service = Arc::new(application_service(&config, provider_http_client));
+    let service = Arc::new(application_service(&config, provider_http_client.clone()));
+    let output_channel_store: Arc<dyn OutputChannelStore> = Arc::new(DiskOutputChannelStore::new(
+        config.data_dir().join(OUTPUT_CHANNEL_CONFIG_FILE),
+    ));
+    let output_channels = Arc::new(OutputChannelManager::new(
+        output_channel_store,
+        Arc::new(TelegramOutputChannelSender::new(provider_http_client)),
+    ));
     let scheduled_task_store: Arc<dyn ScheduledTaskStore> = Arc::new(DiskScheduledTaskStore::new(
         config.data_dir().join(SCHEDULED_TASK_CONFIG_FILE),
     ));
-    let scheduled_tasks = Arc::new(ScheduledTaskManager::new(
-        Arc::clone(&service),
-        scheduled_task_store,
-    ));
+    let scheduled_tasks = Arc::new(
+        ScheduledTaskManager::new(Arc::clone(&service), scheduled_task_store)
+            .with_output_channels(Arc::clone(&output_channels)),
+    );
     let state = AppState::new(Arc::clone(&service), config.auth_key())
         .with_default_workspace(Workspace::new(config.workspace_dir()))
+        .with_output_channels(output_channels)
         .with_scheduled_tasks(Arc::clone(&scheduled_tasks));
     let address = config.bind_address();
     let listener = TcpListener::bind(address)

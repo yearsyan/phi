@@ -15,6 +15,7 @@ const apiMocks = vi.hoisted(() => ({
   browseWorkspace: vi.fn(),
   listProviders: vi.fn(),
   listAgentProfiles: vi.fn(),
+  listOutputChannels: vi.fn(),
 }));
 
 vi.mock('../../api/http.ts', () => apiMocks);
@@ -33,6 +34,17 @@ describe('CreateScheduledTaskModal', () => {
     });
     apiMocks.listAgentProfiles.mockResolvedValue({
       agent_profiles: [{ agent_profile_id: 'default' }],
+    });
+    apiMocks.listOutputChannels.mockResolvedValue({
+      output_channels: [
+        {
+          type: 'telegram',
+          output_channel_id: 'alerts',
+          revision: 1,
+          bot_token_configured: true,
+          chat_id: '-1001234567890',
+        },
+      ],
     });
   });
 
@@ -166,5 +178,40 @@ describe('CreateScheduledTaskModal', () => {
       every: 30,
       unit: 'minutes',
     });
+  });
+
+  it('attaches the selected output channel', async () => {
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onCreate={onCreate}
+        />
+      </I18nProvider>,
+    );
+
+    fireEvent.change(screen.getByLabelText('Name'), {
+      target: { value: 'Notify me' },
+    });
+    fireEvent.change(screen.getByLabelText('Prompt'), {
+      target: { value: 'Check status' },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('option', { name: 'alerts · Telegram' }),
+      ).toBeTruthy(),
+    );
+    fireEvent.change(screen.getByLabelText('Output channel'), {
+      target: { value: 'alerts' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+    expect(onCreate.mock.calls[0]?.[0].output_channel_id).toBe('alerts');
   });
 });

@@ -781,6 +781,33 @@ export interface McpProfilesResponse {
   mcp_profiles: PublicMcpProfile[];
 }
 
+export interface PutTelegramOutputChannelRequest {
+  type: 'telegram';
+  bot_token: string;
+  chat_id: string;
+}
+
+export type PutOutputChannelRequest = PutTelegramOutputChannelRequest;
+
+export interface PublicTelegramOutputChannel {
+  type: 'telegram';
+  output_channel_id: string;
+  revision: number;
+  bot_token_configured: boolean;
+  chat_id: string;
+}
+
+export type PublicOutputChannel = PublicTelegramOutputChannel;
+
+export interface OutputChannelResponse {
+  configured: boolean;
+  output_channel: PublicOutputChannel | null;
+}
+
+export interface OutputChannelsResponse {
+  output_channels: PublicOutputChannel[];
+}
+
 /** Body for `PUT /v1/providers/{profile_id}`. */
 export interface PutProviderRequest {
   provider: ProviderKind;
@@ -871,6 +898,7 @@ export interface ScheduledTask {
   profile_id: string;
   agent_profile_id: string;
   capability_mode: CapabilityMode | null;
+  output_channel_id?: string | null;
   schedule: ScheduledTaskSchedule;
   enabled: boolean;
   created_at: string;
@@ -892,6 +920,7 @@ export interface CreateScheduledTaskRequest {
   profile_id?: string;
   agent_profile_id?: string;
   capability_mode?: CapabilityMode;
+  output_channel_id?: string;
   schedule: ScheduledTaskSchedule;
 }
 

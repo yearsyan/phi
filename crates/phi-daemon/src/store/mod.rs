@@ -2,6 +2,7 @@ mod agent_profile;
 mod disk;
 mod mcp_profile;
 mod memory;
+mod output_channel;
 mod provider;
 mod scheduled_task;
 
@@ -22,6 +23,9 @@ pub use mcp_profile::{
     DiskMcpProfileStore, McpProfileStore, McpProfileStoreError, MemoryMcpProfileStore,
 };
 pub use memory::MemoryControlStore;
+pub use output_channel::{
+    DiskOutputChannelStore, MemoryOutputChannelStore, OutputChannelStore, OutputChannelStoreError,
+};
 pub use provider::{DiskProviderStore, MemoryProviderStore};
 pub use scheduled_task::{
     DiskScheduledTaskStore, MemoryScheduledTaskStore, ScheduledTaskStore, ScheduledTaskStoreError,

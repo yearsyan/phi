@@ -266,6 +266,11 @@ class S {
   String get hoursLabel => _t('hours', '小时');
   String get daysLabel => _t('days', '天');
   String get timezoneLabel => _t('Timezone (IANA)', '时区（IANA）');
+  String get outputChannel => _t('Output channel', '输出频道');
+  String get noOutputChannel => _t('No notifications', '不发送通知');
+  String outputChannelValue(String value) => _t('Channel: $value', '频道：$value');
+  String outputChannelsLoadFailed(Object error) =>
+      _t('Could not load output channels: $error', '无法加载输出频道：$error');
   String get create => _t('Create', '创建');
   String get namePromptRequired =>
       _t('Name and prompt are required.', '名称和提示词必填。');

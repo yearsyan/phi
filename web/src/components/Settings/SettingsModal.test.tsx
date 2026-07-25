@@ -12,6 +12,7 @@ import { I18nProvider } from '../../i18n/I18nProvider.tsx';
 import type {
   PublicAgentProfile,
   PublicMcpProfile,
+  PublicOutputChannel,
   PublicProviderConfig,
 } from '../../types/wire.ts';
 import { SettingsModal } from './SettingsModal.tsx';
@@ -19,10 +20,13 @@ import { SettingsModal } from './SettingsModal.tsx';
 const apiMocks = vi.hoisted(() => ({
   listAgentProfiles: vi.fn(),
   listMcpProfiles: vi.fn(),
+  listOutputChannels: vi.fn(),
   listProviders: vi.fn(),
   putAgentProfile: vi.fn(),
   putMcpProfile: vi.fn(),
+  putOutputChannel: vi.fn(),
   putProvider: vi.fn(),
+  testOutputChannel: vi.fn(),
 }));
 
 vi.mock('../../api/http.ts', () => apiMocks);
@@ -91,9 +95,12 @@ describe('SettingsModal', () => {
     apiMocks.listMcpProfiles.mockResolvedValue({
       mcp_profiles: [remoteMcpProfile],
     });
+    apiMocks.listOutputChannels.mockResolvedValue({ output_channels: [] });
     apiMocks.putProvider.mockReset();
     apiMocks.putAgentProfile.mockReset();
     apiMocks.putMcpProfile.mockReset();
+    apiMocks.putOutputChannel.mockReset();
+    apiMocks.testOutputChannel.mockReset();
   });
 
   afterEach(cleanup);
@@ -495,6 +502,72 @@ describe('SettingsModal', () => {
             clear_env: true,
           },
         }),
+      );
+    });
+  });
+
+  it('configures and tests a Telegram output channel', async () => {
+    const created: PublicOutputChannel = {
+      type: 'telegram',
+      output_channel_id: 'alerts',
+      revision: 1,
+      bot_token_configured: true,
+      chat_id: '-1001234567890',
+    };
+    apiMocks.putOutputChannel.mockResolvedValue({
+      configured: true,
+      output_channel: created,
+    });
+    apiMocks.testOutputChannel.mockResolvedValue(undefined);
+    render(
+      <I18nProvider initialLocale="en">
+        <SettingsModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId=""
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onSaveAuthKey={vi.fn()}
+          onSaveProfileId={vi.fn()}
+          onSaveAgentProfileId={vi.fn()}
+          onSaveCapabilityMode={vi.fn()}
+          onProviderSaved={vi.fn()}
+          onConfigured={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Output channels' }));
+    await waitFor(() => {
+      expect(apiMocks.listOutputChannels).toHaveBeenCalledWith('daemon-key');
+    });
+    fireEvent.change(screen.getByLabelText('Output channel id'), {
+      target: { value: 'alerts' },
+    });
+    fireEvent.change(screen.getByLabelText(/Bot token/), {
+      target: { value: '123456789:test_bot_token_with_enough_chars' },
+    });
+    fireEvent.change(screen.getByLabelText(/Chat id/), {
+      target: { value: '-1001234567890' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(apiMocks.putOutputChannel).toHaveBeenCalledWith(
+        'daemon-key',
+        'alerts',
+        {
+          type: 'telegram',
+          bot_token: '123456789:test_bot_token_with_enough_chars',
+          chat_id: '-1001234567890',
+        },
+      );
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Send test' }));
+    await waitFor(() => {
+      expect(apiMocks.testOutputChannel).toHaveBeenCalledWith(
+        'daemon-key',
+        'alerts',
       );
     });
   });

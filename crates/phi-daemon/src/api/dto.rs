@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    output_channel::{OutputChannel, OutputChannelDefinition},
     runtime::{
         AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
         AskUserId, AskUserRequest, AssistantDraft, ContextCompactionPhase, ContextCompactionView,
@@ -51,6 +52,8 @@ pub struct CreateScheduledTaskRequest {
     pub agent_profile_id: Option<String>,
     #[serde(default)]
     pub capability_mode: Option<CapabilityMode>,
+    #[serde(default)]
+    pub output_channel_id: Option<String>,
     pub schedule: ScheduledTaskScheduleDto,
 }
 
@@ -64,6 +67,7 @@ impl fmt::Debug for CreateScheduledTaskRequest {
             .field("profile_id", &self.profile_id)
             .field("agent_profile_id", &self.agent_profile_id)
             .field("capability_mode", &self.capability_mode)
+            .field("output_channel_id", &self.output_channel_id)
             .field("schedule", &self.schedule)
             .finish()
     }
@@ -87,6 +91,7 @@ impl CreateScheduledTaskRequest {
                 .agent_profile_id
                 .unwrap_or_else(|| default_agent_profile_id.to_owned()),
             capability_mode: self.capability_mode,
+            output_channel_id: self.output_channel_id,
             schedule: self.schedule.into(),
         }
     }
@@ -174,6 +179,7 @@ pub struct ScheduledTaskDto {
     pub profile_id: String,
     pub agent_profile_id: String,
     pub capability_mode: Option<CapabilityMode>,
+    pub output_channel_id: Option<String>,
     pub schedule: ScheduledTaskScheduleDto,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
@@ -194,6 +200,7 @@ impl From<ScheduledTask> for ScheduledTaskDto {
             profile_id: task.profile_id,
             agent_profile_id: task.agent_profile_id,
             capability_mode: task.capability_mode,
+            output_channel_id: task.output_channel_id,
             schedule: ScheduledTaskScheduleDto::from(&task.schedule),
             enabled: task.enabled,
             created_at: task.created_at,
@@ -740,6 +747,78 @@ impl McpProfileResponse {
 #[derive(Debug, Serialize)]
 pub struct McpProfilesResponse {
     pub mcp_profiles: Vec<PublicMcpProfile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PutOutputChannelRequest {
+    Telegram { bot_token: String, chat_id: String },
+}
+
+impl fmt::Debug for PutOutputChannelRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Telegram { chat_id, .. } => formatter
+                .debug_struct("Telegram")
+                .field("bot_token", &"[REDACTED]")
+                .field("chat_id", chat_id)
+                .finish(),
+        }
+    }
+}
+
+impl From<PutOutputChannelRequest> for OutputChannelDefinition {
+    fn from(request: PutOutputChannelRequest) -> Self {
+        match request {
+            PutOutputChannelRequest::Telegram { bot_token, chat_id } => {
+                Self::Telegram { bot_token, chat_id }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PublicOutputChannel {
+    Telegram {
+        output_channel_id: String,
+        revision: u64,
+        bot_token_configured: bool,
+        chat_id: String,
+    },
+}
+
+impl From<OutputChannel> for PublicOutputChannel {
+    fn from(channel: OutputChannel) -> Self {
+        match channel.definition {
+            OutputChannelDefinition::Telegram { bot_token, chat_id } => Self::Telegram {
+                output_channel_id: channel.output_channel_id,
+                revision: channel.revision,
+                bot_token_configured: !bot_token.is_empty(),
+                chat_id,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputChannelResponse {
+    pub configured: bool,
+    pub output_channel: Option<PublicOutputChannel>,
+}
+
+impl OutputChannelResponse {
+    pub fn from_channel(channel: Option<OutputChannel>) -> Self {
+        Self {
+            configured: channel.is_some(),
+            output_channel: channel.map(PublicOutputChannel::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputChannelsResponse {
+    pub output_channels: Vec<PublicOutputChannel>,
 }
 
 fn default_mcp_connect_timeout_secs() -> u64 {
@@ -2199,6 +2278,32 @@ mod tests {
         );
         assert!(!value.to_string().contains(bearer_secret));
         assert!(!value.to_string().contains(header_secret));
+    }
+
+    #[test]
+    fn output_channel_request_debug_and_public_dto_redact_bot_token() {
+        let secret = "123456789:canary_bot_token_that_must_not_appear";
+        let request: PutOutputChannelRequest = serde_json::from_value(serde_json::json!({
+            "type": "telegram",
+            "bot_token": secret,
+            "chat_id": "-1001234567890"
+        }))
+        .unwrap();
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+
+        let channel = OutputChannel {
+            output_channel_id: "alerts".to_owned(),
+            revision: 1,
+            definition: request.into(),
+        };
+        let value =
+            serde_json::to_value(OutputChannelResponse::from_channel(Some(channel))).unwrap();
+        assert_eq!(value["output_channel"]["type"], "telegram");
+        assert_eq!(value["output_channel"]["bot_token_configured"], true);
+        assert!(!value.to_string().contains(secret));
     }
 
     #[test]

@@ -5,10 +5,13 @@ import type {
   ForkPosition,
   McpProfileResponse,
   McpProfilesResponse,
+  OutputChannelResponse,
+  OutputChannelsResponse,
   ProviderResponse,
   ProvidersResponse,
   PutAgentProfileRequest,
   PutMcpProfileRequest,
+  PutOutputChannelRequest,
   PutProviderRequest,
   ScheduledTask,
   ScheduledTasksResponse,
@@ -260,5 +263,47 @@ export function putMcpProfile(
     `/v1/mcp-profiles/${encodeURIComponent(mcpProfileId)}`,
     authKey,
     { method: 'PUT', body: JSON.stringify(body) },
+  );
+}
+
+export function listOutputChannels(
+  authKey: string,
+): Promise<OutputChannelsResponse> {
+  return http<OutputChannelsResponse>('/v1/output-channels', authKey, {
+    method: 'GET',
+  });
+}
+
+export function getOutputChannel(
+  authKey: string,
+  outputChannelId: string,
+): Promise<OutputChannelResponse> {
+  return http<OutputChannelResponse>(
+    `/v1/output-channels/${encodeURIComponent(outputChannelId)}`,
+    authKey,
+    { method: 'GET' },
+  );
+}
+
+export function putOutputChannel(
+  authKey: string,
+  outputChannelId: string,
+  body: PutOutputChannelRequest,
+): Promise<OutputChannelResponse> {
+  return http<OutputChannelResponse>(
+    `/v1/output-channels/${encodeURIComponent(outputChannelId)}`,
+    authKey,
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
+}
+
+export function testOutputChannel(
+  authKey: string,
+  outputChannelId: string,
+): Promise<void> {
+  return http<void>(
+    `/v1/output-channels/${encodeURIComponent(outputChannelId)}/test`,
+    authKey,
+    { method: 'POST' },
   );
 }

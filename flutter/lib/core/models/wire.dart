@@ -850,6 +850,7 @@ class ScheduledTask {
     this.profileId,
     this.agentProfileId,
     this.capabilityMode,
+    this.outputChannelId,
     required this.schedule,
     this.enabled = true,
     this.createdAt,
@@ -867,6 +868,7 @@ class ScheduledTask {
   final String? profileId;
   final String? agentProfileId;
   final String? capabilityMode;
+  final String? outputChannelId;
   final ScheduledTaskSchedule schedule;
   final bool enabled;
   final String? createdAt;
@@ -884,6 +886,7 @@ class ScheduledTask {
     profileId: json['profile_id'] as String?,
     agentProfileId: json['agent_profile_id'] as String?,
     capabilityMode: json['capability_mode'] as String?,
+    outputChannelId: json['output_channel_id'] as String?,
     schedule: ScheduledTaskSchedule.fromJson(_asJson(json['schedule'])),
     enabled: json['enabled'] as bool? ?? true,
     createdAt: json['created_at'] as String?,
@@ -1086,6 +1089,30 @@ class PublicMcpProfile {
         : _asInt(json['request_timeout_secs'], 60),
     maxOutputLines: _asInt(json['max_output_lines'], 2000),
     maxOutputBytes: _asInt(json['max_output_bytes'], 51200),
+  );
+}
+
+class PublicOutputChannel {
+  const PublicOutputChannel({
+    required this.type,
+    required this.outputChannelId,
+    required this.revision,
+    required this.botTokenConfigured,
+    required this.chatId,
+  });
+
+  final String type;
+  final String outputChannelId;
+  final int revision;
+  final bool botTokenConfigured;
+  final String chatId;
+
+  static PublicOutputChannel fromJson(Json json) => PublicOutputChannel(
+    type: json['type'] as String? ?? '',
+    outputChannelId: json['output_channel_id'] as String? ?? '',
+    revision: _asInt(json['revision']),
+    botTokenConfigured: json['bot_token_configured'] as bool? ?? false,
+    chatId: json['chat_id'] as String? ?? '',
   );
 }
 

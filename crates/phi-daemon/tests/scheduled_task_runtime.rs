@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,6 +19,10 @@ use phi::{
 };
 use phi_daemon::{
     api::AppState,
+    output_channel::{
+        OutputChannelDefinition, OutputChannelDeliveryError, OutputChannelManager,
+        OutputChannelSender,
+    },
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentProfileDefinition, AgentRegistry,
         BuiltAgent, compile_agent_profile, default_agent_profile,
@@ -30,15 +34,16 @@ use phi_daemon::{
     serve,
     service::ApplicationService,
     store::{
-        MemoryControlStore, MemoryProviderStore, MemoryScheduledTaskStore, ProviderConfig,
-        ProviderKind, ProviderStore, ScheduledTaskStore,
+        MemoryControlStore, MemoryOutputChannelStore, MemoryProviderStore,
+        MemoryScheduledTaskStore, OutputChannelStore, ProviderConfig, ProviderKind, ProviderStore,
+        ScheduledTaskStore,
     },
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
-    sync::{Notify, oneshot},
+    sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
 };
 
@@ -84,12 +89,31 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
         .configure_agent_profile("reviewer", AgentProfileDefinition::default())
         .await
         .unwrap();
-    let manager = Arc::new(ScheduledTaskManager::new(
-        Arc::clone(&service),
-        Arc::new(MemoryScheduledTaskStore::new()),
+    let channel_store = Arc::new(MemoryOutputChannelStore::new());
+    channel_store
+        .replace_output_channel(
+            "alerts",
+            OutputChannelDefinition::Telegram {
+                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+                chat_id: "-1001234567890".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let output_channels = Arc::new(OutputChannelManager::new(
+        channel_store,
+        Arc::new(RecordingOutputChannelSender::default()),
     ));
+    let manager = Arc::new(
+        ScheduledTaskManager::new(
+            Arc::clone(&service),
+            Arc::new(MemoryScheduledTaskStore::new()),
+        )
+        .with_output_channels(Arc::clone(&output_channels)),
+    );
     let state = AppState::new(Arc::clone(&service), AUTH_KEY)
         .with_default_workspace(Workspace::new(&workspace.0))
+        .with_output_channels(output_channels)
         .with_scheduled_tasks(Arc::clone(&manager));
     let (address, stop, server) = spawn_server(state).await;
     let client = reqwest::Client::new();
@@ -102,6 +126,28 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
+    let missing_channel = authorized(
+        client.post(format!("{base}/v1/scheduled-tasks")),
+        json!({
+            "name": "Invalid channel",
+            "prompt": "This task must not be created",
+            "workspace": workspace.0,
+            "agent_profile_id": "reviewer",
+            "output_channel_id": "missing",
+            "schedule": {
+                "type": "interval",
+                "every": 1,
+                "unit": "hours"
+            }
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing_channel.status(), StatusCode::BAD_REQUEST);
+    let missing_channel: Value = missing_channel.json().await.unwrap();
+    assert_eq!(missing_channel["code"], "invalid_scheduled_task");
+
     let create = authorized(
         client.post(format!("{base}/v1/scheduled-tasks")),
         json!({
@@ -109,6 +155,7 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
             "prompt": "Review the latest workspace changes",
             "workspace": workspace.0,
             "agent_profile_id": "reviewer",
+            "output_channel_id": "alerts",
             "schedule": {
                 "type": "daily",
                 "time": "09:00",
@@ -125,6 +172,7 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
     let task_id = created["task_id"].as_str().unwrap();
     assert_eq!(created["prompt"], "Review the latest workspace changes");
     assert_eq!(created["agent_profile_id"], "reviewer");
+    assert_eq!(created["output_channel_id"], "alerts");
     assert_eq!(created["schedule"]["type"], "daily");
     assert_eq!(created["schedule"]["timezone"], "Asia/Singapore");
     assert_eq!(created["revision"], 1);
@@ -180,16 +228,34 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
 async fn due_task_creates_a_named_independent_session_and_records_success() {
     let workspace = TemporaryDirectory::new("phi-scheduled-run");
     let provider_calls = Arc::new(AtomicUsize::new(0));
+    let askuser_exposed = Arc::new(AtomicBool::new(false));
     let service = Arc::new(ApplicationService::new(
         AgentRegistry::new(),
         Arc::new(MemoryControlStore::new()),
         Arc::new(InMemorySessionStorage::new()),
         Arc::new(ImmediateFactory {
             provider_calls: Arc::clone(&provider_calls),
+            askuser_exposed: Arc::clone(&askuser_exposed),
             install_permission_tool: true,
         }),
     ));
     let store = Arc::new(MemoryScheduledTaskStore::new());
+    let channel_store = Arc::new(MemoryOutputChannelStore::new());
+    channel_store
+        .replace_output_channel(
+            "alerts",
+            OutputChannelDefinition::Telegram {
+                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+                chat_id: "-1001234567890".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let notifications = Arc::new(RecordingOutputChannelSender::with_failures(1));
+    let output_channels = Arc::new(OutputChannelManager::new(
+        channel_store,
+        notifications.clone(),
+    ));
     let now = Utc::now();
     let task = ScheduledTask {
         id: ScheduledTaskId::new(),
@@ -199,6 +265,7 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         profile_id: "default".to_owned(),
         agent_profile_id: "default".to_owned(),
         capability_mode: Some(CapabilityMode::WorkspaceEdit),
+        output_channel_id: Some("alerts".to_owned()),
         schedule: ScheduledTaskSchedule::Interval {
             every: 1,
             unit: ScheduledIntervalUnit::Minutes,
@@ -212,10 +279,10 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         revision: 1,
     };
     store.create_task(task.clone()).await.unwrap();
-    let manager = Arc::new(ScheduledTaskManager::new(
-        Arc::clone(&service),
-        store.clone(),
-    ));
+    let manager = Arc::new(
+        ScheduledTaskManager::new(Arc::clone(&service), store.clone())
+            .with_output_channels(output_channels),
+    );
     manager.start().await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -233,6 +300,10 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
     .unwrap();
 
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !askuser_exposed.load(Ordering::SeqCst),
+        "noninteractive scheduled tasks must not expose askuser"
+    );
     let sessions = service.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(
@@ -244,9 +315,51 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         Some(Workspace::new(&workspace.0))
     );
     assert_eq!(sessions[0].state.as_ref().unwrap().message_count, 2);
+    assert_eq!(notifications.failures_remaining.load(Ordering::Acquire), 0);
+    let messages = notifications.messages.lock().await;
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].contains("Status: running"));
+    assert!(messages[1].contains("Status: succeeded"));
+    assert!(messages[1].contains("Session:"));
 
     manager.shutdown().await;
     assert!(service.shutdown().await.is_empty());
+}
+
+#[derive(Default)]
+struct RecordingOutputChannelSender {
+    messages: Mutex<Vec<String>>,
+    failures_remaining: AtomicUsize,
+}
+
+impl RecordingOutputChannelSender {
+    fn with_failures(failures: usize) -> Self {
+        Self {
+            messages: Mutex::new(Vec::new()),
+            failures_remaining: AtomicUsize::new(failures),
+        }
+    }
+}
+
+#[async_trait]
+impl OutputChannelSender for RecordingOutputChannelSender {
+    async fn send(
+        &self,
+        _definition: &OutputChannelDefinition,
+        message: &str,
+    ) -> Result<(), OutputChannelDeliveryError> {
+        self.messages.lock().await.push(message.to_owned());
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(OutputChannelDeliveryError::Transport);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -271,6 +384,7 @@ async fn paused_task_runs_manually_and_rejects_overlap() {
         profile_id: "default".to_owned(),
         agent_profile_id: "default".to_owned(),
         capability_mode: None,
+        output_channel_id: None,
         schedule: ScheduledTaskSchedule::Interval {
             every: 1,
             unit: ScheduledIntervalUnit::Hours,
@@ -312,6 +426,7 @@ async fn startup_marks_an_uncertain_persisted_run_interrupted() {
         Arc::new(InMemorySessionStorage::new()),
         Arc::new(ImmediateFactory {
             provider_calls: Arc::new(AtomicUsize::new(0)),
+            askuser_exposed: Arc::new(AtomicBool::new(false)),
             install_permission_tool: false,
         }),
     ));
@@ -325,6 +440,7 @@ async fn startup_marks_an_uncertain_persisted_run_interrupted() {
         profile_id: "default".to_owned(),
         agent_profile_id: "default".to_owned(),
         capability_mode: None,
+        output_channel_id: None,
         schedule: ScheduledTaskSchedule::Interval {
             every: 1,
             unit: ScheduledIntervalUnit::Hours,
@@ -412,12 +528,17 @@ async fn spawn_server(
 #[derive(Clone)]
 struct ImmediateProvider {
     calls: Arc<AtomicUsize>,
+    askuser_exposed: Arc<AtomicBool>,
     expect_permission_tool_hidden: bool,
 }
 
 impl LlmProvider for ImmediateProvider {
     fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.askuser_exposed.store(
+            request.tools.iter().any(|tool| tool.name == "askuser"),
+            Ordering::SeqCst,
+        );
         if self.expect_permission_tool_hidden {
             assert!(
                 request
@@ -437,6 +558,7 @@ impl LlmProvider for ImmediateProvider {
 #[derive(Clone)]
 struct ImmediateFactory {
     provider_calls: Arc<AtomicUsize>,
+    askuser_exposed: Arc<AtomicBool>,
     install_permission_tool: bool,
 }
 
@@ -536,6 +658,7 @@ impl AgentFactory for ImmediateFactory {
             .unwrap_or(agent_profile.definition.initial_capability_mode);
         let mut builder = Agent::builder(ImmediateProvider {
             calls: Arc::clone(&self.provider_calls),
+            askuser_exposed: Arc::clone(&self.askuser_exposed),
             expect_permission_tool_hidden: self.install_permission_tool,
         })
         .workspace(workspace)

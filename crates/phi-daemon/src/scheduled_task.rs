@@ -13,7 +13,7 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, LocalResult, NaiveTime, TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt, stream};
 use phi::{CapabilityMode, Content, Workspace};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -24,6 +24,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    output_channel::{OutputChannelManager, validate_output_channel_id},
     runtime::{RunId, RuntimeEventKind, SessionId},
     service::{ApplicationService, ServiceError},
     store::{ScheduledTaskStore, ScheduledTaskStoreError},
@@ -151,6 +152,8 @@ pub struct ScheduledTask {
     pub profile_id: String,
     pub agent_profile_id: String,
     pub capability_mode: Option<CapabilityMode>,
+    #[serde(default)]
+    pub output_channel_id: Option<String>,
     pub schedule: ScheduledTaskSchedule,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
@@ -173,6 +176,7 @@ impl fmt::Debug for ScheduledTask {
             .field("profile_id", &self.profile_id)
             .field("agent_profile_id", &self.agent_profile_id)
             .field("capability_mode", &self.capability_mode)
+            .field("output_channel_id", &self.output_channel_id)
             .field("schedule", &self.schedule)
             .field("enabled", &self.enabled)
             .field("created_at", &self.created_at)
@@ -193,6 +197,7 @@ pub struct CreateScheduledTask {
     pub profile_id: String,
     pub agent_profile_id: String,
     pub capability_mode: Option<CapabilityMode>,
+    pub output_channel_id: Option<String>,
     pub schedule: ScheduledTaskSchedule,
 }
 
@@ -216,6 +221,7 @@ struct CoordinatorState {
 pub struct ScheduledTaskManager {
     service: Arc<ApplicationService>,
     store: Arc<dyn ScheduledTaskStore>,
+    output_channels: Option<Arc<OutputChannelManager>>,
     coordinator: Mutex<CoordinatorState>,
     executions: Mutex<JoinSet<()>>,
     execution_slots: Arc<Semaphore>,
@@ -232,6 +238,7 @@ impl ScheduledTaskManager {
         Self {
             service,
             store,
+            output_channels: None,
             coordinator: Mutex::new(CoordinatorState::default()),
             executions: Mutex::new(JoinSet::new()),
             execution_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
@@ -241,6 +248,11 @@ impl ScheduledTaskManager {
             started: AtomicBool::new(false),
             closing: AtomicBool::new(false),
         }
+    }
+
+    pub fn with_output_channels(mut self, output_channels: Arc<OutputChannelManager>) -> Self {
+        self.output_channels = Some(output_channels);
+        self
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), ScheduledTaskError> {
@@ -337,6 +349,22 @@ impl ScheduledTaskManager {
                 agent_profile_id: request.agent_profile_id,
             });
         }
+        if let Some(output_channel_id) = &request.output_channel_id {
+            let output_channels = self
+                .output_channels
+                .as_ref()
+                .ok_or(ScheduledTaskError::OutputChannelManagementUnavailable)?;
+            if output_channels
+                .get_channel(output_channel_id)
+                .await
+                .map_err(ScheduledTaskError::OutputChannel)?
+                .is_none()
+            {
+                return Err(ScheduledTaskError::OutputChannelNotFound {
+                    output_channel_id: output_channel_id.clone(),
+                });
+            }
+        }
 
         let _coordinator = self.coordinator.lock().await;
         if self.store.list_tasks().await?.len() >= MAX_SCHEDULED_TASKS {
@@ -353,6 +381,7 @@ impl ScheduledTaskManager {
             profile_id: request.profile_id,
             agent_profile_id: request.agent_profile_id,
             capability_mode: request.capability_mode,
+            output_channel_id: request.output_channel_id,
             next_run_at: Some(initial_next_run(&request.schedule, now)?),
             schedule: request.schedule,
             enabled: true,
@@ -516,17 +545,16 @@ impl ScheduledTaskManager {
         permit: OwnedSemaphorePermit,
     ) {
         let manager = Arc::clone(self);
-        let task_id = task.id;
         let mut executions = self.executions.lock().await;
         reap_join_set(&mut executions);
         executions.spawn(async move {
             let _permit = permit;
-            let completion = AssertUnwindSafe(manager.execute_task(task, scheduled_for))
+            let completion = AssertUnwindSafe(manager.execute_task(task.clone(), scheduled_for))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| TaskCompletion::interrupted("scheduled-task runtime panicked"));
             manager
-                .finish_execution(task_id, scheduled_for, completion)
+                .finish_execution(task, scheduled_for, completion)
                 .await;
         });
     }
@@ -536,6 +564,7 @@ impl ScheduledTaskManager {
         task: ScheduledTask,
         scheduled_for: DateTime<Utc>,
     ) -> TaskCompletion {
+        self.notify_task_started(&task, scheduled_for).await;
         let prepared = match self
             .service
             .prepare_noninteractive_session_configured_in_workspace(
@@ -580,7 +609,9 @@ impl ScheduledTaskManager {
                 "could not persist the scheduled run session id"
             );
         }
-        wait_for_run(&mut events, queued.run_id).await
+        wait_for_run(&mut events, queued.run_id)
+            .await
+            .with_session_id(session_id)
     }
 
     async fn cleanup_failed_session(&self, session_id: SessionId) {
@@ -615,10 +646,11 @@ impl ScheduledTaskManager {
 
     async fn finish_execution(
         &self,
-        task_id: ScheduledTaskId,
+        task: ScheduledTask,
         scheduled_for: DateTime<Utc>,
         completion: TaskCompletion,
     ) {
+        let task_id = task.id;
         let result = async {
             let mut coordinator = self.coordinator.lock().await;
             if let Some(mut task) = self.store.get_task(task_id).await?
@@ -628,7 +660,7 @@ impl ScheduledTaskManager {
             {
                 run.finished_at = Some(Utc::now());
                 run.outcome = completion.outcome;
-                run.error = completion.error;
+                run.error = completion.error.clone();
                 self.store.update_task(task).await?;
             }
             coordinator.running.remove(&task_id);
@@ -643,22 +675,41 @@ impl ScheduledTaskManager {
             );
             self.coordinator.lock().await.running.remove(&task_id);
         }
+        self.notify_task_finished(&task, scheduled_for, &completion)
+            .await;
         self.wake.notify_one();
     }
 
     async fn recover_interrupted_runs(&self) -> Result<(), ScheduledTaskError> {
         let _coordinator = self.coordinator.lock().await;
         let now = Utc::now();
+        let mut interrupted = Vec::new();
         for mut task in self.store.list_tasks().await? {
             if let Some(run) = task.last_run.as_mut()
                 && run.outcome == ScheduledRunOutcome::Running
             {
+                let scheduled_for = run.scheduled_for;
+                let session_id = run.session_id;
                 run.finished_at = Some(now);
                 run.outcome = ScheduledRunOutcome::Interrupted;
                 run.error = Some("daemon restarted before the run completed".to_owned());
-                self.store.update_task(task).await?;
+                self.store.update_task(task.clone()).await?;
+                interrupted.push((scheduled_for, session_id, task));
             }
         }
+        drop(_coordinator);
+        stream::iter(interrupted)
+            .for_each_concurrent(
+                MAX_CONCURRENT_RUNS,
+                |(scheduled_for, session_id, task)| async move {
+                    let completion =
+                        TaskCompletion::interrupted("daemon restarted before the run completed")
+                            .with_optional_session_id(session_id);
+                    self.notify_task_finished(&task, scheduled_for, &completion)
+                        .await;
+                },
+            )
+            .await;
         Ok(())
     }
 
@@ -666,6 +717,7 @@ impl ScheduledTaskManager {
         let mut coordinator = self.coordinator.lock().await;
         let running = std::mem::take(&mut coordinator.running);
         let now = Utc::now();
+        let mut interrupted = Vec::new();
         for task_id in running {
             let Some(mut task) = self.store.get_task(task_id).await? else {
                 continue;
@@ -673,13 +725,84 @@ impl ScheduledTaskManager {
             if let Some(run) = task.last_run.as_mut()
                 && run.outcome == ScheduledRunOutcome::Running
             {
+                let scheduled_for = run.scheduled_for;
+                let session_id = run.session_id;
                 run.finished_at = Some(now);
                 run.outcome = ScheduledRunOutcome::Interrupted;
                 run.error = Some(message.to_owned());
-                self.store.update_task(task).await?;
+                self.store.update_task(task.clone()).await?;
+                interrupted.push((scheduled_for, session_id, task));
             }
         }
+        drop(coordinator);
+        stream::iter(interrupted)
+            .for_each_concurrent(
+                MAX_CONCURRENT_RUNS,
+                |(scheduled_for, session_id, task)| async move {
+                    let completion =
+                        TaskCompletion::interrupted(message).with_optional_session_id(session_id);
+                    self.notify_task_finished(&task, scheduled_for, &completion)
+                        .await;
+                },
+            )
+            .await;
         Ok(())
+    }
+
+    async fn notify_task_started(&self, task: &ScheduledTask, scheduled_for: DateTime<Utc>) {
+        let message = format!(
+            "Phi scheduled task started\nTask: {}\nStatus: running\nScheduled for: {}",
+            task.name,
+            scheduled_for.to_rfc3339()
+        );
+        self.notify_output_channel(task, &message, "started").await;
+    }
+
+    async fn notify_task_finished(
+        &self,
+        task: &ScheduledTask,
+        scheduled_for: DateTime<Utc>,
+        completion: &TaskCompletion,
+    ) {
+        let mut message = format!(
+            "Phi scheduled task finished\nTask: {}\nStatus: {}\nScheduled for: {}",
+            task.name,
+            outcome_name(completion.outcome),
+            scheduled_for.to_rfc3339()
+        );
+        if let Some(session_id) = completion.session_id {
+            message.push_str(&format!("\nSession: {session_id}"));
+        }
+        self.notify_output_channel(task, &message, "finished").await;
+    }
+
+    async fn notify_output_channel(
+        &self,
+        task: &ScheduledTask,
+        message: &str,
+        phase: &'static str,
+    ) {
+        let Some(output_channel_id) = task.output_channel_id.as_deref() else {
+            return;
+        };
+        let Some(output_channels) = &self.output_channels else {
+            tracing::warn!(
+                task_id = %task.id,
+                %output_channel_id,
+                phase,
+                "scheduled-task output channel is unavailable"
+            );
+            return;
+        };
+        if let Err(error) = output_channels.send(output_channel_id, message).await {
+            tracing::warn!(
+                task_id = %task.id,
+                %output_channel_id,
+                phase,
+                error = %error,
+                "scheduled-task output channel delivery failed"
+            );
+        }
     }
 
     async fn reap_executions(&self) {
@@ -730,9 +853,11 @@ async fn wait_for_run(
     }
 }
 
+#[derive(Clone, Debug)]
 struct TaskCompletion {
     outcome: ScheduledRunOutcome,
     error: Option<String>,
+    session_id: Option<SessionId>,
 }
 
 impl TaskCompletion {
@@ -740,6 +865,7 @@ impl TaskCompletion {
         Self {
             outcome: ScheduledRunOutcome::Succeeded,
             error: None,
+            session_id: None,
         }
     }
 
@@ -747,6 +873,7 @@ impl TaskCompletion {
         Self {
             outcome: ScheduledRunOutcome::Stopped,
             error: None,
+            session_id: None,
         }
     }
 
@@ -754,6 +881,7 @@ impl TaskCompletion {
         Self {
             outcome: ScheduledRunOutcome::Failed,
             error: Some(error.into()),
+            session_id: None,
         }
     }
 
@@ -761,7 +889,18 @@ impl TaskCompletion {
         Self {
             outcome: ScheduledRunOutcome::Interrupted,
             error: Some(error.into()),
+            session_id: None,
         }
+    }
+
+    fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    fn with_optional_session_id(mut self, session_id: Option<SessionId>) -> Self {
+        self.session_id = session_id;
+        self
     }
 }
 
@@ -773,6 +912,16 @@ fn running_record(scheduled_for: DateTime<Utc>, started_at: DateTime<Utc>) -> Sc
         outcome: ScheduledRunOutcome::Running,
         session_id: None,
         error: None,
+    }
+}
+
+fn outcome_name(outcome: ScheduledRunOutcome) -> &'static str {
+    match outcome {
+        ScheduledRunOutcome::Running => "running",
+        ScheduledRunOutcome::Succeeded => "succeeded",
+        ScheduledRunOutcome::Failed => "failed",
+        ScheduledRunOutcome::Stopped => "stopped",
+        ScheduledRunOutcome::Interrupted => "interrupted",
     }
 }
 
@@ -804,6 +953,15 @@ fn normalize_create(
     }
     let profile_id = normalize_identifier("profile_id", &request.profile_id)?;
     let agent_profile_id = normalize_identifier("agent_profile_id", &request.agent_profile_id)?;
+    let output_channel_id = request
+        .output_channel_id
+        .as_deref()
+        .map(|output_channel_id| -> Result<String, ScheduledTaskError> {
+            validate_output_channel_id(output_channel_id)
+                .map_err(|error| invalid("output_channel_id", error.to_string()))?;
+            Ok(output_channel_id.to_owned())
+        })
+        .transpose()?;
     Ok(CreateScheduledTask {
         name: name.to_owned(),
         prompt: prompt.to_owned(),
@@ -811,6 +969,7 @@ fn normalize_create(
         profile_id,
         agent_profile_id,
         capability_mode: request.capability_mode,
+        output_channel_id,
         schedule: normalize_schedule(request.schedule)?,
     })
 }
@@ -993,6 +1152,7 @@ pub(crate) fn validate_persisted_task(task: &ScheduledTask) -> Result<(), String
         profile_id: task.profile_id.clone(),
         agent_profile_id: task.agent_profile_id.clone(),
         capability_mode: task.capability_mode,
+        output_channel_id: task.output_channel_id.clone(),
         schedule: task.schedule.clone(),
     })
     .map_err(|error| error.to_string())?;
@@ -1000,6 +1160,7 @@ pub(crate) fn validate_persisted_task(task: &ScheduledTask) -> Result<(), String
         || normalized.prompt != task.prompt
         || normalized.profile_id != task.profile_id
         || normalized.agent_profile_id != task.agent_profile_id
+        || normalized.output_channel_id != task.output_channel_id
         || normalized.schedule != task.schedule
     {
         return Err("task contains non-normalized fields".to_owned());
@@ -1073,6 +1234,15 @@ pub enum ScheduledTaskError {
 
     #[error("Agent Profile {agent_profile_id:?} was not found")]
     AgentProfileNotFound { agent_profile_id: String },
+
+    #[error("output channel management is unavailable for this embedded daemon")]
+    OutputChannelManagementUnavailable,
+
+    #[error("output channel {output_channel_id:?} was not found")]
+    OutputChannelNotFound { output_channel_id: String },
+
+    #[error(transparent)]
+    OutputChannel(#[from] crate::output_channel::OutputChannelError),
 
     #[error(transparent)]
     Store(#[from] ScheduledTaskStoreError),

@@ -912,6 +912,9 @@ HTTP/WebSocket 接口：
   profile 独立递增。
 - `GET /v1/mcp-profiles`、`GET/PUT /v1/mcp-profiles/{mcp_profile_id}`：管理独立的
   stdio/Streamable HTTP MCP 连接；公开响应只返回 secret 是否已配置或其键名。
+- `GET /v1/output-channels`、`GET/PUT /v1/output-channels/{output_channel_id}`：
+  管理定时任务的输出频道；当前支持 Telegram，公开响应不回显 bot token。
+- `POST /v1/output-channels/{output_channel_id}/test`：向已配置的输出频道发送测试消息。
 - `GET /v1/sessions`：列出已经持久化的 session；同时返回向后兼容的有序
   `sessions` 和由 daemon 按工作区投影的 `workspaces` 树。
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
@@ -932,16 +935,18 @@ HTTP/WebSocket 接口：
 
 同一 session 可以被多个 WebSocket 同时 attach；运行期间的新 prompt 会进入有界
 FIFO，stop、状态、模型和 capability 变化会同步广播。每个 session 由单独 actor 串行拥有
-`Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会自动获得
-`askuser` 和已启用的 subagent 工具，交互 session 还会获得工具审批；父 Agent 创建 child 时会向 session 调用方广播结构化事件，
+`Agent`，metadata 与 transcript 默认持久化到磁盘。daemon 创建的 Agent 会获得已启用的
+subagent 工具；交互 session 还会自动获得 `askuser` 和工具审批。父 Agent 创建 child 时会向 session 调用方广播结构化事件，
 child 的流式过程可通过独立只读 WebSocket 观察。问题通过广播发送，任一 attach 客户端
 可回答；越过 capability 边界的 Bash 等调用会显示“仅本次 / 本会话 / 拒绝”审批卡，
-断线重连可从 snapshot 的 pending 状态恢复。定时任务是非交互运行，不创建工具审批请求，
-越过其 capability 的工具继续 fail closed。
+断线重连可从 snapshot 的 pending 状态恢复。定时任务是非交互运行，不暴露 `askuser`，
+也不创建工具审批请求；越过其 capability 的工具继续 fail closed。
 
 定时任务由 daemon 进程调度，每次执行都创建独立 session，并把任务名作为
 session 标题。同一任务不重叠执行；下一次计划在开始 Agent 前持久化，避免进程
-崩溃后自动重放可能已发生的外部副作用。daemon 必须持续运行才能准时触发。
+崩溃后自动重放可能已发生的外部副作用。任务可通过 `output_channel_id` 选择
+Telegram 输出频道；daemon 会发送开始和终态（成功、失败、停止或中断）通知。
+通知发送失败只记录脱敏警告，不会改变任务结果。daemon 必须持续运行才能准时触发。
 
 首个 prompt 入队后，daemon 会异步生成并持久化 session 标题，再向所有 attach 客户端
 广播 `title_changed`。可通过 `PHI_DAEMON_SESSION_TITLE_PROFILE_ID` 指定独立的
@@ -1003,9 +1008,10 @@ NODE_EXTRA_CA_CERTS=../.phi/daemon/tls/localhost.crt \
 ```
 
 首次使用需在设置中保存 daemon 长期 key 和至少一个 Provider profile。设置页会分别列出
-Provider、Agent Profile 和 MCP Profile；MCP 支持 Streamable HTTP 与 stdio，Agent
-Profile 可关联多个 MCP。daemon 已保存的 API key、MCP bearer/header/environment
-secret 不会返回浏览器。已有本地配置时，页面会自动连接
+Provider、Agent Profile、MCP Profile 和输出频道；输出频道当前支持 Telegram，可保存
+bot token、chat ID 并发送测试消息。MCP 支持 Streamable HTTP 与 stdio，Agent
+Profile 可关联多个 MCP。daemon 已保存的 API key、Telegram bot token、MCP
+bearer/header/environment secret 不会返回浏览器。已有本地配置时，页面会自动连接
 一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
 客户端在 `session_created` 后继续复用原 WebSocket，不会在首条消息开始时强制重连；
 连接中断后，已激活 session 会通过 attach 自动退避恢复。prompt 使用 `request_id`
@@ -1033,15 +1039,16 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 之外的安全区，避免最后一行操作贴住浮动输入框。
 侧栏的“定时任务”页面可创建每日（IANA 时区与工作日）或间隔调度，并展示
 运行中/已暂停分组、下次时间与最近结果；可暂停、恢复、立即运行、删除或打开最近
-执行产生的 session。任务可指定 Agent Profile，因此也会继承该 profile 引用的 MCP；
-定时运行没有交互审批，MCP 工具需要 `full_access` 才会可用。
+执行产生的 session，并可选择一个已配置的 Telegram 输出频道接收开始和终态通知。
+任务可指定 Agent Profile，因此也会继承该 profile 引用的 MCP；
+定时运行不暴露 `askuser`，也没有交互审批；MCP 工具需要 `full_access` 才会可用。
 
 ### Flutter client
 
 `flutter/` 提供与 Web 客户端并列的 Flutter 应用，复用 daemon 的 REST、单次 WS token、
 prepared session、attach/resync 和 sequence gap 语义。应用包含 session/chat、workspace、
-scheduled task、askuser、工具权限审批、模型与 capability 控制，当前平台工程覆盖 Android、iOS、macOS、
-Windows 与 HarmonyOS/OpenHarmony。Provider 配置仍由 Web 客户端或 HTTP API 管理。
+scheduled task（含输出频道选择）、askuser、工具权限审批、模型与 capability 控制，当前平台工程覆盖 Android、iOS、macOS、
+Windows 与 HarmonyOS/OpenHarmony。Provider 与输出频道配置仍由 Web 客户端或 HTTP API 管理。
 应用随包提供未裁剪的 Noto Sans SC 可变字体，以统一各平台的中英文界面字形和
 100–900 字重；字体按 SIL Open Font License 1.1 再分发，并可从 Settings → About →
 Open-source licenses 查看完整许可证。

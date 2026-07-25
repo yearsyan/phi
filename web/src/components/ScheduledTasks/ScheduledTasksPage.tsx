@@ -251,6 +251,13 @@ function TaskGroup({
                         })
                       : t('scheduled.noNextRun')}
                   </span>
+                  {task.output_channel_id && (
+                    <span>
+                      {t('scheduled.outputChannel.badge', {
+                        channel: task.output_channel_id,
+                      })}
+                    </span>
+                  )}
                   {task.last_run && (
                     <span className={outcomeClass(task, styles)}>
                       {outcomeLabel(task, t)}

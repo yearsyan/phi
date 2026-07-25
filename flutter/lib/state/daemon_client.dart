@@ -122,6 +122,46 @@ class DaemonClient {
         .toList();
   }
 
+  Future<List<PublicOutputChannel>> listOutputChannels() async {
+    final json = await _requestJson('GET', '/v1/output-channels');
+    return (json['output_channels'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(PublicOutputChannel.fromJson)
+        .toList();
+  }
+
+  Future<PublicOutputChannel> putTelegramOutputChannel({
+    required String outputChannelId,
+    required String botToken,
+    required String chatId,
+  }) async {
+    final encodedId = Uri.encodeComponent(outputChannelId);
+    final json = await _requestJson(
+      'PUT',
+      '/v1/output-channels/$encodedId',
+      body: {'type': 'telegram', 'bot_token': botToken, 'chat_id': chatId},
+    );
+    final outputChannel = json['output_channel'];
+    if (outputChannel is Map<String, dynamic>) {
+      return PublicOutputChannel.fromJson(outputChannel);
+    }
+    throw DaemonError(
+      'invalid_response',
+      'expected output_channel object from daemon',
+    );
+  }
+
+  Future<void> testOutputChannel(String outputChannelId) async {
+    final encodedId = Uri.encodeComponent(outputChannelId);
+    final response = await transport.request(
+      'POST',
+      '/v1/output-channels/$encodedId/test',
+    );
+    if (!response.isSuccess) {
+      throw DaemonError.fromBody(response.statusCode, response.body);
+    }
+  }
+
   /* ------------------------------- workspace ----------------------------- */
 
   Future<WorkspaceBrowseResponse> browseWorkspace([String? path]) async {
@@ -150,6 +190,7 @@ class DaemonClient {
     String? profileId,
     String? agentProfileId,
     String? capabilityMode,
+    String? outputChannelId,
     required ScheduledTaskSchedule schedule,
   }) async {
     final json = await _requestJson(
@@ -162,6 +203,7 @@ class DaemonClient {
         'profile_id': ?profileId,
         'agent_profile_id': ?agentProfileId,
         'capability_mode': ?capabilityMode,
+        'output_channel_id': ?outputChannelId,
         'schedule': schedule.toJson(),
       },
     );

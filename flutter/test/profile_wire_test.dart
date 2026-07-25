@@ -75,4 +75,36 @@ void main() {
     expect(local.transport.envKeys, ['MCP_TOKEN']);
     expect(local.transport.clearEnv, isTrue);
   });
+
+  test('Output channel wire model exposes Telegram metadata but no token', () {
+    final channel = PublicOutputChannel.fromJson({
+      'type': 'telegram',
+      'output_channel_id': 'alerts',
+      'revision': 4,
+      'bot_token_configured': true,
+      'chat_id': '-1001234567890',
+    });
+
+    expect(channel.type, 'telegram');
+    expect(channel.outputChannelId, 'alerts');
+    expect(channel.revision, 4);
+    expect(channel.botTokenConfigured, isTrue);
+    expect(channel.chatId, '-1001234567890');
+  });
+
+  test(
+    'Scheduled task output channel is optional for older daemon responses',
+    () {
+      ScheduledTask task(Map<String, dynamic> extra) => ScheduledTask.fromJson({
+        'task_id': 'task-1',
+        'name': 'Review',
+        'prompt': 'Review the workspace',
+        'schedule': {'type': 'interval', 'every': 1, 'unit': 'hours'},
+        ...extra,
+      });
+
+      expect(task({}).outputChannelId, isNull);
+      expect(task({'output_channel_id': 'alerts'}).outputChannelId, 'alerts');
+    },
+  );
 }

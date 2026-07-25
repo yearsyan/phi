@@ -538,9 +538,9 @@ impl ApplicationService {
         .await
     }
 
-    /// Prepares a background session that cannot wait for a client approval.
-    /// Tools above its capability boundary remain unavailable instead of
-    /// creating an indefinitely pending permission request.
+    /// Prepares a background session that cannot wait for client interaction.
+    /// `askuser` and tool-permission prompts remain unavailable, and tools
+    /// above its capability boundary fail closed.
     pub(crate) async fn prepare_noninteractive_session_configured_in_workspace(
         &self,
         profile_id: impl Into<String>,
@@ -581,7 +581,7 @@ impl ApplicationService {
         agent_profile_id: String,
         capability_mode: Option<CapabilityMode>,
         workspace: Option<Workspace>,
-        interactive_tool_permissions: bool,
+        interactive: bool,
     ) -> Result<PreparedSession, ServiceError> {
         let _lifecycle = self.enter().await?;
         let session_id = SessionId::new();
@@ -610,7 +610,7 @@ impl ApplicationService {
             }
             .into());
         }
-        let handle = self.spawn_handle(session_id, built, interactive_tool_permissions);
+        let handle = self.spawn_handle(session_id, built, interactive);
         self.prepared
             .lock()
             .await
@@ -1157,12 +1157,12 @@ impl ApplicationService {
         &self,
         session_id: SessionId,
         mut built: BuiltAgent,
-        interactive_tool_permissions: bool,
+        interactive: bool,
     ) -> AgentHandle {
         let subagents = self
             .subagents_enabled
             .then(|| self.install_subagents(session_id, &mut built));
-        AgentHandle::spawn_configured_with_skills_subagents_and_tool_permissions(
+        AgentHandle::spawn_configured_with_skills_subagents_and_interactivity(
             session_id,
             built.agent,
             built.profile_id,
@@ -1171,7 +1171,7 @@ impl ApplicationService {
             built.reasoning_effort,
             built.skills,
             subagents,
-            interactive_tool_permissions,
+            interactive,
         )
     }
 

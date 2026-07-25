@@ -10,15 +10,17 @@ use phi::Workspace;
 
 use crate::service::ApplicationService;
 use crate::{
+    output_channel::{OutputChannelError, OutputChannelManager},
     runtime::{AgentFactoryError, AgentHandleError},
     scheduled_task::{ScheduledTaskError, ScheduledTaskManager},
     service::ServiceError,
-    store::{AgentProfileStoreError, McpProfileStoreError},
+    store::{AgentProfileStoreError, McpProfileStoreError, OutputChannelStoreError},
 };
 
 mod auth;
 mod dto;
 mod http;
+mod output_channel;
 mod scheduled_task;
 mod web;
 mod workspace;
@@ -33,6 +35,7 @@ pub struct AppState {
     service: Arc<ApplicationService>,
     auth: AuthManager,
     default_workspace: Workspace,
+    output_channels: Option<Arc<OutputChannelManager>>,
     scheduled_tasks: Option<Arc<ScheduledTaskManager>>,
 }
 
@@ -50,6 +53,7 @@ impl AppState {
             service,
             auth: AuthManager::new(auth_key, auth_token_ttl),
             default_workspace: Workspace::new("."),
+            output_channels: None,
             scheduled_tasks: None,
         }
     }
@@ -61,6 +65,11 @@ impl AppState {
 
     pub fn with_scheduled_tasks(mut self, scheduled_tasks: Arc<ScheduledTaskManager>) -> Self {
         self.scheduled_tasks = Some(scheduled_tasks);
+        self
+    }
+
+    pub fn with_output_channels(mut self, output_channels: Arc<OutputChannelManager>) -> Self {
+        self.output_channels = Some(output_channels);
         self
     }
 
@@ -79,12 +88,17 @@ impl AppState {
     fn scheduled_tasks(&self) -> Option<&Arc<ScheduledTaskManager>> {
         self.scheduled_tasks.as_ref()
     }
+
+    fn output_channels(&self) -> Option<&Arc<OutputChannelManager>> {
+        self.output_channels.as_ref()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
     let protected_http = Router::<AppState>::new()
         .merge(auth::routes())
         .merge(http::routes())
+        .merge(output_channel::routes())
         .merge(scheduled_task::routes())
         .merge(workspace::routes())
         .route_layer(middleware::from_fn_with_state(
@@ -180,9 +194,16 @@ impl ApiError {
             ),
             ScheduledTaskError::InvalidField { .. }
             | ScheduledTaskError::ProviderNotFound { .. }
-            | ScheduledTaskError::AgentProfileNotFound { .. } => {
+            | ScheduledTaskError::AgentProfileNotFound { .. }
+            | ScheduledTaskError::OutputChannelNotFound { .. } => {
                 Self::bad_request("invalid_scheduled_task", error.to_string())
             }
+            ScheduledTaskError::OutputChannelManagementUnavailable => Self::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "output_channels_unavailable",
+                error.to_string(),
+            ),
+            ScheduledTaskError::OutputChannel(error) => Self::output_channel(error),
             ScheduledTaskError::RevisionConflict { .. } => Self::new(
                 StatusCode::CONFLICT,
                 "scheduled_task_revision_conflict",
@@ -214,6 +235,29 @@ impl ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "scheduled-task storage failed",
+            ),
+        }
+    }
+
+    fn output_channel(error: OutputChannelError) -> Self {
+        match error {
+            OutputChannelError::NotFound { .. } => Self::new(
+                StatusCode::NOT_FOUND,
+                "output_channel_not_found",
+                error.to_string(),
+            ),
+            OutputChannelError::Store(OutputChannelStoreError::Validation(_)) => {
+                Self::bad_request("invalid_output_channel", error.to_string())
+            }
+            OutputChannelError::Delivery(_) => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "output_channel_delivery_failed",
+                error.to_string(),
+            ),
+            OutputChannelError::Store(_) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "output channel storage failed",
             ),
         }
     }
