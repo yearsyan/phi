@@ -9,6 +9,7 @@ import {
 } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '../../i18n/I18nProvider.tsx';
+import type { ScheduledTask } from '../../types/wire.ts';
 import { CreateScheduledTaskModal } from './CreateScheduledTaskModal.tsx';
 
 const apiMocks = vi.hoisted(() => ({
@@ -41,6 +42,7 @@ describe('CreateScheduledTaskModal', () => {
           type: 'telegram',
           output_channel_id: 'alerts',
           revision: 1,
+          bot_account_id: 'primary',
           bot_token_configured: true,
           chat_id: '-1001234567890',
         },
@@ -49,6 +51,91 @@ describe('CreateScheduledTaskModal', () => {
   });
 
   afterEach(() => cleanup());
+
+  it('keeps prompt focus when callback props change', async () => {
+    const firstOnClose = vi.fn();
+    const { rerender } = render(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode={null}
+          onClose={firstOnClose}
+          onCreate={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+    await screen.findByRole('option', { name: 'alerts · Telegram' });
+    const prompt = screen.getByLabelText('Prompt');
+    prompt.focus();
+    expect(document.activeElement).toBe(prompt);
+
+    rerender(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode={null}
+          onClose={vi.fn()}
+          onCreate={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    expect(document.activeElement).toBe(prompt);
+  });
+
+  it('prefills and replaces an existing task through its current revision', async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <I18nProvider initialLocale="en">
+        <CreateScheduledTaskModal
+          authKey="daemon-key"
+          profileId="default"
+          agentProfileId="default"
+          capabilityMode="full_access"
+          task={existingTask()}
+          onClose={vi.fn()}
+          onCreate={vi.fn()}
+          onUpdate={onUpdate}
+        />
+      </I18nProvider>,
+    );
+    await screen.findByRole('option', { name: 'alerts · Telegram' });
+    expect(
+      screen.getByRole('heading', { name: 'Edit scheduled task' }),
+    ).toBeTruthy();
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe(
+      'Existing review',
+    );
+    expect((screen.getByLabelText('Prompt') as HTMLTextAreaElement).value).toBe(
+      'Review the existing workspace',
+    );
+
+    fireEvent.change(screen.getByLabelText('Prompt'), {
+      target: { value: 'Review failures and suggest fixes' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(onUpdate).toHaveBeenCalledTimes(1));
+    expect(onUpdate).toHaveBeenCalledWith({
+      name: 'Existing review',
+      prompt: 'Review failures and suggest fixes',
+      workspace: '/workspace/existing',
+      profile_id: 'default',
+      agent_profile_id: 'default',
+      capability_mode: null,
+      output_channel_id: 'alerts',
+      schedule: {
+        type: 'interval',
+        every: 30,
+        unit: 'minutes',
+      },
+      expected_revision: 7,
+    });
+  });
 
   it('creates the default weekday schedule with workspace and profile policy', async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
@@ -206,7 +293,7 @@ describe('CreateScheduledTaskModal', () => {
         screen.getByRole('option', { name: 'alerts · Telegram' }),
       ).toBeTruthy(),
     );
-    fireEvent.change(screen.getByLabelText('Output channel'), {
+    fireEvent.change(screen.getByLabelText('Recipient target'), {
       target: { value: 'alerts' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
@@ -215,3 +302,28 @@ describe('CreateScheduledTaskModal', () => {
     expect(onCreate.mock.calls[0]?.[0].output_channel_id).toBe('alerts');
   });
 });
+
+function existingTask(): ScheduledTask {
+  return {
+    task_id: 'task-1',
+    name: 'Existing review',
+    prompt: 'Review the existing workspace',
+    workspace: '/workspace/existing',
+    profile_id: 'default',
+    agent_profile_id: 'default',
+    capability_mode: null,
+    output_channel_id: 'alerts',
+    schedule: {
+      type: 'interval',
+      every: 30,
+      unit: 'minutes',
+    },
+    enabled: true,
+    created_at: '2026-07-25T00:00:00Z',
+    updated_at: '2026-07-25T00:00:00Z',
+    next_run_at: '2026-07-25T00:30:00Z',
+    last_run: null,
+    skipped_runs: 0,
+    revision: 7,
+  };
+}

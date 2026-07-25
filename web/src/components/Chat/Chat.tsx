@@ -12,7 +12,11 @@ import type {
 import { useI18n } from '../../i18n/I18nProvider.tsx';
 import type { TranslationKey } from '../../i18n/translations.ts';
 import { deriveTimeline } from '../../state/timeline.ts';
-import type { ForkPosition, PublicProviderConfig } from '../../types/wire.ts';
+import type {
+  ForkPosition,
+  PublicAgentProfile,
+  PublicProviderConfig,
+} from '../../types/wire.ts';
 import { FolderIcon, GearIcon, MenuIcon, SparkIcon } from '../common/Icons.tsx';
 import { AskCard } from './AskCard.tsx';
 import styles from './Chat.module.css';
@@ -26,9 +30,12 @@ interface ChatProps {
   authKey: string;
   profileId: string;
   providerProfiles: PublicProviderConfig[];
+  agentProfileId: string;
+  agentProfiles: PublicAgentProfile[];
   conversationKey?: string;
   onFork: (messageIndex: number, position: ForkPosition) => Promise<void>;
   onSelectProvider: (profileId: string) => void;
+  onSelectAgentProfile: (agentProfileId: string) => void;
   onSelectWorkspace: (workspace: string) => void;
   onOpenSidebar: () => void;
   onOpenSettings: () => void;
@@ -48,9 +55,12 @@ export function Chat({
   authKey,
   profileId,
   providerProfiles,
+  agentProfileId,
+  agentProfiles,
   conversationKey,
   onFork,
   onSelectProvider,
+  onSelectAgentProfile,
   onSelectWorkspace,
   onOpenSidebar,
   onOpenSettings,
@@ -59,6 +69,7 @@ export function Chat({
     state,
     connectionPhase,
     connectionError,
+    canReconfigurePreparedSession,
     retry,
     sendPrompt,
     stop,
@@ -127,6 +138,21 @@ export function Chat({
     state.pendingToolPermissions.length > 0 ||
     state.notices.length > 0;
   const activeProfileId = state.profileId ?? profileId;
+  const activeAgentProfileId =
+    state.agentProfile?.agent_profile_id ??
+    (agentProfileId.trim() || 'default');
+  const activeAgentProfileIsListed = agentProfiles.some(
+    (profile) => profile.agent_profile_id === activeAgentProfileId,
+  );
+  const canSelectAgentProfile =
+    authKey.trim().length > 0 &&
+    connectionPhase !== 'idle' &&
+    canReconfigurePreparedSession &&
+    state.sessionId === null &&
+    state.history.length === 0 &&
+    state.pendingPrompts.length === 0 &&
+    state.activeRunId === null &&
+    !busy;
   const displayedModel =
     state.config?.model ??
     providerProfiles.find((profile) => profile.profile_id === activeProfileId)
@@ -212,6 +238,45 @@ export function Chat({
         </div>
 
         <div className={styles.controls}>
+          <label
+            className={`${styles.agentProfilePicker} ${
+              canSelectAgentProfile ? '' : styles.agentProfilePickerLocked
+            }`}
+            title={
+              canSelectAgentProfile
+                ? t('chat.agentProfile.switchHint')
+                : t('chat.agentProfile.lockedHint')
+            }
+          >
+            <span>{t('chat.agentProfile.shortLabel')}</span>
+            <select
+              aria-label={t('chat.agentProfile.label')}
+              value={activeAgentProfileId}
+              disabled={!canSelectAgentProfile}
+              onChange={(event) => {
+                if (
+                  canSelectAgentProfile &&
+                  event.target.value !== activeAgentProfileId
+                ) {
+                  onSelectAgentProfile(event.target.value);
+                }
+              }}
+            >
+              {!activeAgentProfileIsListed && (
+                <option value={activeAgentProfileId}>
+                  {activeAgentProfileId}
+                </option>
+              )}
+              {agentProfiles.map((profile) => (
+                <option
+                  key={profile.agent_profile_id}
+                  value={profile.agent_profile_id}
+                >
+                  {profile.agent_profile_id}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
             type="button"
             className={styles.iconButton}

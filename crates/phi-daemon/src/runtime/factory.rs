@@ -855,14 +855,7 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             tool_names,
-            HashSet::from([
-                "bash",
-                "bash_task_output",
-                "bash_task_stop",
-                "edit",
-                "read",
-                "write",
-            ])
+            HashSet::from(["bash", "bash_task_stop", "edit", "read", "write",])
         );
     }
 

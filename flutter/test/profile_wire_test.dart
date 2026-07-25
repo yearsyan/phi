@@ -76,11 +76,26 @@ void main() {
     expect(local.transport.clearEnv, isTrue);
   });
 
-  test('Output channel wire model exposes Telegram metadata but no token', () {
+  test('Bot account wire model exposes Telegram metadata but no token', () {
+    final account = PublicBotAccount.fromJson({
+      'type': 'telegram',
+      'bot_account_id': 'primary',
+      'revision': 2,
+      'bot_token_configured': true,
+    });
+
+    expect(account.type, 'telegram');
+    expect(account.botAccountId, 'primary');
+    expect(account.revision, 2);
+    expect(account.botTokenConfigured, isTrue);
+  });
+
+  test('Output target wire model references a bot account but no token', () {
     final channel = PublicOutputChannel.fromJson({
       'type': 'telegram',
       'output_channel_id': 'alerts',
       'revision': 4,
+      'bot_account_id': 'primary',
       'bot_token_configured': true,
       'chat_id': '-1001234567890',
     });
@@ -88,6 +103,7 @@ void main() {
     expect(channel.type, 'telegram');
     expect(channel.outputChannelId, 'alerts');
     expect(channel.revision, 4);
+    expect(channel.botAccountId, 'primary');
     expect(channel.botTokenConfigured, isTrue);
     expect(channel.chatId, '-1001234567890');
   });

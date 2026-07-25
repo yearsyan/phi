@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DaemonSessionControls } from '../../hooks/useDaemonSession.ts';
 import { I18nProvider } from '../../i18n/I18nProvider.tsx';
 import { initialSessionState } from '../../state/sessionReducer.ts';
-import type { PublicMessage } from '../../types/wire.ts';
+import type { PublicAgentProfile, PublicMessage } from '../../types/wire.ts';
 import { Chat } from './Chat.tsx';
 import { workspaceName } from './WorkspacePicker.tsx';
 
@@ -22,6 +22,31 @@ const history: PublicMessage[] = [
     tool_calls: [],
     tool_call_id: null,
     tool_result_is_error: false,
+  },
+];
+
+const agentProfiles: PublicAgentProfile[] = [
+  {
+    agent_profile_id: 'default',
+    revision: 0,
+    prompt: { mode: 'full', text: '' },
+    tools: { allow: null, deny: [] },
+    skills: { allow: null, deny: [] },
+    mcp_profile_ids: [],
+    initial_capability_mode: 'workspace_edit',
+    model: null,
+    reasoning_effort: null,
+  },
+  {
+    agent_profile_id: 'reviewer',
+    revision: 1,
+    prompt: { mode: 'extend', text: 'Review carefully.' },
+    tools: { allow: null, deny: [] },
+    skills: { allow: null, deny: [] },
+    mcp_profile_ids: [],
+    initial_capability_mode: 'read_only',
+    model: null,
+    reasoning_effort: null,
   },
 ];
 
@@ -45,6 +70,7 @@ function controls(
     connectionPhase: 'ready',
     connectionError: null,
     sessionListRevision: 0,
+    canReconfigurePreparedSession: true,
     retry: vi.fn(),
     sendPrompt: vi.fn(() => true),
     stop: vi.fn(),
@@ -71,8 +97,11 @@ describe('Chat', () => {
           authKey="daemon-key"
           profileId="default"
           providerProfiles={[]}
+          agentProfileId="default"
+          agentProfiles={agentProfiles}
           onFork={vi.fn()}
           onSelectProvider={vi.fn()}
+          onSelectAgentProfile={vi.fn()}
           onSelectWorkspace={vi.fn()}
           onOpenSidebar={vi.fn()}
           onOpenSettings={session.retry}
@@ -94,6 +123,98 @@ describe('Chat', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     expect(session.retry).toHaveBeenCalledOnce();
+  });
+
+  it('selects an Agent Profile before the first prompt', () => {
+    const onSelectAgentProfile = vi.fn();
+
+    render(
+      <I18nProvider initialLocale="en">
+        <Chat
+          controls={controls()}
+          authKey="daemon-key"
+          profileId="default"
+          providerProfiles={[]}
+          agentProfileId="default"
+          agentProfiles={agentProfiles}
+          onFork={vi.fn()}
+          onSelectProvider={vi.fn()}
+          onSelectAgentProfile={onSelectAgentProfile}
+          onSelectWorkspace={vi.fn()}
+          onOpenSidebar={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    const picker = screen.getByRole('combobox', { name: 'Agent Profile' });
+    expect((picker as HTMLSelectElement).disabled).toBe(false);
+    expect((picker as HTMLSelectElement).value).toBe('default');
+
+    fireEvent.change(picker, { target: { value: 'reviewer' } });
+    expect(onSelectAgentProfile).toHaveBeenCalledWith('reviewer');
+  });
+
+  it('shows the pinned Agent Profile but locks it after activation', () => {
+    const onSelectAgentProfile = vi.fn();
+    const session = controls({
+      sessionId: 'session-1',
+      history,
+      agentProfile: { agent_profile_id: 'reviewer', revision: 1 },
+    });
+
+    render(
+      <I18nProvider initialLocale="en">
+        <Chat
+          controls={session}
+          authKey="daemon-key"
+          profileId="default"
+          providerProfiles={[]}
+          agentProfileId="default"
+          agentProfiles={agentProfiles}
+          onFork={vi.fn()}
+          onSelectProvider={vi.fn()}
+          onSelectAgentProfile={onSelectAgentProfile}
+          onSelectWorkspace={vi.fn()}
+          onOpenSidebar={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    const picker = screen.getByRole('combobox', { name: 'Agent Profile' });
+    expect((picker as HTMLSelectElement).value).toBe('reviewer');
+    expect((picker as HTMLSelectElement).disabled).toBe(true);
+
+    fireEvent.change(picker, { target: { value: 'default' } });
+    expect(onSelectAgentProfile).not.toHaveBeenCalled();
+  });
+
+  it('locks Agent Profile selection as soon as the first prompt is admitted', () => {
+    const session = controls();
+    session.canReconfigurePreparedSession = false;
+
+    render(
+      <I18nProvider initialLocale="en">
+        <Chat
+          controls={session}
+          authKey="daemon-key"
+          profileId="default"
+          providerProfiles={[]}
+          agentProfileId="default"
+          agentProfiles={agentProfiles}
+          onFork={vi.fn()}
+          onSelectProvider={vi.fn()}
+          onSelectAgentProfile={vi.fn()}
+          onSelectWorkspace={vi.fn()}
+          onOpenSidebar={vi.fn()}
+          onOpenSettings={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    const picker = screen.getByRole('combobox', { name: 'Agent Profile' });
+    expect((picker as HTMLSelectElement).disabled).toBe(true);
   });
 
   it('derives a readable directory name without losing root paths', () => {
@@ -130,8 +251,11 @@ describe('Chat', () => {
           authKey="daemon-key"
           profileId="default"
           providerProfiles={[]}
+          agentProfileId="default"
+          agentProfiles={agentProfiles}
           onFork={vi.fn()}
           onSelectProvider={vi.fn()}
+          onSelectAgentProfile={vi.fn()}
           onSelectWorkspace={vi.fn()}
           onOpenSidebar={vi.fn()}
           onOpenSettings={vi.fn()}
@@ -176,8 +300,11 @@ describe('Chat', () => {
             authKey="daemon-key"
             profileId="default"
             providerProfiles={[]}
+            agentProfileId="default"
+            agentProfiles={agentProfiles}
             onFork={vi.fn()}
             onSelectProvider={vi.fn()}
+            onSelectAgentProfile={vi.fn()}
             onSelectWorkspace={vi.fn()}
             onOpenSidebar={vi.fn()}
             onOpenSettings={vi.fn()}

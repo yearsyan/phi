@@ -1,6 +1,6 @@
 # phi-daemon
 
-`phi-daemon` 把 `phi::Agent` 包装成一个常驻进程：进程内维护 `session_id -> Agent actor` 映射，通过 HTTP 列出已经激活的 session，通过 WebSocket 创建、恢复、操纵 session，并把 Agent 的流式事件广播给所有 attach 的客户端。daemon 还持久化每日/间隔定时任务，在到期时为每次执行创建一个独立 session，并可通过 Telegram 输出频道发送开始和终态通知。
+`phi-daemon` 把 `phi::Agent` 包装成一个常驻进程：进程内维护 `session_id -> Agent actor` 映射，通过 HTTP 列出已经激活的 session，通过 WebSocket 创建、恢复、操纵 session，并把 Agent 的流式事件广播给所有 attach 的客户端。daemon 还持久化每日/间隔定时任务，在到期时为每次执行创建一个独立 session，并可通过 Telegram 收件目标发送开始和终态通知。
 
 当前实现的重点是 session 生命周期、排队、广播、停止和磁盘恢复。命名 Provider
 profile 管理 adapter/凭证/默认生成配置；独立的 Agent Profile 管理 prompt 编译、
@@ -30,9 +30,9 @@ flowchart LR
     Axum --> Scheduler["ScheduledTaskManager<br/>daily / interval admission"]
     Scheduler --> Service
     Scheduler --> ScheduledStore["scheduled-tasks.json<br/>schedule + run state"]
-    Scheduler --> OutputChannels["OutputChannelManager<br/>Telegram delivery"]
+    Scheduler --> OutputChannels["OutputChannelManager<br/>Bot accounts + recipient targets"]
     Axum --> OutputChannels
-    OutputChannels --> OutputStore["output-channels.json<br/>chat ID + bot token"]
+    OutputChannels --> OutputStore["output-channels.json<br/>Bot accounts + chat targets"]
     OutputChannels --> Telegram["Telegram Bot API"]
     Factory --> Provider["phi Provider adapter"]
     Registry --> Actor["one actor per live session"]
@@ -59,7 +59,7 @@ flowchart LR
 - `ApplicationService` 负责首个 prompt 的延迟激活、持久化 metadata、进程重启后的单飞恢复，以及 registry 生命周期。
 - `ScheduledTaskManager` 独立持有调度与运行状态，到期后调用
   `ApplicationService` 创建普通 session；它不绕过 actor 复制 Agent loop。任务可选择
-  daemon 持有的输出频道，开始和终态通知失败不会改变 Agent 或任务结果。
+  daemon 持有的收件目标，开始和终态通知失败不会改变 Agent 或任务结果。
 - 首个 prompt 入队后，daemon 会在独立后台请求中生成 session 标题；标题更新仍回到
   actor 串行持久化并广播，不阻塞或修改主 Agent transcript。
 - `phi::SessionStorage` 保存完整 transcript 和 Provider 回放状态；WebSocket 的 public
@@ -127,12 +127,9 @@ loopback/LAN 地址提示。
 
 standalone daemon 将每个父 Agent 和 child Agent 配置为完整 coding agent，并以
 `PHI_DAEMON_WORKSPACE_DIR` 作为新 session 的默认 `phi::Workspace`，安装
-`read`、`edit`、`write`、`bash`、
-`bash_task_output`、`bash_task_stop`。后台 Bash 从启动起将合并输出写入私有临时文件，
+`read`、`edit`、`write`、`bash`、`bash_task_stop`。后台 Bash 从启动起将合并输出写入私有临时文件，
 目录/文件在 Unix 上分别以 `0700`/`0600` 创建，单文件上限 5 GiB；完成通知由 actor
-mailbox 自动唤醒模型，随后用 `read` 读取 `output_file`。`bash_task_output` 属于
-deprecated 兼容接口（默认阻塞 30 秒，可设置 `block=false`，最大等待
-600 秒），不应被模型用于主动轮询。内建 `default@0` Agent Profile 使用 Phi coding
+mailbox 自动唤醒模型，随后用 `read` 读取 `output_file`，不提供主动轮询工具。内建 `default@0` Agent Profile 使用 Phi coding
 persona；自定义 profile 可用 `extend` 追加行为说明，或用 `full` 替换 persona。无论哪种
 模式，daemon 都会追加不可删除的 harness 与解析后的绝对 workspace 信息；真正的工具
 权限仍由运行时检查，而不是由 prompt 保证。workspace 在首 prompt 激活时与 session
@@ -277,9 +274,11 @@ Agent Profile 工具名 deny，也不会跳过内置工具自己的 canonical wo
   revision，包括 bearer token、自定义 header value 与 stdio environment value；
   Unix 以 `0600` 创建。HTTP GET 只返回 `bearer_token_configured`、header name 与
   environment key，不返回 secret value。
-- `output-channels.json` 保存每个输出频道的最新定义和独立 revision；当前定义包含
-  Telegram bot token 与 chat ID，Unix 以 `0600` 创建。HTTP GET 只返回
-  `bot_token_configured`，不返回 token。
+- `output-channels.json` 是版本化的 Bot 账号与收件目标集合。Bot 账号保存 Telegram
+  token，收件目标只保存 `bot_account_id` 与 chat ID，因此同一 token 只出现一次且可
+  被多个目标复用；Unix 以 `0600` 创建。HTTP GET 只返回
+  `bot_token_configured`，不返回 token。旧版“每个频道复制 token”的数组会在 daemon
+  启动时原子迁移并按相同 token 去重。
 - `scheduled-tasks.json` 是版本化的定时任务集合，保存调度、下次执行时间、
   最近运行状态、可选 `output_channel_id` 与完整 prompt；Unix 上以 `0600` 创建。
   该文件可能包含敏感业务指令，不应公开分发。
@@ -488,6 +487,9 @@ curl -X PUT http://127.0.0.1:8787/v1/providers/openai-main \
 
 `provider` 支持 `openai_chat`、`openai_responses`、`anthropic`。`provider`、`api_key`、`base_url`、`model` 和 `max_context_tokens` 必填；`max_context_tokens` 必须是正整数，用于上下文占用统计，并作为后续压缩和精简策略的预算上限。默认 `max_retries=10`、`request_timeout_secs=30`、`stream_idle_timeout_secs=120`，其余可选字段可省略或为 `null`。连接响应头超时和 SSE 完整事件间空闲超时都必须大于零。`request_timeout_secs` 命中后请求会直接失败，不会自动重发，以免已经被 Provider 接收的 POST 重复计费。该接口只做本地格式和 Provider URL 校验，不会发送探测请求。daemon factory 为所有 session 构建的 Provider 复用同一个 HTTP client 和连接池。
 
+`max_output_tokens` 未配置时，daemon 不会为 OpenAI Chat、Responses 或 Anthropic 请求
+写入对应的输出 token 上限字段；需要固定上限时必须在 Provider profile 中显式设置。
+
 旧客户端提交的 `system_prompt` 字段仍会被兼容解析，但 daemon 会忽略该值，公开响应中的
 `system_prompt` 始终为 `null`。模型行为提示词应通过独立 Agent Profile 配置，不能与
 Provider credential/adapter 配置混合。
@@ -608,50 +610,64 @@ stdio 子进程及其
 
 ### Output Channel API
 
-输出频道是 daemon 级配置，当前只支持 Telegram：
+Telegram 输出分成两个 daemon 级实体：
 
-- `GET /v1/output-channels`：列出公开、脱敏的输出频道。
-- `GET /v1/output-channels/{output_channel_id}`：读取单个频道；未配置时返回
-  `{"configured":false,"output_channel":null}`。
-- `PUT /v1/output-channels/{output_channel_id}`：完整替换频道配置。
-- `POST /v1/output-channels/{output_channel_id}/test`：发送测试消息，成功返回 `204`。
+- **Bot 账号**保存一次 token，可被多个收件目标复用。
+- **收件目标**引用 `bot_account_id` 并保存一个 `chat_id`；定时任务继续通过
+  `output_channel_id` 引用这个目标。
 
-频道 ID 只能包含 ASCII 字母、数字、`_` 和 `-`。Telegram 配置示例：
+Bot 账号 API：
+
+- `GET /v1/bot-accounts`：列出公开、脱敏的 Bot 账号。
+- `GET /v1/bot-accounts/{bot_account_id}`：读取一个 Bot 账号。
+- `PUT /v1/bot-accounts/{bot_account_id}`：创建或完整替换账号 token。
 
 ```json
 {
   "type": "telegram",
-  "bot_token": "123456789:replace-with-a-real-secret",
+  "bot_token": "123456789:replace-with-a-real-secret"
+}
+```
+
+公开响应只包含 `bot_account_id`、revision 与 `bot_token_configured`，绝不回显 token。
+
+收件目标 API：
+
+- `GET /v1/output-channels`：列出收件目标。
+- `GET /v1/output-channels/{output_channel_id}`：读取单个目标；未配置时返回
+  `{"configured":false,"output_channel":null}`。
+- `PUT /v1/output-channels/{output_channel_id}`：创建或完整替换目标。
+- `POST /v1/output-channels/{output_channel_id}/test`：解析目标引用的 Bot 账号并发送
+  测试消息，成功返回 `204`。
+
+```json
+{
+  "type": "telegram",
+  "bot_account_id": "primary-bot",
   "chat_id": "-1001234567890"
 }
 ```
 
-`chat_id` 可以是私聊、群组或频道的数字 ID，也可以是 Telegram 支持的
-`@channelusername`。Bot 必须已经能向目标会话发消息；频道通常还需要把 Bot 加为管理员。
-PUT 是完整替换，因此更新已有频道时仍需重新提交 bot token。公开响应形如：
+Bot 账号和目标 ID 都只能包含 ASCII 字母、数字、`_` 和 `-`。`chat_id` 可以是私聊、
+群组或频道的数字 ID，也可以是 Telegram 支持的 `@channelusername`。Bot 必须已经能向
+目标会话发消息；私聊用户应先发送 `/start`，频道通常还需要把 Bot 加为管理员。
 
-```json
-{
-  "configured": true,
-  "output_channel": {
-    "type": "telegram",
-    "output_channel_id": "telegram-alerts",
-    "revision": 1,
-    "bot_token_configured": true,
-    "chat_id": "-1001234567890"
-  }
-}
-```
+为了兼容旧客户端，目标 PUT 暂时仍接受旧的 `bot_token + chat_id` 请求；daemon 会以
+`output_channel_id` 作为隐式 Bot 账号 ID 写入新模型。新客户端应使用
+`bot_account_id + chat_id`。目标公开响应保留 `bot_token_configured: true` 兼容字段，
+同时返回真实的 `bot_account_id`。
 
-bot token 只保存在 `output-channels.json`，不会进入公开 DTO、普通 Debug 输出或
-Telegram 传输错误。应把该文件和 daemon 长期 key 同等保密；不要把 token 放进
-任务 prompt、URL、日志、测试 fixture 或客户端持久化状态。
+bot token 只保存在 `output-channels.json` 的 `bot_accounts` 集合，不会进入收件目标、
+公开 DTO、普通 Debug 输出或 Telegram 传输错误。应把该文件和 daemon 长期 key 同等
+保密；不要把 token 放进任务 prompt、URL、日志、测试 fixture 或客户端持久化状态。
 
 ### Scheduled Task API
 
 - `GET /v1/scheduled-tasks`：返回 `{"tasks":[...]}`，新建任务在前。
 - `POST /v1/scheduled-tasks`：创建并启用任务，成功返回 `201` 和任务对象。
 - `GET /v1/scheduled-tasks/{task_id}`：读取单个任务。
+- `PUT /v1/scheduled-tasks/{task_id}`：完整替换任务的可编辑定义，使用 revision 做
+  乐观并发控制。
 - `PATCH /v1/scheduled-tasks/{task_id}`：暂停或恢复，可用 revision 做乐观并发控制。
 - `DELETE /v1/scheduled-tasks/{task_id}`：删除任务，成功返回 `204`。
 - `POST /v1/scheduled-tasks/{task_id}/run`：立即异步执行一次，成功接纳返回
@@ -678,8 +694,8 @@ Telegram 传输错误。应把该文件和 daemon 长期 key 同等保密；不�
 ```
 
 `workspace`、`profile_id`、`agent_profile_id` 和 `output_channel_id` 可省略；前三者
-分别使用 daemon 默认 workspace 和 `default` profile，未指定输出频道时不发送通知。
-创建时会验证指定输出频道已经存在。`capability_mode` 省略或为 `null` 时继承 Agent
+分别使用 daemon 默认 workspace 和 `default` profile，未指定收件目标时不发送通知。
+创建时会验证指定收件目标已经存在。`capability_mode` 省略或为 `null` 时继承 Agent
 Profile 初值。时间必须是 `HH:MM`，`weekdays` 不能为空，时区必须是有效 IANA 名称。
 夏令时跳变导致某日本地时间不存在时，该日跳过；回拨导致时间重复时，只在较早的
 那一次执行。
@@ -703,14 +719,32 @@ Profile 初值。时间必须是 `HH:MM`，`weekdays` 不能为空，时区必�
 调用 MCP 工具，应把任务或 Agent Profile 的 capability 设为 `full_access`。后台任务
 也不暴露 `askuser`；需要用户决定的前置条件应直接写进定时任务 prompt。
 
-更新只接受启用状态：
+暂停或恢复使用 PATCH：
 
 ```json
 { "enabled": false, "expected_revision": 3 }
 ```
 
-revision 不一致返回 `409 scheduled_task_revision_conflict`。暂停或删除不会取消
-已经开始的 session；同一任务执行中再手动执行返回
+编辑使用 PUT，并完整提交可编辑定义：
+
+```json
+{
+  "name": "更新后的 CI 检查",
+  "prompt": "检查 CI 失败并给出修复建议。",
+  "workspace": "/workspace/project",
+  "profile_id": "default",
+  "agent_profile_id": "default",
+  "capability_mode": "workspace_edit",
+  "output_channel_id": null,
+  "schedule": { "type": "interval", "every": 15, "unit": "minutes" },
+  "expected_revision": 3
+}
+```
+
+PUT 保留任务的启用状态、创建时间、最近运行和跳过次数；调度发生变化时，从保存时刻
+重新计算下一次执行。没有字段变化时不递增 revision。revision 不一致返回
+`409 scheduled_task_revision_conflict`。编辑、暂停或删除都不会改变已经开始的
+session；新定义只影响后续执行。同一任务执行中再手动执行返回
 `409 scheduled_task_already_running`。daemon 最多保存 1000 个任务，最多并发运行
 8 个调度 session；全局容量暂时不足的到期任务会等待之后的调度周期。
 
@@ -718,10 +752,17 @@ revision 不一致返回 `409 scheduled_task_revision_conflict`。暂停或删�
 `last_run.session_id` 可用于打开结果。`last_run.outcome` 为 `running`、
 `succeeded`、`failed`、`stopped` 或 `interrupted`。同一任务不会重叠执行；
 重叠到期点会前移到下一个未来时间并增加 `skipped_runs`。daemon 停机期间
-积累多个到期点时，恢复后最多立即补一次，不会形成追赶风暴。配置了输出频道时，
+积累多个到期点时，恢复后最多立即补一次，不会形成追赶风暴。配置了收件目标时，
 调度器会在开始运行时发送 `running` 通知，在得出终态后发送 `succeeded`、
-`failed`、`stopped` 或 `interrupted` 通知；终态通知在可用时包含 session ID。
-Telegram 不可达、拒绝消息或频道配置之后失效时，只记录脱敏 warning，不会把原本
+`failed`、`stopped` 或 `interrupted` 通知；通知标题为
+`scheduled task started`/`scheduled task finished`，状态分别使用 emoji，计划时间
+按“年月日 时:分:秒”的 24 小时制显示。每日任务使用其 IANA 时区，间隔任务使用 daemon
+本地时区；通知不显示 session ID，`last_run.session_id` 仍通过 API 保留。终态通知包含本次
+执行的累计 token 总数、输入、输出、缓存输入、缓存率，工具调用总数、按工具名汇总的
+次数和最后一条 public assistant 文本。缓存率为缓存输入 token 除以输入 token；没有
+输入 token 时显示 `n/a`。通知不会投影 reasoning、internal 消息或 opaque provider state；超过 Telegram 单条消息
+4096 字符上限的最终文本会按 Unicode 字符安全截断。
+Telegram 不可达、拒绝消息或目标配置之后失效时，只记录脱敏 warning，不会把原本
 成功的 Agent run 改成失败，也不会自动重试可能已被 Telegram 接收的消息。
 
 为避免崩溃后重放一个副作用是否已发生无法确定的 prompt，调度器会在创建
@@ -1128,8 +1169,9 @@ const socket = new WebSocket(
 显示标题、当前 workspace 目录名和右侧设置菜单；目录的完整绝对路径保留在悬浮提示中，
 数据来自 `ready` 或最新 snapshot。
 
-内置 Web 客户端的设置页分别管理 Provider、Agent Profile、MCP Profile 和输出频道。
-输出频道页可保存 Telegram bot token、chat ID 并发送测试消息；MCP 页支持
+内置 Web 客户端的设置页分别管理 Provider、Agent Profile、MCP Profile 和 Telegram 通知。
+通知页把 Telegram Bot 账号与收件目标分层管理：账号保存 token，多个目标可复用
+账号并分别保存 chat ID，目标可发送测试消息；MCP 页支持
 Streamable HTTP 与 stdio，Agent Profile 页可勾选多个 MCP Profile。API key、Telegram
 bot token、MCP bearer token、header value 和 environment value 只写入 daemon，
 不通过 GET 回显。
@@ -1137,7 +1179,9 @@ composer 的 Provider/model 菜单在 prepared 对话发送首个 prompt 前选�
 会保留 workspace 并重建 `/new` 连接。session 激活后，profile 项只作为模型预设：客户端
 发送 `set_model`，由 actor 在空闲状态持久化 model override，并从下一次用户请求开始使用；
 未发送的输入草稿不会被清除。已激活 session 的 Provider adapter、base URL 和凭据仍按
-metadata 固定，不能在原对话中热替换；切换完整 Provider 连接需要新建对话。
+metadata 固定，不能在原对话中热替换；切换完整 Provider 连接需要新建对话。聊天页右上角
+的 Agent Profile 选择器读取 `GET /v1/agent-profiles`，只在首条消息发送前允许修改；
+修改后保留 workspace 并重建 prepared `/new` 连接，session 激活后显示固定值且不可切换。
 
 运行时为唤醒父 Agent 注入的消息仍以 `role=user` 参与 Provider transcript，但 public
 message 会额外携带 `"visibility":"internal"`。客户端必须保留该条目以维持 history

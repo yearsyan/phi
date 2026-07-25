@@ -1,6 +1,8 @@
 import type {
   AgentProfileResponse,
   AgentProfilesResponse,
+  BotAccountResponse,
+  BotAccountsResponse,
   CreateScheduledTaskRequest,
   ForkPosition,
   McpProfileResponse,
@@ -10,9 +12,11 @@ import type {
   ProviderResponse,
   ProvidersResponse,
   PutAgentProfileRequest,
+  PutBotAccountRequest,
   PutMcpProfileRequest,
   PutOutputChannelRequest,
   PutProviderRequest,
+  ReplaceScheduledTaskRequest,
   ScheduledTask,
   ScheduledTasksResponse,
   SessionSummary,
@@ -136,6 +140,21 @@ export function updateScheduledTask(
         enabled,
         expected_revision: expectedRevision,
       }),
+    },
+  );
+}
+
+export function replaceScheduledTask(
+  authKey: string,
+  taskId: string,
+  body: ReplaceScheduledTaskRequest,
+): Promise<ScheduledTask> {
+  return http<ScheduledTask>(
+    `/v1/scheduled-tasks/${encodeURIComponent(taskId)}`,
+    authKey,
+    {
+      method: 'PUT',
+      body: JSON.stringify(body),
     },
   );
 }
@@ -272,6 +291,35 @@ export function listOutputChannels(
   return http<OutputChannelsResponse>('/v1/output-channels', authKey, {
     method: 'GET',
   });
+}
+
+export function listBotAccounts(authKey: string): Promise<BotAccountsResponse> {
+  return http<BotAccountsResponse>('/v1/bot-accounts', authKey, {
+    method: 'GET',
+  });
+}
+
+export function getBotAccount(
+  authKey: string,
+  botAccountId: string,
+): Promise<BotAccountResponse> {
+  return http<BotAccountResponse>(
+    `/v1/bot-accounts/${encodeURIComponent(botAccountId)}`,
+    authKey,
+    { method: 'GET' },
+  );
+}
+
+export function putBotAccount(
+  authKey: string,
+  botAccountId: string,
+  body: PutBotAccountRequest,
+): Promise<BotAccountResponse> {
+  return http<BotAccountResponse>(
+    `/v1/bot-accounts/${encodeURIComponent(botAccountId)}`,
+    authKey,
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
 }
 
 export function getOutputChannel(

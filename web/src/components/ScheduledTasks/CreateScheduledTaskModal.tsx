@@ -13,7 +13,9 @@ import type {
   PublicAgentProfile,
   PublicOutputChannel,
   PublicProviderConfig,
+  ReplaceScheduledTaskRequest,
   ScheduledIntervalUnit,
+  ScheduledTask,
   ScheduledWeekday,
 } from '../../types/wire.ts';
 import { WorkspacePicker } from '../Chat/WorkspacePicker.tsx';
@@ -35,8 +37,10 @@ interface CreateScheduledTaskModalProps {
   profileId: string;
   agentProfileId: string;
   capabilityMode: CapabilityMode | null;
+  task?: ScheduledTask;
   onClose: () => void;
   onCreate: (request: CreateScheduledTaskRequest) => Promise<void>;
+  onUpdate?: (request: ReplaceScheduledTaskRequest) => Promise<void>;
 }
 
 export function CreateScheduledTaskModal({
@@ -44,43 +48,62 @@ export function CreateScheduledTaskModal({
   profileId,
   agentProfileId,
   capabilityMode,
+  task,
   onClose,
   onCreate,
+  onUpdate,
 }: CreateScheduledTaskModalProps) {
   const { t } = useI18n();
   const nameRef = useRef<HTMLInputElement>(null);
-  const [name, setName] = useState('');
-  const [prompt, setPrompt] = useState('');
-  const [workspace, setWorkspace] = useState<string | null>(null);
-  const [selectedProfile, setSelectedProfile] = useState(profileId);
+  const dailySchedule = task?.schedule.type === 'daily' ? task.schedule : null;
+  const intervalSchedule =
+    task?.schedule.type === 'interval' ? task.schedule : null;
+  const taskWorkspace = task?.workspace;
+  const editing = task !== undefined;
+  const [name, setName] = useState(task?.name ?? '');
+  const [prompt, setPrompt] = useState(task?.prompt ?? '');
+  const [workspace, setWorkspace] = useState<string | null>(
+    task?.workspace ?? null,
+  );
+  const [selectedProfile, setSelectedProfile] = useState(
+    task?.profile_id ?? profileId,
+  );
   const [selectedAgentProfile, setSelectedAgentProfile] = useState(
-    agentProfileId.trim() || 'default',
+    task?.agent_profile_id ?? (agentProfileId.trim() || 'default'),
   );
   const [selectedCapability, setSelectedCapability] = useState<
     CapabilityMode | ''
-  >(capabilityMode ?? '');
+  >(task ? (task.capability_mode ?? '') : (capabilityMode ?? ''));
   const [providers, setProviders] = useState<PublicProviderConfig[]>([]);
   const [agentProfiles, setAgentProfiles] = useState<PublicAgentProfile[]>([]);
   const [outputChannels, setOutputChannels] = useState<PublicOutputChannel[]>(
     [],
   );
-  const [selectedOutputChannel, setSelectedOutputChannel] = useState('');
+  const [selectedOutputChannel, setSelectedOutputChannel] = useState(
+    task?.output_channel_id ?? '',
+  );
   const [scheduleType, setScheduleType] = useState<'daily' | 'interval'>(
-    'daily',
+    task?.schedule.type ?? 'daily',
   );
-  const [dailyTime, setDailyTime] = useState('09:00');
-  const [weekdays, setWeekdays] = useState<ScheduledWeekday[]>(() =>
-    WEEKDAYS.slice(0, 5),
+  const [dailyTime, setDailyTime] = useState(dailySchedule?.time ?? '09:00');
+  const [weekdays, setWeekdays] = useState<ScheduledWeekday[]>(
+    () => dailySchedule?.weekdays ?? WEEKDAYS.slice(0, 5),
   );
-  const [intervalEvery, setIntervalEvery] = useState(1);
-  const [intervalUnit, setIntervalUnit] =
-    useState<ScheduledIntervalUnit>('hours');
+  const [intervalEvery, setIntervalEvery] = useState(
+    intervalSchedule?.every ?? 1,
+  );
+  const [intervalUnit, setIntervalUnit] = useState<ScheduledIntervalUnit>(
+    intervalSchedule?.unit ?? 'hours',
+  );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const timezone = resolvedTimezone();
+  const timezone = dailySchedule?.timezone ?? resolvedTimezone();
 
   useEffect(() => {
     nameRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !submitting) onClose();
     };
@@ -91,7 +114,9 @@ export function CreateScheduledTaskModal({
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
-      browseWorkspace(authKey),
+      taskWorkspace
+        ? browseWorkspace(authKey, taskWorkspace)
+        : browseWorkspace(authKey),
       listProviders(authKey),
       listAgentProfiles(authKey),
       listOutputChannels(authKey).catch(() => ({ output_channels: [] })),
@@ -104,7 +129,7 @@ export function CreateScheduledTaskModal({
           outputChannelResponse,
         ]) => {
           if (cancelled) return;
-          setWorkspace(workspaceResponse.path);
+          setWorkspace(taskWorkspace ?? workspaceResponse.path);
           setProviders(providerResponse.providers);
           setAgentProfiles(agentProfileResponse.agent_profiles);
           setOutputChannels(outputChannelResponse.output_channels);
@@ -120,7 +145,7 @@ export function CreateScheduledTaskModal({
     return () => {
       cancelled = true;
     };
-  }, [authKey]);
+  }, [authKey, taskWorkspace]);
 
   const toggleWeekday = (weekday: ScheduledWeekday) => {
     setWeekdays((current) =>
@@ -175,7 +200,24 @@ export function CreateScheduledTaskModal({
       request.output_channel_id = selectedOutputChannel;
     }
     try {
-      await onCreate(request);
+      if (task) {
+        if (!onUpdate) {
+          throw new Error('scheduled-task update handler is unavailable');
+        }
+        await onUpdate({
+          name: request.name,
+          prompt: request.prompt,
+          workspace: workspace ?? task.workspace,
+          profile_id: selectedProfile,
+          agent_profile_id: selectedAgentProfile,
+          capability_mode: selectedCapability || null,
+          output_channel_id: selectedOutputChannel || null,
+          schedule,
+          expected_revision: task.revision,
+        });
+      } else {
+        await onCreate(request);
+      }
     } catch (createError) {
       setError(
         createError instanceof Error
@@ -197,9 +239,17 @@ export function CreateScheduledTaskModal({
         <header className={styles.header}>
           <div>
             <h2 id="create-scheduled-task-title">
-              {t('scheduled.modal.title')}
+              {t(
+                editing ? 'scheduled.modal.editTitle' : 'scheduled.modal.title',
+              )}
             </h2>
-            <p>{t('scheduled.modal.subtitle')}</p>
+            <p>
+              {t(
+                editing
+                  ? 'scheduled.modal.editSubtitle'
+                  : 'scheduled.modal.subtitle',
+              )}
+            </p>
           </div>
           <button
             type="button"
@@ -467,8 +517,14 @@ export function CreateScheduledTaskModal({
               disabled={!canCreate || submitting}
             >
               {submitting
-                ? t('scheduled.modal.creating')
-                : t('scheduled.modal.create')}
+                ? t(
+                    editing
+                      ? 'scheduled.modal.saving'
+                      : 'scheduled.modal.creating',
+                  )
+                : t(
+                    editing ? 'scheduled.modal.save' : 'scheduled.modal.create',
+                  )}
             </button>
           </footer>
         </form>

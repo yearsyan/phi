@@ -209,10 +209,12 @@ impl AnthropicMessagesProvider {
         let model = request.config.model.as_deref().unwrap_or(&self.model);
         let mut body = json!({
             "model": model,
-            "max_tokens": request.config.max_tokens.unwrap_or(4096),
             "messages": messages,
             "stream": true
         });
+        if let Some(max_tokens) = request.config.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         if !system.is_empty() {
             body["system"] = json!(system.join("\n"));
         }
@@ -888,6 +890,21 @@ mod tests {
         assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn omits_max_tokens_when_unset() {
+        let provider =
+            AnthropicMessagesProvider::with_base_url("key", "https://example.com", "claude-model")
+                .unwrap();
+        let request = ProviderRequest {
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            config: GenerationConfig::default(),
+        };
+
+        let body = provider.request_body(&request).unwrap();
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

@@ -14,14 +14,14 @@ use chrono::Utc;
 use futures_util::stream;
 use phi::{
     Agent, AssistantMessage, CapabilityMode, InMemorySessionStorage, LlmProvider, ProviderEvent,
-    ProviderEventStream, ProviderRequest, ProviderResponse, SkillCatalog, Tool, ToolDefinition,
-    ToolEffect, ToolError, ToolOutput, Workspace,
+    ProviderEventStream, ProviderRequest, ProviderResponse, SkillCatalog, TokenUsage, Tool,
+    ToolCall, ToolDefinition, ToolEffect, ToolError, ToolOutput, Workspace,
 };
 use phi_daemon::{
     api::AppState,
     output_channel::{
-        OutputChannelDefinition, OutputChannelDeliveryError, OutputChannelManager,
-        OutputChannelSender,
+        BotAccountDefinition, OutputChannelDefinition, OutputChannelDeliveryError,
+        OutputChannelManager, OutputChannelSender,
     },
     runtime::{
         AgentBuildRequest, AgentFactory, AgentFactoryError, AgentProfileDefinition, AgentRegistry,
@@ -91,10 +91,19 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
         .unwrap();
     let channel_store = Arc::new(MemoryOutputChannelStore::new());
     channel_store
+        .replace_bot_account(
+            "primary",
+            BotAccountDefinition::Telegram {
+                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    channel_store
         .replace_output_channel(
             "alerts",
             OutputChannelDefinition::Telegram {
-                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+                bot_account_id: "primary".to_owned(),
                 chat_id: "-1001234567890".to_owned(),
             },
         )
@@ -188,9 +197,64 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
     let listed: Value = serde_json::from_slice(&listed.bytes().await.unwrap()).unwrap();
     assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
 
+    let replaced = authorized(
+        client.put(format!("{base}/v1/scheduled-tasks/{task_id}")),
+        json!({
+            "name": "Edited review",
+            "prompt": "Review failures and suggest fixes",
+            "workspace": workspace.0,
+            "profile_id": "default",
+            "agent_profile_id": "reviewer",
+            "capability_mode": "read_only",
+            "output_channel_id": null,
+            "schedule": {
+                "type": "interval",
+                "every": 30,
+                "unit": "minutes"
+            },
+            "expected_revision": 1
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let replaced: Value = serde_json::from_slice(&replaced.bytes().await.unwrap()).unwrap();
+    assert_eq!(replaced["name"], "Edited review");
+    assert_eq!(replaced["prompt"], "Review failures and suggest fixes");
+    assert_eq!(replaced["capability_mode"], "read_only");
+    assert_eq!(replaced["output_channel_id"], Value::Null);
+    assert_eq!(replaced["schedule"]["type"], "interval");
+    assert_eq!(replaced["schedule"]["every"], 30);
+    assert_eq!(replaced["revision"], 2);
+    assert!(replaced["next_run_at"].is_string());
+
+    let replace_conflict = authorized(
+        client.put(format!("{base}/v1/scheduled-tasks/{task_id}")),
+        json!({
+            "name": "Stale edit",
+            "prompt": "This edit must not be stored",
+            "workspace": workspace.0,
+            "profile_id": "default",
+            "agent_profile_id": "reviewer",
+            "capability_mode": null,
+            "output_channel_id": "alerts",
+            "schedule": {
+                "type": "interval",
+                "every": 1,
+                "unit": "hours"
+            },
+            "expected_revision": 1
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(replace_conflict.status(), StatusCode::CONFLICT);
+
     let paused = authorized(
         client.patch(format!("{base}/v1/scheduled-tasks/{task_id}")),
-        json!({ "enabled": false, "expected_revision": 1 }),
+        json!({ "enabled": false, "expected_revision": 2 }),
     )
     .send()
     .await
@@ -199,7 +263,7 @@ async fn authenticated_http_crud_preserves_schedule_shape_and_revision() {
     let paused: Value = serde_json::from_slice(&paused.bytes().await.unwrap()).unwrap();
     assert_eq!(paused["enabled"], false);
     assert_eq!(paused["next_run_at"], Value::Null);
-    assert_eq!(paused["revision"], 2);
+    assert_eq!(paused["revision"], 3);
 
     let conflict = authorized(
         client.patch(format!("{base}/v1/scheduled-tasks/{task_id}")),
@@ -237,15 +301,25 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
             provider_calls: Arc::clone(&provider_calls),
             askuser_exposed: Arc::clone(&askuser_exposed),
             install_permission_tool: true,
+            emit_tool_call: true,
         }),
     ));
     let store = Arc::new(MemoryScheduledTaskStore::new());
     let channel_store = Arc::new(MemoryOutputChannelStore::new());
     channel_store
+        .replace_bot_account(
+            "primary",
+            BotAccountDefinition::Telegram {
+                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    channel_store
         .replace_output_channel(
             "alerts",
             OutputChannelDefinition::Telegram {
-                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+                bot_account_id: "primary".to_owned(),
                 chat_id: "-1001234567890".to_owned(),
             },
         )
@@ -299,7 +373,7 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
     .await
     .unwrap();
 
-    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
     assert!(
         !askuser_exposed.load(Ordering::SeqCst),
         "noninteractive scheduled tasks must not expose askuser"
@@ -314,13 +388,22 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         sessions[0].record.workspace,
         Some(Workspace::new(&workspace.0))
     );
-    assert_eq!(sessions[0].state.as_ref().unwrap().message_count, 2);
+    assert_eq!(sessions[0].state.as_ref().unwrap().message_count, 4);
     assert_eq!(notifications.failures_remaining.load(Ordering::Acquire), 0);
     let messages = notifications.messages.lock().await;
     assert_eq!(messages.len(), 2);
-    assert!(messages[0].contains("Status: running"));
-    assert!(messages[1].contains("Status: succeeded"));
-    assert!(messages[1].contains("Session:"));
+    assert!(messages[0].starts_with("scheduled task started\n"));
+    assert!(messages[0].contains("Status: ⏳"));
+    assert!(messages[1].starts_with("scheduled task finished\n"));
+    assert!(messages[1].contains("Status: ✅"));
+    assert!(!messages[0].contains("Phi scheduled task"));
+    assert!(!messages[1].contains("Phi scheduled task"));
+    assert!(!messages[1].contains("Session:"));
+    assert!(messages[1].contains("Token usage: total 220, input 200, output 20, cached 120"));
+    assert!(messages[1].contains("Token cache rate: 60.0%"));
+    assert!(messages[1].contains("Tool calls: 1"));
+    assert!(messages[1].contains("Tools: scheduled_inspection ×1"));
+    assert!(messages[1].contains("Final response:\nscheduled result"));
 
     manager.shutdown().await;
     assert!(service.shutdown().await.is_empty());
@@ -345,6 +428,7 @@ impl RecordingOutputChannelSender {
 impl OutputChannelSender for RecordingOutputChannelSender {
     async fn send(
         &self,
+        _bot_account: &BotAccountDefinition,
         _definition: &OutputChannelDefinition,
         message: &str,
     ) -> Result<(), OutputChannelDeliveryError> {
@@ -428,6 +512,7 @@ async fn startup_marks_an_uncertain_persisted_run_interrupted() {
             provider_calls: Arc::new(AtomicUsize::new(0)),
             askuser_exposed: Arc::new(AtomicBool::new(false)),
             install_permission_tool: false,
+            emit_tool_call: false,
         }),
     ));
     let store = Arc::new(MemoryScheduledTaskStore::new());
@@ -530,11 +615,12 @@ struct ImmediateProvider {
     calls: Arc<AtomicUsize>,
     askuser_exposed: Arc<AtomicBool>,
     expect_permission_tool_hidden: bool,
+    emit_tool_call: bool,
 }
 
 impl LlmProvider for ImmediateProvider {
     fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
         self.askuser_exposed.store(
             request.tools.iter().any(|tool| tool.name == "askuser"),
             Ordering::SeqCst,
@@ -548,9 +634,23 @@ impl LlmProvider for ImmediateProvider {
                 "noninteractive scheduled tasks must not expose tools that require approval"
             );
         }
+        let message = if self.emit_tool_call && call == 0 {
+            AssistantMessage::tool_calls(vec![ToolCall::new(
+                "scheduled-inspection-1",
+                "scheduled_inspection",
+                json!({}),
+            )])
+        } else {
+            AssistantMessage::text("scheduled result")
+        };
+        let usage = if call == 0 {
+            TokenUsage::new(120, 12, 80)
+        } else {
+            TokenUsage::new(80, 8, 40)
+        };
         Box::pin(stream::iter([Ok(ProviderEvent::Done(ProviderResponse {
-            message: AssistantMessage::text("scheduled result"),
-            usage: None,
+            message,
+            usage: Some(usage),
         }))]))
     }
 }
@@ -560,10 +660,33 @@ struct ImmediateFactory {
     provider_calls: Arc<AtomicUsize>,
     askuser_exposed: Arc<AtomicBool>,
     install_permission_tool: bool,
+    emit_tool_call: bool,
 }
 
 #[derive(Clone)]
 struct ScheduledExternalTool;
+
+#[derive(Clone)]
+struct ScheduledInspectionTool;
+
+#[async_trait]
+impl Tool for ScheduledInspectionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "scheduled_inspection",
+            "returns a deterministic inspection result",
+            json!({ "type": "object" }),
+        )
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    async fn execute(&self, _arguments: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::success("inspection complete"))
+    }
+}
 
 #[async_trait]
 impl Tool for ScheduledExternalTool {
@@ -660,6 +783,7 @@ impl AgentFactory for ImmediateFactory {
             calls: Arc::clone(&self.provider_calls),
             askuser_exposed: Arc::clone(&self.askuser_exposed),
             expect_permission_tool_hidden: self.install_permission_tool,
+            emit_tool_call: self.emit_tool_call,
         })
         .workspace(workspace)
         .model(model.clone())
@@ -667,6 +791,9 @@ impl AgentFactory for ImmediateFactory {
         .system_prompt(agent_profile.compiled_system_prompt.clone());
         if self.install_permission_tool {
             builder = builder.tool(ScheduledExternalTool);
+        }
+        if self.emit_tool_call {
+            builder = builder.tool(ScheduledInspectionTool);
         }
         let agent = builder.build();
         Ok(BuiltAgent {

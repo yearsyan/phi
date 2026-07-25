@@ -69,6 +69,7 @@ const en = {
     'Delete “%{name}”? A currently running session will continue.',
   'scheduled.action.pause': 'Pause',
   'scheduled.action.resume': 'Resume',
+  'scheduled.action.edit': 'Edit',
   'scheduled.action.run': 'Run now',
   'scheduled.action.delete': 'Delete task',
   'scheduled.action.openSession': 'Open last session',
@@ -101,12 +102,17 @@ const en = {
   'scheduled.modal.title': 'Create scheduled task',
   'scheduled.modal.subtitle':
     'Create an automated prompt that runs in a new background session.',
+  'scheduled.modal.editTitle': 'Edit scheduled task',
+  'scheduled.modal.editSubtitle':
+    'Update future runs without changing sessions that already started.',
   'scheduled.modal.close': 'Close scheduled task dialog',
   'scheduled.modal.notice':
     'Scheduled runs cannot ask the user or open an interactive approval. They use the selected capability policy directly, so access outside the workspace or unavailable network services may fail.',
   'scheduled.modal.cancel': 'Cancel',
   'scheduled.modal.create': 'Create',
   'scheduled.modal.creating': 'Creating…',
+  'scheduled.modal.save': 'Save',
+  'scheduled.modal.saving': 'Saving…',
   'scheduled.field.name': 'Name',
   'scheduled.field.namePlaceholder': 'Enter a task name',
   'scheduled.field.workspace': 'Workspace',
@@ -120,11 +126,11 @@ const en = {
   'scheduled.field.agentProfileNoMcp':
     'No MCP linked. MCP tools come from the Agent Profile; configure them in Settings.',
   'scheduled.field.capability': 'Access',
-  'scheduled.field.outputChannel': 'Output channel',
+  'scheduled.field.outputChannel': 'Recipient target',
   'scheduled.outputChannel.none': 'No notifications',
   'scheduled.outputChannel.hint':
-    'Send start and completion status to the selected channel.',
-  'scheduled.outputChannel.badge': 'Channel: %{channel}',
+    'Send start and completion status to the selected recipient.',
+  'scheduled.outputChannel.badge': 'Recipient: %{channel}',
   'scheduled.field.schedule': 'Schedule',
   'scheduled.capability.profile': 'Use Agent Profile default',
   'scheduled.schedule.dailyTab': 'Daily',
@@ -219,6 +225,12 @@ const en = {
   'chat.provider.nextRequestHint':
     'This conversation keeps its Provider connection. Choosing a profile changes only the model used by the next request.',
   'chat.provider.discardDraft': 'Switch Provider and discard the unsent draft?',
+  'chat.agentProfile.label': 'Agent Profile',
+  'chat.agentProfile.shortLabel': 'Agent',
+  'chat.agentProfile.switchHint':
+    'Choose the Agent Profile before sending the first message.',
+  'chat.agentProfile.lockedHint':
+    'The Agent Profile is fixed after the conversation starts.',
   'chat.reasoning.label': 'Reasoning effort',
   'chat.reasoning.auto': 'Auto',
   'chat.reasoning.none': 'None',
@@ -387,11 +399,11 @@ const en = {
   'settings.tabs.providers': 'Providers',
   'settings.tabs.agents': 'Agent Profiles',
   'settings.tabs.mcp': 'MCP Profiles',
-  'settings.tabs.channels': 'Output channels',
+  'settings.tabs.channels': 'Telegram delivery',
   'settings.profileFooterHint':
     'Profile changes apply when an Agent is next created or restored.',
   'settings.channelFooterHint':
-    'Output channel changes apply to the next scheduled-task notification.',
+    'Bot-account and recipient-target changes apply to the next scheduled-task notification.',
 
   // Agent Profile management
   'settings.agent.profiles': 'Agent Profiles',
@@ -508,6 +520,34 @@ const en = {
     'The daemon did not return the saved MCP Profile.',
 
   // Output channel management
+  'settings.channels.botAccountsTab': 'Bot accounts',
+  'settings.channels.targetsTab': 'Recipients',
+  'settings.channels.botAccounts': 'Bot accounts',
+  'settings.channels.targets': 'Recipient targets',
+  'settings.channels.botsEmpty':
+    'Add a Telegram bot account before creating recipients.',
+  'settings.channels.targetsEmpty':
+    'Add a recipient target for a private chat, group, or channel.',
+  'settings.channels.addBot': 'Add bot account',
+  'settings.channels.addTarget': 'Add recipient',
+  'settings.channels.botAccount': 'Bot account',
+  'settings.channels.target': 'Recipient target',
+  'settings.channels.newBot': 'New bot account',
+  'settings.channels.newTarget': 'New recipient',
+  'settings.channels.botId': 'Bot account id',
+  'settings.channels.botIdPlaceholder': 'for example: primary-bot',
+  'settings.channels.targetId': 'Recipient target id',
+  'settings.channels.targetIdPlaceholder': 'for example: alice-alerts',
+  'settings.channels.telegramBot': 'Telegram bot account',
+  'settings.channels.telegramBotCopy':
+    'Store the bot token once, then reuse this account across recipient targets.',
+  'settings.channels.telegramTarget': 'Telegram recipient',
+  'settings.channels.telegramTargetCopy':
+    'Choose a bot account and the chat that should receive scheduled-task status.',
+  'settings.channels.botRequiredHint':
+    'Create a bot account before adding a recipient target.',
+  'settings.channels.botSaved': 'Bot account saved.',
+  'settings.channels.targetSaved': 'Recipient target saved.',
   'settings.channels.list': 'Output channels',
   'settings.channels.channel': 'Output channel',
   'settings.channels.empty':
@@ -535,8 +575,16 @@ const en = {
   'settings.channels.testSent': 'Telegram test message sent.',
   'settings.channels.discardChanges': 'Discard unsaved output channel changes?',
   'settings.channels.errors.idRequired': 'Output channel id is required.',
+  'settings.channels.errors.botIdRequired': 'Bot account id is required.',
+  'settings.channels.errors.targetIdRequired':
+    'Recipient target id is required.',
+  'settings.channels.errors.botRequired': 'Select a bot account.',
   'settings.channels.errors.tokenRequired': 'Telegram bot token is required.',
   'settings.channels.errors.chatIdRequired': 'Telegram chat id is required.',
+  'settings.channels.errors.botNotConfigured':
+    'The daemon did not return the saved bot account.',
+  'settings.channels.errors.targetNotConfigured':
+    'The daemon did not return the saved recipient target.',
   'settings.channels.errors.notConfigured':
     'The daemon did not return the saved output channel.',
 
@@ -598,6 +646,7 @@ const zh: Record<TranslationKey, string> = {
     '确定删除“%{name}”吗？已经开始运行的会话仍会继续。',
   'scheduled.action.pause': '暂停',
   'scheduled.action.resume': '恢复',
+  'scheduled.action.edit': '编辑',
   'scheduled.action.run': '立即运行',
   'scheduled.action.delete': '删除任务',
   'scheduled.action.openSession': '打开最近会话',
@@ -630,12 +679,17 @@ const zh: Record<TranslationKey, string> = {
   'scheduled.modal.title': '创建定时任务',
   'scheduled.modal.subtitle':
     '创建自动执行的提示词，每次会在新的后台会话中运行。',
+  'scheduled.modal.editTitle': '编辑定时任务',
+  'scheduled.modal.editSubtitle':
+    '更新后续执行配置，不影响已经开始运行的会话。',
   'scheduled.modal.close': '关闭定时任务窗口',
   'scheduled.modal.notice':
     '定时任务不能询问用户或弹出交互式授权，而会直接使用所选能力策略。访问工作区外文件或不可用的网络服务时，任务可能失败。',
   'scheduled.modal.cancel': '取消',
   'scheduled.modal.create': '创建',
   'scheduled.modal.creating': '正在创建…',
+  'scheduled.modal.save': '保存',
+  'scheduled.modal.saving': '正在保存…',
   'scheduled.field.name': '名称',
   'scheduled.field.namePlaceholder': '输入任务名称',
   'scheduled.field.workspace': '工作空间',
@@ -648,10 +702,10 @@ const zh: Record<TranslationKey, string> = {
   'scheduled.field.agentProfileNoMcp':
     '未关联 MCP。定时任务通过 Agent Profile 引用 MCP，可在设置页配置。',
   'scheduled.field.capability': '权限',
-  'scheduled.field.outputChannel': '输出频道',
+  'scheduled.field.outputChannel': '收件目标',
   'scheduled.outputChannel.none': '不发送通知',
-  'scheduled.outputChannel.hint': '将任务开始和结束状态发送到所选频道。',
-  'scheduled.outputChannel.badge': '频道：%{channel}',
+  'scheduled.outputChannel.hint': '将任务开始和结束状态发送给所选收件目标。',
+  'scheduled.outputChannel.badge': '收件目标：%{channel}',
   'scheduled.field.schedule': '定时设置',
   'scheduled.capability.profile': '使用 Agent Profile 默认值',
   'scheduled.schedule.dailyTab': '每日',
@@ -736,6 +790,10 @@ const zh: Record<TranslationKey, string> = {
   'chat.provider.nextRequestHint':
     '当前对话会保持原 Provider 连接；选择配置只会修改下一次请求使用的模型。',
   'chat.provider.discardDraft': '切换 Provider 并丢弃尚未发送的草稿吗？',
+  'chat.agentProfile.label': 'Agent Profile',
+  'chat.agentProfile.shortLabel': 'Agent',
+  'chat.agentProfile.switchHint': '首条消息发送前可以选择 Agent Profile。',
+  'chat.agentProfile.lockedHint': '会话开始后 Agent Profile 将保持固定。',
   'chat.reasoning.label': '思考强度',
   'chat.reasoning.auto': '自动',
   'chat.reasoning.none': '关闭',
@@ -891,9 +949,10 @@ const zh: Record<TranslationKey, string> = {
   'settings.tabs.providers': 'Provider',
   'settings.tabs.agents': 'Agent Profile',
   'settings.tabs.mcp': 'MCP Profile',
-  'settings.tabs.channels': '输出频道',
+  'settings.tabs.channels': 'Telegram 通知',
   'settings.profileFooterHint': 'Profile 更改将在下次创建或恢复 Agent 时生效。',
-  'settings.channelFooterHint': '输出频道更改将在下一条定时任务通知时生效。',
+  'settings.channelFooterHint':
+    'Bot 账号和收件目标更改将在下一条定时任务通知时生效。',
 
   'settings.agent.profiles': 'Agent Profile 列表',
   'settings.agent.profile': 'Agent Profile',
@@ -997,6 +1056,31 @@ const zh: Record<TranslationKey, string> = {
   'settings.mcp.errors.secretNameRequired': '请重新输入 %{name} 对应的密钥值。',
   'settings.mcp.errors.notConfigured': 'Daemon 未返回已保存的 MCP Profile。',
 
+  'settings.channels.botAccountsTab': 'Bot 账号',
+  'settings.channels.targetsTab': '收件目标',
+  'settings.channels.botAccounts': 'Bot 账号列表',
+  'settings.channels.targets': '收件目标列表',
+  'settings.channels.botsEmpty': '请先添加 Telegram Bot 账号，再创建收件目标。',
+  'settings.channels.targetsEmpty': '添加私聊、群组或频道收件目标。',
+  'settings.channels.addBot': '添加 Bot 账号',
+  'settings.channels.addTarget': '添加收件目标',
+  'settings.channels.botAccount': 'Bot 账号',
+  'settings.channels.target': '收件目标',
+  'settings.channels.newBot': '新 Bot 账号',
+  'settings.channels.newTarget': '新收件目标',
+  'settings.channels.botId': 'Bot 账号 id',
+  'settings.channels.botIdPlaceholder': '例如：primary-bot',
+  'settings.channels.targetId': '收件目标 id',
+  'settings.channels.targetIdPlaceholder': '例如：alice-alerts',
+  'settings.channels.telegramBot': 'Telegram Bot 账号',
+  'settings.channels.telegramBotCopy':
+    'Bot token 只保存一次，可由多个收件目标复用。',
+  'settings.channels.telegramTarget': 'Telegram 收件目标',
+  'settings.channels.telegramTargetCopy':
+    '选择 Bot 账号和接收定时任务状态的聊天。',
+  'settings.channels.botRequiredHint': '请先创建 Bot 账号，再添加收件目标。',
+  'settings.channels.botSaved': 'Bot 账号已保存。',
+  'settings.channels.targetSaved': '收件目标已保存。',
   'settings.channels.list': '输出频道列表',
   'settings.channels.channel': '输出频道',
   'settings.channels.empty': '添加 Telegram 频道来接收定时任务通知。',
@@ -1022,8 +1106,15 @@ const zh: Record<TranslationKey, string> = {
   'settings.channels.testSent': 'Telegram 测试消息已发送。',
   'settings.channels.discardChanges': '要丢弃未保存的输出频道更改吗？',
   'settings.channels.errors.idRequired': '输出频道 id 不能为空。',
+  'settings.channels.errors.botIdRequired': 'Bot 账号 id 不能为空。',
+  'settings.channels.errors.targetIdRequired': '收件目标 id 不能为空。',
+  'settings.channels.errors.botRequired': '请选择 Bot 账号。',
   'settings.channels.errors.tokenRequired': 'Telegram bot token 不能为空。',
   'settings.channels.errors.chatIdRequired': 'Telegram chat id 不能为空。',
+  'settings.channels.errors.botNotConfigured':
+    'Daemon 未返回已保存的 Bot 账号。',
+  'settings.channels.errors.targetNotConfigured':
+    'Daemon 未返回已保存的收件目标。',
   'settings.channels.errors.notConfigured': 'Daemon 未返回已保存的输出频道。',
 
   'theme.toggle': '切换主题',

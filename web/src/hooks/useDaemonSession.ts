@@ -44,6 +44,8 @@ export interface DaemonSessionControls {
   connectionPhase: ConnectionPhase;
   connectionError: string | null;
   sessionListRevision: number;
+  /** False once the first prepared-session prompt may have been admitted. */
+  canReconfigurePreparedSession: boolean;
   retry: () => void;
   sendPrompt: (text: string, skill?: SkillInvocation) => boolean;
   stop: () => void;
@@ -471,11 +473,17 @@ export function useDaemonSession(
     dispatch({ type: 'clear_notice', index });
   }, []);
 
+  const canReconfigurePreparedSession =
+    target?.kind === 'new' &&
+    promotedSessionIdRef.current === null &&
+    preparedPromptRequestIdRef.current === null;
+
   return {
     state,
     connectionPhase,
     connectionError,
     sessionListRevision,
+    canReconfigurePreparedSession,
     retry,
     sendPrompt,
     stop,

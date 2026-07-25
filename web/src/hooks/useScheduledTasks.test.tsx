@@ -8,6 +8,7 @@ import { useScheduledTasks } from './useScheduledTasks.ts';
 const apiMocks = vi.hoisted(() => ({
   listScheduledTasks: vi.fn(),
   createScheduledTask: vi.fn(),
+  replaceScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   runScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
@@ -28,12 +29,10 @@ describe('useScheduledTasks', () => {
     vi.useRealTimers();
   });
 
-  it('loads and refreshes while the scheduled-task page is active', async () => {
+  it('loads once without polling while the scheduled-task page is active', async () => {
     vi.useFakeTimers();
     const first = task('task-1');
-    apiMocks.listScheduledTasks
-      .mockResolvedValueOnce({ tasks: [first] })
-      .mockResolvedValueOnce({ tasks: [{ ...first, skipped_runs: 1 }] });
+    apiMocks.listScheduledTasks.mockResolvedValueOnce({ tasks: [first] });
 
     const { result } = renderHook(() => useScheduledTasks('daemon-key', true));
     await act(async () => {
@@ -42,20 +41,26 @@ describe('useScheduledTasks', () => {
     expect(result.current.tasks).toEqual([first]);
 
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(60_000);
       await Promise.resolve();
     });
-    expect(apiMocks.listScheduledTasks).toHaveBeenCalledTimes(2);
-    expect(result.current.tasks[0]?.skipped_runs).toBe(1);
+    expect(apiMocks.listScheduledTasks).toHaveBeenCalledTimes(1);
+    expect(result.current.tasks).toEqual([first]);
   });
 
-  it('creates, pauses, runs, and deletes through revision-aware requests', async () => {
+  it('creates, edits, pauses, runs, and deletes through revision-aware requests', async () => {
     const created = task('task-1');
-    const paused = {
+    const edited = {
       ...created,
+      name: 'Edited review',
+      prompt: 'Review failures',
+      revision: 2,
+    };
+    const paused = {
+      ...edited,
       enabled: false,
       next_run_at: null,
-      revision: 2,
+      revision: 3,
     };
     const running = {
       ...paused,
@@ -69,6 +74,7 @@ describe('useScheduledTasks', () => {
       },
     };
     apiMocks.createScheduledTask.mockResolvedValue(created);
+    apiMocks.replaceScheduledTask.mockResolvedValue(edited);
     apiMocks.updateScheduledTask.mockResolvedValue(paused);
     apiMocks.listScheduledTasks
       .mockResolvedValueOnce({ tasks: [] })
@@ -88,14 +94,35 @@ describe('useScheduledTasks', () => {
     });
     expect(result.current.tasks).toEqual([created]);
 
+    const replacement = {
+      name: edited.name,
+      prompt: edited.prompt,
+      workspace: edited.workspace,
+      profile_id: edited.profile_id,
+      agent_profile_id: edited.agent_profile_id,
+      capability_mode: edited.capability_mode,
+      output_channel_id: edited.output_channel_id ?? null,
+      schedule: edited.schedule,
+      expected_revision: created.revision,
+    };
     await act(async () => {
-      await result.current.setEnabled(created, false);
+      await result.current.editTask(created.task_id, replacement);
+    });
+    expect(apiMocks.replaceScheduledTask).toHaveBeenCalledWith(
+      'daemon-key',
+      'task-1',
+      replacement,
+    );
+    expect(result.current.tasks).toEqual([edited]);
+
+    await act(async () => {
+      await result.current.setEnabled(edited, false);
     });
     expect(apiMocks.updateScheduledTask).toHaveBeenCalledWith(
       'daemon-key',
       'task-1',
       false,
-      1,
+      2,
     );
     expect(result.current.tasks).toEqual([paused]);
 
@@ -114,8 +141,7 @@ describe('useScheduledTasks', () => {
     expect(result.current.tasks).toEqual([]);
   });
 
-  it('does not let polling hide a task while its create request is in flight', async () => {
-    vi.useFakeTimers();
+  it('does not let a manual refresh hide a task while its create request is in flight', async () => {
     const created = task('task-1');
     let resolveCreate: ((task: ScheduledTask) => void) | undefined;
     apiMocks.createScheduledTask.mockReturnValue(
@@ -138,8 +164,7 @@ describe('useScheduledTasks', () => {
       });
     });
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
-      await Promise.resolve();
+      await result.current.refresh();
     });
     expect(apiMocks.listScheduledTasks).toHaveBeenCalledTimes(1);
 

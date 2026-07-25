@@ -10,8 +10,8 @@ use axum::{
 use super::{
     ApiError, AppState,
     dto::{
-        CreateScheduledTaskRequest, ScheduledTaskDto, ScheduledTasksResponse,
-        UpdateScheduledTaskRequest,
+        CreateScheduledTaskRequest, ReplaceScheduledTaskRequest, ScheduledTaskDto,
+        ScheduledTasksResponse, UpdateScheduledTaskRequest,
     },
     workspace::resolve_workspace_path,
 };
@@ -30,6 +30,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v1/scheduled-tasks/{task_id}",
             get(get_scheduled_task)
+                .put(replace_scheduled_task)
                 .patch(update_scheduled_task)
                 .delete(delete_scheduled_task),
         )
@@ -89,6 +90,21 @@ async fn update_scheduled_task(
         .map_err(|error| ApiError::bad_request("invalid_scheduled_task", error.body_text()))?;
     let task = manager(&state)?
         .update_task(task_id, request.into())
+        .await
+        .map_err(ApiError::scheduled_task)?;
+    Ok(Json(ScheduledTaskDto::from(task)))
+}
+
+async fn replace_scheduled_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<ScheduledTaskId>,
+    request: Result<Json<ReplaceScheduledTaskRequest>, JsonRejection>,
+) -> Result<Json<ScheduledTaskDto>, ApiError> {
+    let Json(request) = request
+        .map_err(|error| ApiError::bad_request("invalid_scheduled_task", error.body_text()))?;
+    let workspace = resolve_workspace_path(FilePath::new(&request.workspace)).await?;
+    let task = manager(&state)?
+        .replace_task(task_id, request.into_replace(workspace))
         .await
         .map_err(ApiError::scheduled_task)?;
     Ok(Json(ScheduledTaskDto::from(task)))

@@ -3,15 +3,15 @@ import {
   createScheduledTask as createScheduledTaskRequest,
   deleteScheduledTask as deleteScheduledTaskRequest,
   listScheduledTasks,
+  replaceScheduledTask as replaceScheduledTaskRequest,
   runScheduledTask as runScheduledTaskRequest,
   updateScheduledTask as updateScheduledTaskRequest,
 } from '../api/http.ts';
 import type {
   CreateScheduledTaskRequest,
+  ReplaceScheduledTaskRequest,
   ScheduledTask,
 } from '../types/wire.ts';
-
-const REFRESH_INTERVAL_MS = 5_000;
 
 export interface ScheduledTasksState {
   tasks: ScheduledTask[];
@@ -19,6 +19,10 @@ export interface ScheduledTasksState {
   error: string | null;
   refresh: () => Promise<void>;
   createTask: (request: CreateScheduledTaskRequest) => Promise<ScheduledTask>;
+  editTask: (
+    taskId: string,
+    request: ReplaceScheduledTaskRequest,
+  ) => Promise<ScheduledTask>;
   setEnabled: (task: ScheduledTask, enabled: boolean) => Promise<ScheduledTask>;
   runNow: (taskId: string) => Promise<void>;
   deleteTask: (taskId: string) => Promise<void>;
@@ -85,12 +89,7 @@ export function useScheduledTasks(
       return;
     }
     void refresh();
-    const interval = window.setInterval(
-      () => void refresh(),
-      REFRESH_INTERVAL_MS,
-    );
     return () => {
-      window.clearInterval(interval);
       requestRevisionRef.current += 1;
     };
   }, [enabled, refresh]);
@@ -134,6 +133,32 @@ export function useScheduledTasks(
           task.task_id,
           nextEnabled,
           task.revision,
+        );
+        setTasks((current) => replaceTask(current, updated));
+        setError(null);
+        return updated;
+      } catch (updateError) {
+        setError(
+          updateError instanceof Error
+            ? updateError.message
+            : String(updateError),
+        );
+        throw updateError;
+      } finally {
+        endMutation();
+      }
+    },
+    [beginMutation, endMutation],
+  );
+
+  const editTask = useCallback(
+    async (taskId: string, request: ReplaceScheduledTaskRequest) => {
+      beginMutation();
+      try {
+        const updated = await replaceScheduledTaskRequest(
+          authKeyRef.current,
+          taskId,
+          request,
         );
         setTasks((current) => replaceTask(current, updated));
         setError(null);
@@ -201,6 +226,7 @@ export function useScheduledTasks(
     error,
     refresh,
     createTask,
+    editTask,
     setEnabled,
     runNow,
     deleteTask,

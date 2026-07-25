@@ -1092,11 +1092,33 @@ class PublicMcpProfile {
   );
 }
 
+class PublicBotAccount {
+  const PublicBotAccount({
+    required this.type,
+    required this.botAccountId,
+    required this.revision,
+    required this.botTokenConfigured,
+  });
+
+  final String type;
+  final String botAccountId;
+  final int revision;
+  final bool botTokenConfigured;
+
+  static PublicBotAccount fromJson(Json json) => PublicBotAccount(
+    type: json['type'] as String? ?? '',
+    botAccountId: json['bot_account_id'] as String? ?? '',
+    revision: _asInt(json['revision']),
+    botTokenConfigured: json['bot_token_configured'] as bool? ?? false,
+  );
+}
+
 class PublicOutputChannel {
   const PublicOutputChannel({
     required this.type,
     required this.outputChannelId,
     required this.revision,
+    required this.botAccountId,
     required this.botTokenConfigured,
     required this.chatId,
   });
@@ -1104,6 +1126,7 @@ class PublicOutputChannel {
   final String type;
   final String outputChannelId;
   final int revision;
+  final String botAccountId;
   final bool botTokenConfigured;
   final String chatId;
 
@@ -1111,6 +1134,7 @@ class PublicOutputChannel {
     type: json['type'] as String? ?? '',
     outputChannelId: json['output_channel_id'] as String? ?? '',
     revision: _asInt(json['revision']),
+    botAccountId: json['bot_account_id'] as String? ?? '',
     botTokenConfigured: json['bot_token_configured'] as bool? ?? false,
     chatId: json['chat_id'] as String? ?? '',
   );

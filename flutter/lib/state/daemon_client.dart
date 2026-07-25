@@ -130,16 +130,48 @@ class DaemonClient {
         .toList();
   }
 
+  Future<List<PublicBotAccount>> listBotAccounts() async {
+    final json = await _requestJson('GET', '/v1/bot-accounts');
+    return (json['bot_accounts'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(PublicBotAccount.fromJson)
+        .toList();
+  }
+
+  Future<PublicBotAccount> putTelegramBotAccount({
+    required String botAccountId,
+    required String botToken,
+  }) async {
+    final encodedId = Uri.encodeComponent(botAccountId);
+    final json = await _requestJson(
+      'PUT',
+      '/v1/bot-accounts/$encodedId',
+      body: {'type': 'telegram', 'bot_token': botToken},
+    );
+    final botAccount = json['bot_account'];
+    if (botAccount is Map<String, dynamic>) {
+      return PublicBotAccount.fromJson(botAccount);
+    }
+    throw DaemonError(
+      'invalid_response',
+      'expected bot_account object from daemon',
+    );
+  }
+
   Future<PublicOutputChannel> putTelegramOutputChannel({
     required String outputChannelId,
-    required String botToken,
+    required String botAccountId,
     required String chatId,
   }) async {
     final encodedId = Uri.encodeComponent(outputChannelId);
     final json = await _requestJson(
       'PUT',
       '/v1/output-channels/$encodedId',
-      body: {'type': 'telegram', 'bot_token': botToken, 'chat_id': chatId},
+      body: {
+        'type': 'telegram',
+        'bot_account_id': botAccountId,
+        'chat_id': chatId,
+      },
     );
     final outputChannel = json['output_channel'];
     if (outputChannel is Map<String, dynamic>) {
@@ -219,6 +251,36 @@ class DaemonClient {
       'PATCH',
       '/v1/scheduled-tasks/$taskId',
       body: {'enabled': enabled, 'expected_revision': expectedRevision},
+    );
+    return ScheduledTask.fromJson(json);
+  }
+
+  Future<ScheduledTask> replaceScheduledTask({
+    required String taskId,
+    required String name,
+    required String prompt,
+    required String workspace,
+    required String profileId,
+    required String agentProfileId,
+    String? capabilityMode,
+    String? outputChannelId,
+    required ScheduledTaskSchedule schedule,
+    required int expectedRevision,
+  }) async {
+    final json = await _requestJson(
+      'PUT',
+      '/v1/scheduled-tasks/$taskId',
+      body: {
+        'name': name,
+        'prompt': prompt,
+        'workspace': workspace,
+        'profile_id': profileId,
+        'agent_profile_id': agentProfileId,
+        'capability_mode': capabilityMode,
+        'output_channel_id': outputChannelId,
+        'schedule': schedule.toJson(),
+        'expected_revision': expectedRevision,
+      },
     );
     return ScheduledTask.fromJson(json);
   }

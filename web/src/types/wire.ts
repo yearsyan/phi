@@ -781,9 +781,34 @@ export interface McpProfilesResponse {
   mcp_profiles: PublicMcpProfile[];
 }
 
-export interface PutTelegramOutputChannelRequest {
+export interface PutTelegramBotAccountRequest {
   type: 'telegram';
   bot_token: string;
+}
+
+export type PutBotAccountRequest = PutTelegramBotAccountRequest;
+
+export interface PublicTelegramBotAccount {
+  type: 'telegram';
+  bot_account_id: string;
+  revision: number;
+  bot_token_configured: boolean;
+}
+
+export type PublicBotAccount = PublicTelegramBotAccount;
+
+export interface BotAccountResponse {
+  configured: boolean;
+  bot_account: PublicBotAccount | null;
+}
+
+export interface BotAccountsResponse {
+  bot_accounts: PublicBotAccount[];
+}
+
+export interface PutTelegramOutputChannelRequest {
+  type: 'telegram';
+  bot_account_id: string;
   chat_id: string;
 }
 
@@ -793,6 +818,8 @@ export interface PublicTelegramOutputChannel {
   type: 'telegram';
   output_channel_id: string;
   revision: number;
+  bot_account_id: string;
+  /** Compatibility field retained by the daemon for older clients. */
   bot_token_configured: boolean;
   chat_id: string;
 }
@@ -927,6 +954,18 @@ export interface CreateScheduledTaskRequest {
 export interface UpdateScheduledTaskRequest {
   enabled: boolean;
   expected_revision?: number;
+}
+
+export interface ReplaceScheduledTaskRequest {
+  name: string;
+  prompt: string;
+  workspace: string;
+  profile_id: string;
+  agent_profile_id: string;
+  capability_mode: CapabilityMode | null;
+  output_channel_id: string | null;
+  schedule: ScheduledTaskSchedule;
+  expected_revision: number;
 }
 
 export interface WorkspaceDirectory {

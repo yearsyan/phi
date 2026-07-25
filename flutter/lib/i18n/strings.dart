@@ -252,6 +252,7 @@ class S {
 
   /* --------------------------- scheduled tasks --------------------------- */
   String get newTask => _t('New task', '新建任务');
+  String get editTask => _t('Edit task', '编辑任务');
   String get noScheduledTasks => _t('No scheduled tasks yet', '还没有计划任务');
   String get runNow => _t('Run now', '立即运行');
   String get openLastRun => _t('Open last run', '打开最近运行');
@@ -266,11 +267,12 @@ class S {
   String get hoursLabel => _t('hours', '小时');
   String get daysLabel => _t('days', '天');
   String get timezoneLabel => _t('Timezone (IANA)', '时区（IANA）');
-  String get outputChannel => _t('Output channel', '输出频道');
+  String get outputChannel => _t('Recipient target', '收件目标');
   String get noOutputChannel => _t('No notifications', '不发送通知');
-  String outputChannelValue(String value) => _t('Channel: $value', '频道：$value');
+  String outputChannelValue(String value) =>
+      _t('Recipient: $value', '收件目标：$value');
   String outputChannelsLoadFailed(Object error) =>
-      _t('Could not load output channels: $error', '无法加载输出频道：$error');
+      _t('Could not load recipient targets: $error', '无法加载收件目标：$error');
   String get create => _t('Create', '创建');
   String get namePromptRequired =>
       _t('Name and prompt are required.', '名称和提示词必填。');

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    output_channel::{OutputChannel, OutputChannelDefinition},
+    output_channel::{BotAccount, BotAccountDefinition, OutputChannel, OutputChannelDefinition},
     runtime::{
         AgentProfile, AgentProfileDefinition, AgentStatus, AgentSummary, AgentView, AskUserAnswer,
         AskUserId, AskUserRequest, AssistantDraft, ContextCompactionPhase, ContextCompactionView,
@@ -28,8 +28,8 @@ use crate::{
         SubagentSummary, ToolCallDraft, ToolPermissionId, ToolPermissionPrompt,
     },
     scheduled_task::{
-        CreateScheduledTask, ScheduledIntervalUnit, ScheduledRunOutcome, ScheduledTask,
-        ScheduledTaskId, ScheduledTaskRun, ScheduledTaskSchedule, ScheduledWeekday,
+        CreateScheduledTask, ReplaceScheduledTask, ScheduledIntervalUnit, ScheduledRunOutcome,
+        ScheduledTask, ScheduledTaskId, ScheduledTaskRun, ScheduledTaskSchedule, ScheduledWeekday,
         UpdateScheduledTask,
     },
     service::{ForkPosition, SessionListing},
@@ -161,6 +161,55 @@ impl From<UpdateScheduledTaskRequest> for UpdateScheduledTask {
         Self {
             enabled: request.enabled,
             expected_revision: request.expected_revision,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceScheduledTaskRequest {
+    pub name: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub profile_id: String,
+    pub agent_profile_id: String,
+    #[serde(default)]
+    pub capability_mode: Option<CapabilityMode>,
+    #[serde(default)]
+    pub output_channel_id: Option<String>,
+    pub schedule: ScheduledTaskScheduleDto,
+    pub expected_revision: u64,
+}
+
+impl fmt::Debug for ReplaceScheduledTaskRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplaceScheduledTaskRequest")
+            .field("name", &self.name)
+            .field("prompt", &"[REDACTED]")
+            .field("workspace", &self.workspace)
+            .field("profile_id", &self.profile_id)
+            .field("agent_profile_id", &self.agent_profile_id)
+            .field("capability_mode", &self.capability_mode)
+            .field("output_channel_id", &self.output_channel_id)
+            .field("schedule", &self.schedule)
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+impl ReplaceScheduledTaskRequest {
+    pub fn into_replace(self, workspace: phi::Workspace) -> ReplaceScheduledTask {
+        ReplaceScheduledTask {
+            name: self.name,
+            prompt: self.prompt,
+            workspace,
+            profile_id: self.profile_id,
+            agent_profile_id: self.agent_profile_id,
+            capability_mode: self.capability_mode,
+            output_channel_id: self.output_channel_id,
+            schedule: self.schedule.into(),
+            expected_revision: self.expected_revision,
         }
     }
 }
@@ -751,28 +800,96 @@ pub struct McpProfilesResponse {
 
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PutOutputChannelRequest {
-    Telegram { bot_token: String, chat_id: String },
+pub enum PutBotAccountRequest {
+    Telegram { bot_token: String },
 }
 
-impl fmt::Debug for PutOutputChannelRequest {
+impl fmt::Debug for PutBotAccountRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Telegram { chat_id, .. } => formatter
+            Self::Telegram { .. } => formatter
                 .debug_struct("Telegram")
                 .field("bot_token", &"[REDACTED]")
-                .field("chat_id", chat_id)
                 .finish(),
         }
     }
 }
 
-impl From<PutOutputChannelRequest> for OutputChannelDefinition {
-    fn from(request: PutOutputChannelRequest) -> Self {
+impl From<PutBotAccountRequest> for BotAccountDefinition {
+    fn from(request: PutBotAccountRequest) -> Self {
         match request {
-            PutOutputChannelRequest::Telegram { bot_token, chat_id } => {
-                Self::Telegram { bot_token, chat_id }
-            }
+            PutBotAccountRequest::Telegram { bot_token } => Self::Telegram { bot_token },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PublicBotAccount {
+    Telegram {
+        bot_account_id: String,
+        revision: u64,
+        bot_token_configured: bool,
+    },
+}
+
+impl From<BotAccount> for PublicBotAccount {
+    fn from(account: BotAccount) -> Self {
+        match account.definition {
+            BotAccountDefinition::Telegram { bot_token } => Self::Telegram {
+                bot_account_id: account.bot_account_id,
+                revision: account.revision,
+                bot_token_configured: !bot_token.is_empty(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BotAccountResponse {
+    pub configured: bool,
+    pub bot_account: Option<PublicBotAccount>,
+}
+
+impl BotAccountResponse {
+    pub fn from_account(account: Option<BotAccount>) -> Self {
+        Self {
+            configured: account.is_some(),
+            bot_account: account.map(PublicBotAccount::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BotAccountsResponse {
+    pub bot_accounts: Vec<PublicBotAccount>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PutOutputChannelRequest {
+    Telegram {
+        #[serde(default)]
+        bot_account_id: Option<String>,
+        #[serde(default)]
+        bot_token: Option<String>,
+        chat_id: String,
+    },
+}
+
+impl fmt::Debug for PutOutputChannelRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Telegram {
+                bot_account_id,
+                chat_id,
+                ..
+            } => formatter
+                .debug_struct("Telegram")
+                .field("bot_account_id", bot_account_id)
+                .field("bot_token", &"[REDACTED]")
+                .field("chat_id", chat_id)
+                .finish(),
         }
     }
 }
@@ -783,6 +900,9 @@ pub enum PublicOutputChannel {
     Telegram {
         output_channel_id: String,
         revision: u64,
+        bot_account_id: String,
+        /// Kept for older clients. The referenced bot account is guaranteed to
+        /// exist when a target is returned.
         bot_token_configured: bool,
         chat_id: String,
     },
@@ -791,10 +911,14 @@ pub enum PublicOutputChannel {
 impl From<OutputChannel> for PublicOutputChannel {
     fn from(channel: OutputChannel) -> Self {
         match channel.definition {
-            OutputChannelDefinition::Telegram { bot_token, chat_id } => Self::Telegram {
+            OutputChannelDefinition::Telegram {
+                bot_account_id,
+                chat_id,
+            } => Self::Telegram {
                 output_channel_id: channel.output_channel_id,
                 revision: channel.revision,
-                bot_token_configured: !bot_token.is_empty(),
+                bot_account_id,
+                bot_token_configured: true,
                 chat_id,
             },
         }
@@ -2281,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn output_channel_request_debug_and_public_dto_redact_bot_token() {
+    fn bot_account_and_legacy_output_request_redact_bot_token() {
         let secret = "123456789:canary_bot_token_that_must_not_appear";
         let request: PutOutputChannelRequest = serde_json::from_value(serde_json::json!({
             "type": "telegram",
@@ -2294,14 +2418,36 @@ mod tests {
         assert!(!debug.contains(secret));
         assert!(debug.contains("[REDACTED]"));
 
+        let bot_request: PutBotAccountRequest = serde_json::from_value(serde_json::json!({
+            "type": "telegram",
+            "bot_token": secret
+        }))
+        .unwrap();
+        let debug = format!("{bot_request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+        let account = BotAccount {
+            bot_account_id: "primary".to_owned(),
+            revision: 1,
+            definition: bot_request.into(),
+        };
+        let value = serde_json::to_value(BotAccountResponse::from_account(Some(account))).unwrap();
+        assert_eq!(value["bot_account"]["type"], "telegram");
+        assert_eq!(value["bot_account"]["bot_token_configured"], true);
+        assert!(!value.to_string().contains(secret));
+
         let channel = OutputChannel {
             output_channel_id: "alerts".to_owned(),
             revision: 1,
-            definition: request.into(),
+            definition: OutputChannelDefinition::Telegram {
+                bot_account_id: "primary".to_owned(),
+                chat_id: "-1001234567890".to_owned(),
+            },
         };
         let value =
             serde_json::to_value(OutputChannelResponse::from_channel(Some(channel))).unwrap();
         assert_eq!(value["output_channel"]["type"], "telegram");
+        assert_eq!(value["output_channel"]["bot_account_id"], "primary");
         assert_eq!(value["output_channel"]["bot_token_configured"], true);
         assert!(!value.to_string().contains(secret));
     }
@@ -2321,6 +2467,26 @@ mod tests {
         .unwrap();
 
         let debug = format!("{request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+
+        let replacement: ReplaceScheduledTaskRequest = serde_json::from_value(serde_json::json!({
+            "name": "review",
+            "prompt": secret,
+            "workspace": "/workspace/phi",
+            "profile_id": "default",
+            "agent_profile_id": "default",
+            "capability_mode": null,
+            "output_channel_id": null,
+            "schedule": {
+                "type": "interval",
+                "every": 1,
+                "unit": "hours"
+            },
+            "expected_revision": 1
+        }))
+        .unwrap();
+        let debug = format!("{replacement:?}");
         assert!(!debug.contains(secret));
         assert!(debug.contains("[REDACTED]"));
     }

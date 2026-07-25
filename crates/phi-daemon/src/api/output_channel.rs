@@ -10,13 +10,19 @@ use axum::{
 use super::{
     ApiError, AppState,
     dto::{
-        OutputChannelResponse, OutputChannelsResponse, PublicOutputChannel, PutOutputChannelRequest,
+        BotAccountResponse, BotAccountsResponse, OutputChannelResponse, OutputChannelsResponse,
+        PublicBotAccount, PublicOutputChannel, PutBotAccountRequest, PutOutputChannelRequest,
     },
 };
-use crate::output_channel::OutputChannelManager;
+use crate::output_channel::{OutputChannelDefinition, OutputChannelManager};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/bot-accounts", get(list_bot_accounts))
+        .route(
+            "/v1/bot-accounts/{bot_account_id}",
+            get(get_bot_account).put(put_bot_account),
+        )
         .route("/v1/output-channels", get(list_output_channels))
         .route(
             "/v1/output-channels/{output_channel_id}",
@@ -26,6 +32,45 @@ pub(super) fn routes() -> Router<AppState> {
             "/v1/output-channels/{output_channel_id}/test",
             post(test_output_channel),
         )
+}
+
+async fn list_bot_accounts(
+    State(state): State<AppState>,
+) -> Result<Json<BotAccountsResponse>, ApiError> {
+    let bot_accounts = manager(&state)?
+        .list_bot_accounts()
+        .await
+        .map_err(ApiError::bot_account)?
+        .into_iter()
+        .map(PublicBotAccount::from)
+        .collect();
+    Ok(Json(BotAccountsResponse { bot_accounts }))
+}
+
+async fn get_bot_account(
+    State(state): State<AppState>,
+    Path(bot_account_id): Path<String>,
+) -> Result<Json<BotAccountResponse>, ApiError> {
+    let account = manager(&state)?
+        .get_bot_account(&bot_account_id)
+        .await
+        .map_err(ApiError::bot_account)?;
+    Ok(Json(BotAccountResponse::from_account(account)))
+}
+
+async fn put_bot_account(
+    State(state): State<AppState>,
+    Path(bot_account_id): Path<String>,
+    request: Result<Json<PutBotAccountRequest>, JsonRejection>,
+) -> Result<Json<BotAccountResponse>, ApiError> {
+    let Json(request) = request.map_err(|_| {
+        ApiError::bad_request("invalid_bot_account", "invalid bot account request body")
+    })?;
+    let account = manager(&state)?
+        .configure_bot_account(&bot_account_id, request.into())
+        .await
+        .map_err(ApiError::bot_account)?;
+    Ok(Json(BotAccountResponse::from_account(Some(account))))
 }
 
 async fn list_output_channels(
@@ -63,10 +108,40 @@ async fn put_output_channel(
             "invalid output channel request body",
         )
     })?;
-    let channel = manager(&state)?
-        .configure_channel(&output_channel_id, request.into())
-        .await
-        .map_err(ApiError::output_channel)?;
+    let manager = manager(&state)?;
+    let channel = match request {
+        PutOutputChannelRequest::Telegram {
+            bot_account_id: Some(bot_account_id),
+            bot_token: None,
+            chat_id,
+        } => {
+            manager
+                .configure_channel(
+                    &output_channel_id,
+                    OutputChannelDefinition::Telegram {
+                        bot_account_id,
+                        chat_id,
+                    },
+                )
+                .await
+        }
+        PutOutputChannelRequest::Telegram {
+            bot_account_id: None,
+            bot_token: Some(bot_token),
+            chat_id,
+        } => {
+            manager
+                .configure_legacy_telegram_channel(&output_channel_id, bot_token, chat_id)
+                .await
+        }
+        PutOutputChannelRequest::Telegram { .. } => {
+            return Err(ApiError::bad_request(
+                "invalid_output_channel",
+                "Telegram output target must contain exactly one of bot_account_id or bot_token",
+            ));
+        }
+    }
+    .map_err(ApiError::output_channel)?;
     Ok(Json(OutputChannelResponse::from_channel(Some(channel))))
 }
 

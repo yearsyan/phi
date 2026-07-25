@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { browseWorkspace, forkSession, runScheduledTask } from './http.ts';
+import {
+  browseWorkspace,
+  forkSession,
+  replaceScheduledTask,
+  runScheduledTask,
+} from './http.ts';
 
 describe('browseWorkspace', () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -121,5 +126,47 @@ describe('runScheduledTask', () => {
       }),
     );
     expect(json).not.toHaveBeenCalled();
+  });
+});
+
+describe('replaceScheduledTask', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('puts the complete editable definition with its expected revision', async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: vi.fn().mockResolvedValue({ task_id: 'task/id', revision: 4 }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    const body = {
+      name: 'Edited task',
+      prompt: 'Review failures',
+      workspace: '/workspace/phi',
+      profile_id: 'default',
+      agent_profile_id: 'default',
+      capability_mode: null,
+      output_channel_id: null,
+      schedule: {
+        type: 'interval' as const,
+        every: 30,
+        unit: 'minutes' as const,
+      },
+      expected_revision: 3,
+    };
+
+    await replaceScheduledTask('daemon-key', 'task/id', body);
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/v1/scheduled-tasks/task%2Fid',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify(body),
+        headers: expect.objectContaining({
+          Authorization: 'Bearer daemon-key',
+          'content-type': 'application/json',
+        }),
+      }),
+    );
   });
 });

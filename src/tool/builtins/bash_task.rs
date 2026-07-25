@@ -4,7 +4,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::{
     fs::{File, OpenOptions},
-    sync::{OnceCell, oneshot, watch},
+    sync::{OnceCell, oneshot},
     task::JoinHandle,
 };
 
@@ -24,11 +24,9 @@ use crate::{
 };
 
 const DEFAULT_MAX_RETAINED_TASKS: usize = 64;
-const DEFAULT_TASK_OUTPUT_TIMEOUT_MS: u64 = 30_000;
-const MAX_TASK_OUTPUT_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BashTaskStatus {
+pub(super) enum BashTaskStatus {
     Running,
     Completed,
     Failed,
@@ -36,7 +34,7 @@ enum BashTaskStatus {
 }
 
 impl BashTaskStatus {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
@@ -45,7 +43,7 @@ impl BashTaskStatus {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         self != Self::Running
     }
 }
@@ -105,7 +103,6 @@ impl Drop for BashTaskRegistryInner {
 pub(super) struct WeakBashTaskRegistry {
     inner: Weak<Mutex<BashTaskRegistryInner>>,
     preview_capacity: usize,
-    changes: watch::Sender<u64>,
 }
 
 impl WeakBashTaskRegistry {
@@ -163,9 +160,6 @@ impl WeakBashTaskRegistry {
         }
         let notification = terminal_notification(task_id, entry);
         drop(inner);
-        self.changes.send_modify(|revision| {
-            *revision = revision.wrapping_add(1);
-        });
         let Some(context) = notification_context else {
             return;
         };
@@ -178,7 +172,7 @@ impl WeakBashTaskRegistry {
     }
 }
 
-/// Shared state behind `bash`, `bash_task_output`, and `bash_task_stop`.
+/// Shared state behind `bash` and `bash_task_stop`.
 ///
 /// Entries are bounded. Finished tasks are evicted oldest-first when a new
 /// task starts; running tasks are never silently evicted.
@@ -192,7 +186,6 @@ pub(super) struct BashTaskStart {
 pub(super) struct BashTaskRegistry {
     inner: Arc<Mutex<BashTaskRegistryInner>>,
     output_dir_ready: Arc<OnceCell<()>>,
-    changes: watch::Sender<u64>,
     max_tasks: usize,
     max_lines: usize,
     max_bytes: usize,
@@ -228,14 +221,12 @@ impl BashTaskRegistry {
             fastrand::u64(..),
             fastrand::u64(..)
         ));
-        let (changes, _) = watch::channel(0);
         Self {
             inner: Arc::new(Mutex::new(BashTaskRegistryInner {
                 tasks: HashMap::new(),
                 output_dir,
             })),
             output_dir_ready: Arc::new(OnceCell::new()),
-            changes,
             max_tasks: max_tasks.max(1),
             max_lines: max_lines.max(1),
             max_bytes,
@@ -247,7 +238,6 @@ impl BashTaskRegistry {
         WeakBashTaskRegistry {
             inner: Arc::downgrade(&self.inner),
             preview_capacity: self.preview_capacity,
-            changes: self.changes.clone(),
         }
     }
 
@@ -419,7 +409,7 @@ impl BashTaskRegistry {
         output_paths
     }
 
-    fn snapshot(&self, task_id: &str) -> Result<BashTaskSnapshot, ToolError> {
+    pub(super) fn snapshot(&self, task_id: &str) -> Result<BashTaskSnapshot, ToolError> {
         let inner = self
             .inner
             .lock()
@@ -450,43 +440,6 @@ impl BashTaskRegistry {
             timed_out: entry.timed_out,
             notification_error: entry.notification_error.clone(),
         })
-    }
-
-    async fn query(
-        &self,
-        task_id: &str,
-        block: bool,
-        timeout: Duration,
-    ) -> Result<(TaskRetrievalStatus, BashTaskSnapshot), ToolError> {
-        let mut changes = self.changes.subscribe();
-        let snapshot = self.snapshot(task_id)?;
-        if snapshot.status.is_terminal() {
-            return Ok((TaskRetrievalStatus::Success, snapshot));
-        }
-        if !block {
-            return Ok((TaskRetrievalStatus::NotReady, snapshot));
-        }
-        if timeout.is_zero() {
-            return Ok((TaskRetrievalStatus::Timeout, snapshot));
-        }
-
-        let wait = async {
-            loop {
-                changes.changed().await.map_err(|_| {
-                    ToolError::new("background bash task registry closed while waiting for output")
-                })?;
-                let snapshot = self.snapshot(task_id)?;
-                if snapshot.status.is_terminal() {
-                    return Ok(snapshot);
-                }
-            }
-        };
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(result) => result.map(|snapshot| (TaskRetrievalStatus::Success, snapshot)),
-            Err(_) => self
-                .snapshot(task_id)
-                .map(|snapshot| (TaskRetrievalStatus::Timeout, snapshot)),
-        }
     }
 
     fn format_live_output(&self, entry: &BashTaskEntry) -> String {
@@ -534,9 +487,6 @@ impl BashTaskRegistry {
             handle.abort();
             let _ = handle.await;
         }
-        self.changes.send_modify(|revision| {
-            *revision = revision.wrapping_add(1);
-        });
         self.snapshot(task_id)
     }
 }
@@ -604,38 +554,21 @@ fn terminal_notification(task_id: &str, entry: &BashTaskEntry) -> String {
     )
 }
 
-#[derive(Clone, Copy)]
-enum TaskRetrievalStatus {
-    Success,
-    Timeout,
-    NotReady,
-}
-
-impl TaskRetrievalStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Timeout => "timeout",
-            Self::NotReady => "not_ready",
-        }
-    }
-}
-
-struct BashTaskSnapshot {
+pub(super) struct BashTaskSnapshot {
     task_id: String,
     description: String,
-    status: BashTaskStatus,
-    output_path: PathBuf,
-    output: String,
+    pub(super) status: BashTaskStatus,
+    pub(super) output_path: PathBuf,
+    pub(super) output: String,
     elapsed_seconds: f64,
-    exit_code: Option<i32>,
-    timed_out: bool,
+    pub(super) exit_code: Option<i32>,
+    pub(super) timed_out: bool,
     notification_error: Option<String>,
 }
 
 impl BashTaskSnapshot {
-    fn into_output(self, retrieval_status: TaskRetrievalStatus) -> ToolOutput {
-        let retrieval_status = retrieval_status.as_str();
+    fn into_stop_output(self) -> ToolOutput {
+        let retrieval_status = "success";
         let status = self.status.as_str();
         let output_path = self.output_path.display().to_string();
         let mut parts = vec![
@@ -679,92 +612,8 @@ impl BashTaskSnapshot {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TaskOutputArguments {
-    task_id: String,
-    #[serde(default = "default_task_output_block")]
-    block: bool,
-    #[serde(default = "default_task_output_timeout_ms")]
-    timeout: u64,
-}
-
-fn default_task_output_block() -> bool {
-    true
-}
-
-fn default_task_output_timeout_ms() -> u64 {
-    DEFAULT_TASK_OUTPUT_TIMEOUT_MS
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TaskArguments {
     task_id: String,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct BashTaskOutputTool {
-    registry: BashTaskRegistry,
-}
-
-impl BashTaskOutputTool {
-    pub(super) fn new(registry: BashTaskRegistry) -> Self {
-        Self { registry }
-    }
-}
-
-#[async_trait]
-impl Tool for BashTaskOutputTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(
-            "bash_task_output",
-            "[Deprecated] Prefer read on the output_file returned by bash or its automatic task_notification. This compatibility tool can wait for a background Bash task or inspect its current status.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task id returned by bash with run_in_background=true"
-                    },
-                    "block": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Wait for the task to finish; set false for a non-blocking status check"
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": MAX_TASK_OUTPUT_TIMEOUT_MS,
-                        "default": DEFAULT_TASK_OUTPUT_TIMEOUT_MS,
-                        "description": "Maximum time to wait in milliseconds"
-                    }
-                },
-                "required": ["task_id"],
-                "additionalProperties": false
-            }),
-        )
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    async fn execute(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let arguments: TaskOutputArguments = serde_json::from_value(arguments)
-            .map_err(|error| invalid_arguments("bash_task_output", error))?;
-        if arguments.timeout > MAX_TASK_OUTPUT_TIMEOUT_MS {
-            return Err(ToolError::new(format!(
-                "bash_task_output timeout must not exceed {MAX_TASK_OUTPUT_TIMEOUT_MS} milliseconds"
-            )));
-        }
-        self.registry
-            .query(
-                &arguments.task_id,
-                arguments.block,
-                Duration::from_millis(arguments.timeout),
-            )
-            .await
-            .map(|(retrieval_status, snapshot)| snapshot.into_output(retrieval_status))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -808,7 +657,7 @@ impl Tool for BashTaskStopTool {
         self.registry
             .stop(&arguments.task_id)
             .await
-            .map(|snapshot| snapshot.into_output(TaskRetrievalStatus::Success))
+            .map(BashTaskSnapshot::into_stop_output)
     }
 }
 
@@ -817,22 +666,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    #[test]
-    fn output_tool_is_a_deprecated_blocking_compatibility_path() {
-        let definition = BashTaskOutputTool::new(BashTaskRegistry::new(20, 1_024)).definition();
-
-        assert!(definition.description.starts_with("[Deprecated]"));
-        assert!(definition.description.contains("Prefer read"));
-        assert_eq!(
-            definition.parameters["properties"]["block"]["default"],
-            true
-        );
-        assert_eq!(
-            definition.parameters["properties"]["timeout"]["default"],
-            DEFAULT_TASK_OUTPUT_TIMEOUT_MS
-        );
-    }
 
     #[tokio::test]
     async fn registry_evicts_oldest_finished_task() {
@@ -861,31 +694,6 @@ mod tests {
             registry.snapshot(&second.task_id).unwrap().status,
             BashTaskStatus::Completed
         );
-    }
-
-    #[tokio::test]
-    async fn blocking_compatibility_query_reports_timeout_to_the_model() {
-        let registry = BashTaskRegistry::new(20, 1_024);
-        let task = registry
-            .spawn("pending".to_owned(), None, |_, _, _| async {
-                std::future::pending::<Result<ToolOutput, ToolError>>().await
-            })
-            .await
-            .unwrap();
-        let tool = BashTaskOutputTool::new(registry.clone());
-
-        let output = tool
-            .execute(json!({ "task_id": task.task_id, "timeout": 1 }))
-            .await
-            .unwrap();
-
-        assert!(
-            output
-                .content
-                .contains("<retrieval_status>timeout</retrieval_status>")
-        );
-        assert!(output.content.contains("<status>running</status>"));
-        assert_eq!(output.metadata.unwrap()["retrieval_status"], "timeout");
     }
 
     #[tokio::test]

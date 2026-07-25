@@ -4,6 +4,7 @@ import { useI18n } from '../../i18n/I18nProvider.tsx';
 import type { CapabilityMode, ScheduledTask } from '../../types/wire.ts';
 import {
   ClockIcon,
+  EditIcon,
   MenuIcon,
   PauseIcon,
   PlayIcon,
@@ -35,6 +36,7 @@ export function ScheduledTasksPage({
   const { t, locale } = useI18n();
   const tasks = useScheduledTasks(authKey, true);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const observedSessions = useRef(new Set<string>());
 
@@ -143,6 +145,7 @@ export function ScheduledTasksPage({
                 onRun={(task) =>
                   void runAction(task.task_id, () => tasks.runNow(task.task_id))
                 }
+                onEdit={setEditingTask}
                 onDelete={deleteTask}
               />
             )}
@@ -161,6 +164,7 @@ export function ScheduledTasksPage({
                 onRun={(task) =>
                   void runAction(task.task_id, () => tasks.runNow(task.task_id))
                 }
+                onEdit={setEditingTask}
                 onDelete={deleteTask}
               />
             )}
@@ -168,16 +172,25 @@ export function ScheduledTasksPage({
         )}
       </div>
 
-      {createOpen && (
+      {(createOpen || editingTask) && (
         <CreateScheduledTaskModal
           authKey={authKey}
           profileId={profileId}
           agentProfileId={agentProfileId}
           capabilityMode={capabilityMode}
-          onClose={() => setCreateOpen(false)}
+          task={editingTask ?? undefined}
+          onClose={() => {
+            setCreateOpen(false);
+            setEditingTask(null);
+          }}
           onCreate={async (request) => {
             await tasks.createTask(request);
             setCreateOpen(false);
+          }}
+          onUpdate={async (request) => {
+            if (!editingTask) return;
+            await tasks.editTask(editingTask.task_id, request);
+            setEditingTask(null);
           }}
         />
       )}
@@ -193,6 +206,7 @@ interface TaskGroupProps {
   onOpenSession: (sessionId: string) => void;
   onToggle: (task: ScheduledTask) => void;
   onRun: (task: ScheduledTask) => void;
+  onEdit: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
 }
 
@@ -204,6 +218,7 @@ function TaskGroup({
   onOpenSession,
   onToggle,
   onRun,
+  onEdit,
   onDelete,
 }: TaskGroupProps) {
   const { t } = useI18n();
@@ -299,6 +314,14 @@ function TaskGroup({
                   {task.enabled
                     ? t('scheduled.action.pause')
                     : t('scheduled.action.resume')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onEdit(task)}
+                  disabled={pending}
+                >
+                  <EditIcon />
+                  {t('scheduled.action.edit')}
                 </button>
                 <button
                   type="button"

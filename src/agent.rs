@@ -3647,17 +3647,7 @@ mod tests {
             .build();
         let mut names = agent.tools.keys().map(String::as_str).collect::<Vec<_>>();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "bash",
-                "bash_task_output",
-                "bash_task_stop",
-                "edit",
-                "read",
-                "write"
-            ]
-        );
+        assert_eq!(names, ["bash", "bash_task_stop", "edit", "read", "write"]);
     }
 
     #[tokio::test]

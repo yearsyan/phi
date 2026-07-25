@@ -8,41 +8,109 @@ use thiserror::Error;
 use crate::store::{OutputChannelStore, OutputChannelStoreError};
 
 pub const MAX_OUTPUT_CHANNEL_ID_BYTES: usize = 64;
+pub const MAX_BOT_ACCOUNT_ID_BYTES: usize = 64;
 const MAX_TELEGRAM_BOT_TOKEN_BYTES: usize = 512;
 const MAX_TELEGRAM_CHAT_ID_BYTES: usize = 256;
-const MAX_TELEGRAM_MESSAGE_CHARS: usize = 4_096;
+pub(crate) const MAX_TELEGRAM_MESSAGE_CHARS: usize = 4_096;
 const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 
-/// Secret-bearing configuration for one daemon output destination.
+/// Secret-bearing configuration for one daemon bot account.
 ///
 /// Public HTTP responses use a separate redacted DTO. In particular, the
 /// Telegram bot token must never appear in Debug output or a GET response.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OutputChannelDefinition {
-    Telegram { bot_token: String, chat_id: String },
+pub enum BotAccountDefinition {
+    Telegram { bot_token: String },
 }
 
-impl fmt::Debug for OutputChannelDefinition {
+impl fmt::Debug for BotAccountDefinition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Telegram { chat_id, .. } => formatter
+            Self::Telegram { .. } => formatter
                 .debug_struct("Telegram")
                 .field("bot_token", &"[REDACTED]")
-                .field("chat_id", chat_id)
                 .finish(),
         }
     }
 }
 
+impl BotAccountDefinition {
+    pub fn normalized(&self) -> Result<Self, OutputChannelValidationError> {
+        match self {
+            Self::Telegram { bot_token } => Ok(Self::Telegram {
+                bot_token: normalize_telegram_bot_token(bot_token)?,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotAccount {
+    pub bot_account_id: String,
+    pub revision: u64,
+    pub definition: BotAccountDefinition,
+}
+
+impl fmt::Debug for BotAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BotAccount")
+            .field("bot_account_id", &self.bot_account_id)
+            .field("revision", &self.revision)
+            .field("definition", &self.definition)
+            .finish()
+    }
+}
+
+impl BotAccount {
+    pub fn normalized(&self) -> Result<Self, OutputChannelValidationError> {
+        validate_bot_account_id(&self.bot_account_id)?;
+        if self.revision == 0 {
+            return Err(invalid("revision", "must be greater than zero"));
+        }
+        Ok(Self {
+            bot_account_id: self.bot_account_id.clone(),
+            revision: self.revision,
+            definition: self.definition.normalized()?,
+        })
+    }
+}
+
+/// Non-secret configuration for one daemon output destination.
+///
+/// The target references a bot account instead of copying its token. Multiple
+/// targets may therefore share one Telegram bot account.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OutputChannelDefinition {
+    Telegram {
+        bot_account_id: String,
+        chat_id: String,
+    },
+}
+
 impl OutputChannelDefinition {
     pub fn normalized(&self) -> Result<Self, OutputChannelValidationError> {
         match self {
-            Self::Telegram { bot_token, chat_id } => Ok(Self::Telegram {
-                bot_token: normalize_telegram_bot_token(bot_token)?,
-                chat_id: normalize_telegram_chat_id(chat_id)?,
-            }),
+            Self::Telegram {
+                bot_account_id,
+                chat_id,
+            } => {
+                validate_bot_account_id(bot_account_id)?;
+                Ok(Self::Telegram {
+                    bot_account_id: bot_account_id.clone(),
+                    chat_id: normalize_telegram_chat_id(chat_id)?,
+                })
+            }
+        }
+    }
+
+    pub fn bot_account_id(&self) -> &str {
+        match self {
+            Self::Telegram { bot_account_id, .. } => bot_account_id,
         }
     }
 }
@@ -83,27 +151,40 @@ impl OutputChannel {
 pub fn validate_output_channel_id(
     output_channel_id: &str,
 ) -> Result<(), OutputChannelValidationError> {
-    if output_channel_id.is_empty() {
-        return Err(invalid("output_channel_id", "must not be empty"));
+    validate_id(
+        "output_channel_id",
+        output_channel_id,
+        MAX_OUTPUT_CHANNEL_ID_BYTES,
+    )
+}
+
+pub fn validate_bot_account_id(bot_account_id: &str) -> Result<(), OutputChannelValidationError> {
+    validate_id("bot_account_id", bot_account_id, MAX_BOT_ACCOUNT_ID_BYTES)
+}
+
+fn validate_id(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), OutputChannelValidationError> {
+    if value.is_empty() {
+        return Err(invalid(field, "must not be empty"));
     }
-    if output_channel_id != output_channel_id.trim() {
+    if value != value.trim() {
+        return Err(invalid(field, "must not have surrounding whitespace"));
+    }
+    if value.len() > maximum_bytes {
         return Err(invalid(
-            "output_channel_id",
-            "must not have surrounding whitespace",
+            field,
+            format!("must not exceed {maximum_bytes} bytes"),
         ));
     }
-    if output_channel_id.len() > MAX_OUTPUT_CHANNEL_ID_BYTES {
-        return Err(invalid(
-            "output_channel_id",
-            format!("must not exceed {MAX_OUTPUT_CHANNEL_ID_BYTES} bytes"),
-        ));
-    }
-    if !output_channel_id
+    if !value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err(invalid(
-            "output_channel_id",
+            field,
             "must contain only ASCII letters, digits, '_' or '-'",
         ));
     }
@@ -173,7 +254,8 @@ pub enum OutputChannelValidationError {
 pub trait OutputChannelSender: Send + Sync {
     async fn send(
         &self,
-        definition: &OutputChannelDefinition,
+        bot_account: &BotAccountDefinition,
+        output_channel: &OutputChannelDefinition,
         message: &str,
     ) -> Result<(), OutputChannelDeliveryError>;
 }
@@ -232,13 +314,18 @@ struct TelegramResponse {
 impl OutputChannelSender for TelegramOutputChannelSender {
     async fn send(
         &self,
-        definition: &OutputChannelDefinition,
+        bot_account: &BotAccountDefinition,
+        output_channel: &OutputChannelDefinition,
         message: &str,
     ) -> Result<(), OutputChannelDeliveryError> {
-        let definition = definition
+        let bot_account = bot_account
             .normalized()
             .map_err(OutputChannelDeliveryError::InvalidConfiguration)?;
-        let OutputChannelDefinition::Telegram { bot_token, chat_id } = definition;
+        let output_channel = output_channel
+            .normalized()
+            .map_err(OutputChannelDeliveryError::InvalidConfiguration)?;
+        let BotAccountDefinition::Telegram { bot_token } = bot_account;
+        let OutputChannelDefinition::Telegram { chat_id, .. } = output_channel;
         if message.is_empty() {
             return Err(OutputChannelDeliveryError::InvalidMessage(
                 "message must not be empty".to_owned(),
@@ -342,6 +429,28 @@ impl OutputChannelManager {
         Self { store, sender }
     }
 
+    pub async fn list_bot_accounts(&self) -> Result<Vec<BotAccount>, OutputChannelError> {
+        Ok(self.store.list_bot_accounts().await?)
+    }
+
+    pub async fn get_bot_account(
+        &self,
+        bot_account_id: &str,
+    ) -> Result<Option<BotAccount>, OutputChannelError> {
+        Ok(self.store.get_bot_account(bot_account_id).await?)
+    }
+
+    pub async fn configure_bot_account(
+        &self,
+        bot_account_id: &str,
+        definition: BotAccountDefinition,
+    ) -> Result<BotAccount, OutputChannelError> {
+        Ok(self
+            .store
+            .replace_bot_account(bot_account_id, definition)
+            .await?)
+    }
+
     pub async fn list_channels(&self) -> Result<Vec<OutputChannel>, OutputChannelError> {
         Ok(self.store.list_output_channels().await?)
     }
@@ -358,9 +467,27 @@ impl OutputChannelManager {
         output_channel_id: &str,
         definition: OutputChannelDefinition,
     ) -> Result<OutputChannel, OutputChannelError> {
+        let bot_account_id = definition.bot_account_id();
+        if self.store.get_bot_account(bot_account_id).await?.is_none() {
+            return Err(OutputChannelError::BotAccountNotFound {
+                bot_account_id: bot_account_id.to_owned(),
+            });
+        }
         Ok(self
             .store
             .replace_output_channel(output_channel_id, definition)
+            .await?)
+    }
+
+    pub async fn configure_legacy_telegram_channel(
+        &self,
+        output_channel_id: &str,
+        bot_token: String,
+        chat_id: String,
+    ) -> Result<OutputChannel, OutputChannelError> {
+        Ok(self
+            .store
+            .replace_legacy_telegram_channel(output_channel_id, bot_token, chat_id)
             .await?)
     }
 
@@ -376,7 +503,17 @@ impl OutputChannelManager {
             .ok_or_else(|| OutputChannelError::NotFound {
                 output_channel_id: output_channel_id.to_owned(),
             })?;
-        self.sender.send(&channel.definition, message).await?;
+        let bot_account_id = channel.definition.bot_account_id();
+        let bot_account = self
+            .store
+            .get_bot_account(bot_account_id)
+            .await?
+            .ok_or_else(|| OutputChannelError::BotAccountNotFound {
+                bot_account_id: bot_account_id.to_owned(),
+            })?;
+        self.sender
+            .send(&bot_account.definition, &channel.definition, message)
+            .await?;
         Ok(())
     }
 
@@ -394,6 +531,9 @@ pub enum OutputChannelError {
     #[error("output channel {output_channel_id:?} was not found")]
     NotFound { output_channel_id: String },
 
+    #[error("bot account {bot_account_id:?} was not found")]
+    BotAccountNotFound { bot_account_id: String },
+
     #[error(transparent)]
     Store(#[from] OutputChannelStoreError),
 
@@ -409,9 +549,15 @@ mod tests {
 
     use super::*;
 
-    fn telegram_definition(token: &str) -> OutputChannelDefinition {
-        OutputChannelDefinition::Telegram {
+    fn telegram_bot(token: &str) -> BotAccountDefinition {
+        BotAccountDefinition::Telegram {
             bot_token: token.to_owned(),
+        }
+    }
+
+    fn telegram_definition(bot_account_id: &str) -> OutputChannelDefinition {
+        OutputChannelDefinition::Telegram {
+            bot_account_id: bot_account_id.to_owned(),
             chat_id: "-1001234567890".to_owned(),
         }
     }
@@ -419,11 +565,10 @@ mod tests {
     #[test]
     fn telegram_definition_normalizes_and_redacts_bot_token() {
         let token = "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG";
-        let definition = telegram_definition(&format!(" {token} "))
-            .normalized()
-            .unwrap();
-        let debug = format!("{definition:?}");
-        assert!(debug.contains("-1001234567890"));
+        let bot = telegram_bot(&format!(" {token} ")).normalized().unwrap();
+        let definition = telegram_definition("alerts-bot").normalized().unwrap();
+        let debug = format!("{bot:?} {definition:?}");
+        assert!(debug.contains("alerts-bot"));
         assert!(!debug.contains(token));
     }
 
@@ -431,10 +576,12 @@ mod tests {
     fn output_channel_ids_and_telegram_credentials_are_validated() {
         assert!(validate_output_channel_id("alerts").is_ok());
         assert!(validate_output_channel_id("bad channel").is_err());
-        assert!(telegram_definition("not-a-token").normalized().is_err());
+        assert!(validate_bot_account_id("telegram-bot").is_ok());
+        assert!(validate_bot_account_id("bad bot").is_err());
+        assert!(telegram_bot("not-a-token").normalized().is_err());
         assert!(
             OutputChannelDefinition::Telegram {
-                bot_token: "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG".to_owned(),
+                bot_account_id: "telegram-bot".to_owned(),
                 chat_id: " \n ".to_owned(),
             }
             .normalized()
@@ -506,7 +653,11 @@ mod tests {
             format!("http://{address}"),
         );
         let error = sender
-            .send(&telegram_definition(token), "hello")
+            .send(
+                &telegram_bot(token),
+                &telegram_definition("telegram-bot"),
+                "hello",
+            )
             .await
             .unwrap_err();
         let rendered = error.to_string();

@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  listBotAccounts,
   listOutputChannels,
+  putBotAccount,
   putOutputChannel,
   testOutputChannel,
 } from '../../api/http.ts';
 import { useI18n } from '../../i18n/I18nProvider.tsx';
-import type { PublicOutputChannel } from '../../types/wire.ts';
+import type {
+  PublicBotAccount,
+  PublicOutputChannel,
+} from '../../types/wire.ts';
 import { PlusIcon } from '../common/Icons.tsx';
 import styles from './ProfileManager.module.css';
 
@@ -14,21 +19,36 @@ interface OutputChannelManagerProps {
   onDirtyChange: (dirty: boolean) => void;
 }
 
-interface OutputChannelForm {
+type EditorMode = 'bots' | 'targets';
+
+interface BotAccountForm {
   id: string;
   botToken: string;
+}
+
+interface RecipientTargetForm {
+  id: string;
+  botAccountId: string;
   chatId: string;
 }
 
-function emptyForm(): OutputChannelForm {
-  return { id: '', botToken: '', chatId: '' };
+function emptyBotForm(): BotAccountForm {
+  return { id: '', botToken: '' };
 }
 
-function fromChannel(channel: PublicOutputChannel): OutputChannelForm {
+function emptyTargetForm(botAccountId = ''): RecipientTargetForm {
+  return { id: '', botAccountId, chatId: '' };
+}
+
+function fromBotAccount(account: PublicBotAccount): BotAccountForm {
+  return { id: account.bot_account_id, botToken: '' };
+}
+
+function fromTarget(target: PublicOutputChannel): RecipientTargetForm {
   return {
-    id: channel.output_channel_id,
-    botToken: '',
-    chatId: channel.chat_id,
+    id: target.output_channel_id,
+    botAccountId: target.bot_account_id,
+    chatId: target.chat_id,
   };
 }
 
@@ -37,10 +57,15 @@ export function OutputChannelManager({
   onDirtyChange,
 }: OutputChannelManagerProps) {
   const { t } = useI18n();
-  const [channels, setChannels] = useState<PublicOutputChannel[]>([]);
-  const [selected, setSelected] = useState<PublicOutputChannel | null>(null);
-  const [form, setForm] = useState<OutputChannelForm>(emptyForm);
-  const [configured, setConfigured] = useState(false);
+  const [mode, setMode] = useState<EditorMode>('bots');
+  const [botAccounts, setBotAccounts] = useState<PublicBotAccount[]>([]);
+  const [targets, setTargets] = useState<PublicOutputChannel[]>([]);
+  const [selectedBot, setSelectedBot] = useState<PublicBotAccount | null>(null);
+  const [selectedTarget, setSelectedTarget] =
+    useState<PublicOutputChannel | null>(null);
+  const [botForm, setBotForm] = useState<BotAccountForm>(emptyBotForm);
+  const [targetForm, setTargetForm] =
+    useState<RecipientTargetForm>(emptyTargetForm);
   const [dirty, setDirty] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -57,11 +82,28 @@ export function OutputChannelManager({
     [onDirtyChange],
   );
 
-  const applyChannel = useCallback(
-    (channel: PublicOutputChannel) => {
-      setSelected(channel);
-      setForm(fromChannel(channel));
-      setConfigured(true);
+  const clearFeedback = () => {
+    setError(null);
+    setStatus(null);
+  };
+
+  const applyBot = useCallback(
+    (account: PublicBotAccount) => {
+      setMode('bots');
+      setSelectedBot(account);
+      setBotForm(fromBotAccount(account));
+      setDirtyState(false);
+      setError(null);
+      setStatus(null);
+    },
+    [setDirtyState],
+  );
+
+  const applyTarget = useCallback(
+    (target: PublicOutputChannel) => {
+      setMode('targets');
+      setSelectedTarget(target);
+      setTargetForm(fromTarget(target));
       setDirtyState(false);
       setError(null);
       setStatus(null);
@@ -75,95 +117,190 @@ export function OutputChannelManager({
     setLoading(true);
     setError(null);
     try {
-      const response = await listOutputChannels(authKey.trim());
+      const [botResponse, targetResponse] = await Promise.all([
+        listBotAccounts(authKey.trim()),
+        listOutputChannels(authKey.trim()),
+      ]);
       if (revision !== loadRevision.current) return;
-      setChannels(response.output_channels);
-      const first = response.output_channels[0];
-      if (first) {
-        applyChannel(first);
+      setBotAccounts(botResponse.bot_accounts);
+      setTargets(targetResponse.output_channels);
+      const firstBot = botResponse.bot_accounts[0];
+      if (firstBot) {
+        applyBot(firstBot);
       } else {
-        setSelected(null);
-        setForm(emptyForm());
-        setConfigured(false);
+        setMode('bots');
+        setSelectedBot(null);
+        setBotForm(emptyBotForm());
+        setTargetForm(emptyTargetForm());
         setDirtyState(false);
       }
     } catch (loadError) {
       if (revision !== loadRevision.current) return;
-      setChannels([]);
+      setBotAccounts([]);
+      setTargets([]);
       setError(
         loadError instanceof Error ? loadError.message : String(loadError),
       );
     } finally {
       if (revision === loadRevision.current) setLoading(false);
     }
-  }, [applyChannel, authKey, setDirtyState]);
+  }, [applyBot, authKey, setDirtyState]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  const update = <K extends keyof OutputChannelForm>(
-    key: K,
-    value: OutputChannelForm[K],
-  ) => {
-    setForm((current) => ({ ...current, [key]: value }));
-    setDirtyState(true);
-    setError(null);
-    setStatus(null);
-  };
-
   const confirmDiscard = () =>
     !dirty || window.confirm(t('settings.channels.discardChanges'));
 
-  const selectChannel = (channel: PublicOutputChannel) => {
-    if (configured && channel.output_channel_id === form.id) return;
+  const switchMode = (nextMode: EditorMode) => {
+    if (nextMode === mode || !confirmDiscard()) return;
+    if (nextMode === 'bots') {
+      const first = botAccounts[0];
+      if (first) {
+        applyBot(first);
+      } else {
+        setMode('bots');
+        setSelectedBot(null);
+        setBotForm(emptyBotForm());
+        setDirtyState(false);
+        clearFeedback();
+      }
+      return;
+    }
+    const first = targets[0];
+    if (first) {
+      applyTarget(first);
+    } else {
+      setMode('targets');
+      setSelectedTarget(null);
+      setTargetForm(emptyTargetForm(botAccounts[0]?.bot_account_id));
+      setDirtyState(false);
+      clearFeedback();
+    }
+  };
+
+  const selectBot = (account: PublicBotAccount) => {
+    if (
+      mode === 'bots' &&
+      selectedBot?.bot_account_id === account.bot_account_id
+    ) {
+      return;
+    }
     if (!confirmDiscard()) return;
-    applyChannel(channel);
+    applyBot(account);
+  };
+
+  const selectTarget = (target: PublicOutputChannel) => {
+    if (
+      mode === 'targets' &&
+      selectedTarget?.output_channel_id === target.output_channel_id
+    ) {
+      return;
+    }
+    if (!confirmDiscard()) return;
+    applyTarget(target);
   };
 
   const startNew = () => {
     if (!confirmDiscard()) return;
-    setSelected(null);
-    setForm(emptyForm());
-    setConfigured(false);
+    clearFeedback();
     setDirtyState(false);
-    setError(null);
-    setStatus(null);
+    if (mode === 'bots') {
+      setSelectedBot(null);
+      setBotForm(emptyBotForm());
+    } else {
+      setSelectedTarget(null);
+      setTargetForm(emptyTargetForm(botAccounts[0]?.bot_account_id));
+    }
+  };
+
+  const updateBot = <K extends keyof BotAccountForm>(
+    key: K,
+    value: BotAccountForm[K],
+  ) => {
+    setBotForm((current) => ({ ...current, [key]: value }));
+    setDirtyState(true);
+    clearFeedback();
+  };
+
+  const updateTarget = <K extends keyof RecipientTargetForm>(
+    key: K,
+    value: RecipientTargetForm[K],
+  ) => {
+    setTargetForm((current) => ({ ...current, [key]: value }));
+    setDirtyState(true);
+    clearFeedback();
   };
 
   const save = async () => {
-    const id = form.id.trim();
+    if (mode === 'bots') {
+      const id = botForm.id.trim();
+      if (!id) {
+        setError(t('settings.channels.errors.botIdRequired'));
+        return;
+      }
+      const botToken = botForm.botToken.trim();
+      if (!botToken) {
+        setError(t('settings.channels.errors.tokenRequired'));
+        return;
+      }
+      setSaving(true);
+      clearFeedback();
+      try {
+        const response = await putBotAccount(authKey.trim(), id, {
+          type: 'telegram',
+          bot_token: botToken,
+        });
+        if (!response.configured || response.bot_account === null) {
+          setError(t('settings.channels.errors.botNotConfigured'));
+          return;
+        }
+        const saved = response.bot_account;
+        setBotAccounts((current) => upsertBotAccount(current, saved));
+        applyBot(saved);
+        setStatus(t('settings.channels.botSaved'));
+      } catch (saveError) {
+        setError(
+          saveError instanceof Error ? saveError.message : String(saveError),
+        );
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
+    const id = targetForm.id.trim();
     if (!id) {
-      setError(t('settings.channels.errors.idRequired'));
+      setError(t('settings.channels.errors.targetIdRequired'));
       return;
     }
-    const botToken = form.botToken.trim();
-    if (!botToken) {
-      setError(t('settings.channels.errors.tokenRequired'));
+    const botAccountId = targetForm.botAccountId.trim();
+    if (!botAccountId) {
+      setError(t('settings.channels.errors.botRequired'));
       return;
     }
-    const chatId = form.chatId.trim();
+    const chatId = targetForm.chatId.trim();
     if (!chatId) {
       setError(t('settings.channels.errors.chatIdRequired'));
       return;
     }
     setSaving(true);
-    setError(null);
-    setStatus(null);
+    clearFeedback();
     try {
       const response = await putOutputChannel(authKey.trim(), id, {
         type: 'telegram',
-        bot_token: botToken,
+        bot_account_id: botAccountId,
         chat_id: chatId,
       });
       if (!response.configured || response.output_channel === null) {
-        setError(t('settings.channels.errors.notConfigured'));
+        setError(t('settings.channels.errors.targetNotConfigured'));
         return;
       }
-      const savedChannel = response.output_channel;
-      setChannels((current) => upsertChannel(current, savedChannel));
-      applyChannel(savedChannel);
-      setStatus(t('settings.channels.saved'));
+      const saved = response.output_channel;
+      setTargets((current) => upsertTarget(current, saved));
+      applyTarget(saved);
+      setStatus(t('settings.channels.targetSaved'));
     } catch (saveError) {
       setError(
         saveError instanceof Error ? saveError.message : String(saveError),
@@ -174,12 +311,11 @@ export function OutputChannelManager({
   };
 
   const test = async () => {
-    if (!selected || dirty) return;
+    if (mode !== 'targets' || !selectedTarget || dirty) return;
     setTesting(true);
-    setError(null);
-    setStatus(null);
+    clearFeedback();
     try {
-      await testOutputChannel(authKey.trim(), selected.output_channel_id);
+      await testOutputChannel(authKey.trim(), selectedTarget.output_channel_id);
       setStatus(t('settings.channels.testSent'));
     } catch (testError) {
       setError(
@@ -190,58 +326,121 @@ export function OutputChannelManager({
     }
   };
 
+  const selectedRevision =
+    mode === 'bots' ? selectedBot?.revision : selectedTarget?.revision;
+  const configured =
+    mode === 'bots' ? selectedBot !== null : selectedTarget !== null;
+  const currentItems = mode === 'bots' ? botAccounts : targets;
+
   return (
     <div className={styles.layout}>
       <aside className={styles.sidebar}>
+        <div className={styles.transportTabs} role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'bots'}
+            onClick={() => switchMode('bots')}
+          >
+            {t('settings.channels.botAccountsTab')}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === 'targets'}
+            onClick={() => switchMode('targets')}
+          >
+            {t('settings.channels.targetsTab')}
+          </button>
+        </div>
         <div className={styles.sidebarHeading}>
-          <span>{t('settings.channels.list')}</span>
-          <small>{channels.length}</small>
+          <span>
+            {mode === 'bots'
+              ? t('settings.channels.botAccounts')
+              : t('settings.channels.targets')}
+          </span>
+          <small>{currentItems.length}</small>
         </div>
         <div className={styles.list}>
-          {channels.map((channel) => (
-            <button
-              type="button"
-              key={channel.output_channel_id}
-              className={`${styles.item} ${
-                configured && form.id === channel.output_channel_id
-                  ? styles.itemSelected
-                  : ''
-              }`}
-              onClick={() => selectChannel(channel)}
-              aria-label={channel.output_channel_id}
-              aria-current={
-                configured && form.id === channel.output_channel_id
-                  ? 'true'
-                  : undefined
-              }
-            >
-              <span className={styles.itemCopy}>
-                <strong>{channel.output_channel_id}</strong>
-                <small>Telegram · {channel.chat_id}</small>
-              </span>
-            </button>
-          ))}
-          {!loading && channels.length === 0 && (
-            <p className={styles.empty}>{t('settings.channels.empty')}</p>
+          {mode === 'bots'
+            ? botAccounts.map((account) => (
+                <button
+                  type="button"
+                  key={account.bot_account_id}
+                  className={`${styles.item} ${
+                    selectedBot?.bot_account_id === account.bot_account_id
+                      ? styles.itemSelected
+                      : ''
+                  }`}
+                  onClick={() => selectBot(account)}
+                  aria-label={account.bot_account_id}
+                >
+                  <span className={styles.itemCopy}>
+                    <strong>{account.bot_account_id}</strong>
+                    <small>Telegram bot</small>
+                  </span>
+                </button>
+              ))
+            : targets.map((target) => (
+                <button
+                  type="button"
+                  key={target.output_channel_id}
+                  className={`${styles.item} ${
+                    selectedTarget?.output_channel_id ===
+                    target.output_channel_id
+                      ? styles.itemSelected
+                      : ''
+                  }`}
+                  onClick={() => selectTarget(target)}
+                  aria-label={target.output_channel_id}
+                >
+                  <span className={styles.itemCopy}>
+                    <strong>{target.output_channel_id}</strong>
+                    <small>
+                      {target.bot_account_id} · {target.chat_id}
+                    </small>
+                  </span>
+                </button>
+              ))}
+          {!loading && currentItems.length === 0 && (
+            <p className={styles.empty}>
+              {mode === 'bots'
+                ? t('settings.channels.botsEmpty')
+                : t('settings.channels.targetsEmpty')}
+            </p>
           )}
         </div>
         <button type="button" className={styles.addButton} onClick={startNew}>
           <PlusIcon />
-          {t('settings.channels.add')}
+          {mode === 'bots'
+            ? t('settings.channels.addBot')
+            : t('settings.channels.addTarget')}
         </button>
       </aside>
 
       <main className={styles.editor}>
         <div className={styles.editorHeader}>
           <div>
-            <p>{t('settings.channels.channel')}</p>
-            <h3>{configured ? form.id : t('settings.channels.newChannel')}</h3>
+            <p>
+              {mode === 'bots'
+                ? t('settings.channels.botAccount')
+                : t('settings.channels.target')}
+            </p>
+            <h3>
+              {mode === 'bots'
+                ? configured
+                  ? botForm.id
+                  : t('settings.channels.newBot')
+                : configured
+                  ? targetForm.id
+                  : t('settings.channels.newTarget')}
+            </h3>
           </div>
           <div className={styles.headerActions}>
-            {selected && (
-              <span className={styles.revision}>rev {selected.revision}</span>
+            {selectedRevision !== undefined && (
+              <span className={styles.revision}>rev {selectedRevision}</span>
             )}
-            {selected && (
+            {mode === 'targets' && selectedTarget && (
               <button
                 type="button"
                 className={styles.saveButton}
@@ -258,7 +457,11 @@ export function OutputChannelManager({
               className={styles.saveButton}
               onClick={() => void save()}
               disabled={
-                saving || loading || !authKey.trim() || (configured && !dirty)
+                saving ||
+                loading ||
+                !authKey.trim() ||
+                (configured && !dirty) ||
+                (mode === 'targets' && botAccounts.length === 0)
               }
             >
               {saving ? t('settings.saving') : t('settings.save')}
@@ -267,52 +470,108 @@ export function OutputChannelManager({
         </div>
 
         <div className={styles.body}>
-          {!configured && (
-            <label className={styles.field}>
-              <span>{t('settings.channels.id')}</span>
-              <input
-                value={form.id}
-                placeholder={t('settings.channels.idPlaceholder')}
-                onChange={(event) => update('id', event.target.value)}
-              />
-            </label>
-          )}
-
-          <section className={styles.section}>
-            <div className={styles.sectionHeader}>
-              <p className={styles.sectionTitle}>
-                {t('settings.channels.telegram')}
-              </p>
-              <p className={styles.sectionCopy}>
-                {t('settings.channels.telegramCopy')}
-              </p>
-            </div>
-            <label className={styles.field}>
-              <span>{t('settings.channels.botToken')}</span>
-              <input
-                type="password"
-                autoComplete="off"
-                value={form.botToken}
-                placeholder={t('settings.channels.secretPlaceholder')}
-                onChange={(event) => update('botToken', event.target.value)}
-              />
-              <small>{t('settings.channels.botTokenHint')}</small>
-            </label>
-            <label className={styles.field}>
-              <span>{t('settings.channels.chatId')}</span>
-              <input
-                value={form.chatId}
-                placeholder="-1001234567890"
-                onChange={(event) => update('chatId', event.target.value)}
-              />
-              <small>{t('settings.channels.chatIdHint')}</small>
-            </label>
-          </section>
-
-          {configured && dirty && selected?.bot_token_configured && (
-            <div className={styles.warning}>
-              {t('settings.channels.secretUpdateWarning')}
-            </div>
+          {mode === 'bots' ? (
+            <>
+              {!configured && (
+                <label className={styles.field}>
+                  <span>{t('settings.channels.botId')}</span>
+                  <input
+                    aria-label={t('settings.channels.botId')}
+                    value={botForm.id}
+                    placeholder={t('settings.channels.botIdPlaceholder')}
+                    onChange={(event) => updateBot('id', event.target.value)}
+                  />
+                </label>
+              )}
+              <section className={styles.section}>
+                <div className={styles.sectionHeader}>
+                  <p className={styles.sectionTitle}>
+                    {t('settings.channels.telegramBot')}
+                  </p>
+                  <p className={styles.sectionCopy}>
+                    {t('settings.channels.telegramBotCopy')}
+                  </p>
+                </div>
+                <label className={styles.field}>
+                  <span>{t('settings.channels.botToken')}</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={botForm.botToken}
+                    placeholder={t('settings.channels.secretPlaceholder')}
+                    onChange={(event) =>
+                      updateBot('botToken', event.target.value)
+                    }
+                  />
+                  <small>{t('settings.channels.botTokenHint')}</small>
+                </label>
+              </section>
+              {configured && dirty && selectedBot?.bot_token_configured && (
+                <div className={styles.warning}>
+                  {t('settings.channels.secretUpdateWarning')}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {!configured && (
+                <label className={styles.field}>
+                  <span>{t('settings.channels.targetId')}</span>
+                  <input
+                    aria-label={t('settings.channels.targetId')}
+                    value={targetForm.id}
+                    placeholder={t('settings.channels.targetIdPlaceholder')}
+                    onChange={(event) => updateTarget('id', event.target.value)}
+                  />
+                </label>
+              )}
+              <section className={styles.section}>
+                <div className={styles.sectionHeader}>
+                  <p className={styles.sectionTitle}>
+                    {t('settings.channels.telegramTarget')}
+                  </p>
+                  <p className={styles.sectionCopy}>
+                    {t('settings.channels.telegramTargetCopy')}
+                  </p>
+                </div>
+                {botAccounts.length === 0 ? (
+                  <div className={styles.warning}>
+                    {t('settings.channels.botRequiredHint')}
+                  </div>
+                ) : (
+                  <label className={styles.field}>
+                    <span>{t('settings.channels.botAccount')}</span>
+                    <select
+                      aria-label={t('settings.channels.botAccount')}
+                      value={targetForm.botAccountId}
+                      onChange={(event) =>
+                        updateTarget('botAccountId', event.target.value)
+                      }
+                    >
+                      {botAccounts.map((account) => (
+                        <option
+                          value={account.bot_account_id}
+                          key={account.bot_account_id}
+                        >
+                          {account.bot_account_id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <label className={styles.field}>
+                  <span>{t('settings.channels.chatId')}</span>
+                  <input
+                    value={targetForm.chatId}
+                    placeholder="-1001234567890"
+                    onChange={(event) =>
+                      updateTarget('chatId', event.target.value)
+                    }
+                  />
+                  <small>{t('settings.channels.chatIdHint')}</small>
+                </label>
+              </section>
+            </>
           )}
           {error && (
             <div className={styles.error} role="alert">
@@ -326,12 +585,26 @@ export function OutputChannelManager({
   );
 }
 
-function upsertChannel(
-  channels: PublicOutputChannel[],
+function upsertBotAccount(
+  accounts: PublicBotAccount[],
+  replacement: PublicBotAccount,
+): PublicBotAccount[] {
+  const next = accounts.filter(
+    (account) => account.bot_account_id !== replacement.bot_account_id,
+  );
+  next.push(replacement);
+  next.sort((left, right) =>
+    left.bot_account_id.localeCompare(right.bot_account_id),
+  );
+  return next;
+}
+
+function upsertTarget(
+  targets: PublicOutputChannel[],
   replacement: PublicOutputChannel,
 ): PublicOutputChannel[] {
-  const next = channels.filter(
-    (channel) => channel.output_channel_id !== replacement.output_channel_id,
+  const next = targets.filter(
+    (target) => target.output_channel_id !== replacement.output_channel_id,
   );
   next.push(replacement);
   next.sort((left, right) =>

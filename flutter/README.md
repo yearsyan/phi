@@ -18,15 +18,15 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
   `/compact`, user-invocable skills via the slash palette.
 - **Workspaces** — recent workspaces + a directory browser backed by
   `GET /v1/workspaces/browse`.
-- **Scheduled tasks** — list / create (daily or interval, with an optional
-  configured output channel) / enable / run now / delete, open the session
-  produced by the last run.
+- **Scheduled tasks** — list / create / edit (daily or interval, with an
+  optional configured recipient target) / enable / run now / delete, open the
+  session produced by the last run.
 - **Adaptive layout** — phone: stacked navigation; wide screens (macOS,
   Windows, tablets): sidebar + detail pane.
 
-Provider and output-channel configuration are intentionally not included
-(managed via the web client or the daemon's Provider / Output Channel APIs).
-The task editor can select an already configured Telegram channel.
+Provider, bot-account, and recipient-target configuration are intentionally not
+included (managed via the web client or the daemon's corresponding APIs). The
+task editor can select an already configured Telegram recipient target.
 
 ## Bundled font and licensing
 

@@ -278,12 +278,12 @@ let agent = Agent::builder(provider).builtin_tools(tools).build();
 
 `AgentBuilder::all_builtin_tools(cwd)` 是兼容的快捷方式：它同时绑定 session workspace
 并启用 `read`、`bash`、`edit`、`write` 四类能力；启用 Bash 时还会安装共享状态的
-`bash_task_output` 和 `bash_task_stop`。若 Builder 同时显式设置 `workspace`，所有
+`bash_task_stop`。若 Builder 同时显式设置 `workspace`，所有
 `BuiltinTools` 都会重定向到该 workspace，与调用顺序无关。各工具类型也可单独注册并
 配置，例如 `.tool(BashTool::new(cwd).shell("/bin/zsh").timeout(Duration::from_secs(90)))`。
 
 - `read`：只读取一个普通文件，不枚举目录；目录检查和文件发现应改用专用目录/搜索工具，或在 Bash 可用时执行 `ls`、`find`、`rg --files`。它流式读取普通 UTF-8 文本，支持 1-based `offset` 和 `limit`，大文件只扫描请求范围并返回继续读取提示；也能验证并返回 PNG/JPEG/GIF/WebP、PDF，以及按 cell 渲染 Jupyter notebook（包括受限的内嵌图片）。同一可见 tool result 对未变化文件的相同范围重复读取会返回轻量引用。FIFO、设备、伪装媒体和不支持的二进制文件会被拒绝。同时启用 Bash 时，它还能读取该工具返回的 harness-owned `output_file`，即使 capability 已限制为 `ReadOnly`/`WorkspaceEdit`。
-- `bash`：在配置目录中执行 shell 命令并合并 stdout/stderr；默认超时 120 秒，调用参数中的 `timeout` 可覆盖，`BashTool::timeout`、`set_timeout` 和 `without_timeout` 可修改默认值。输出默认保留尾部 2000 行或 50KB，完整输出文件最多 5 GiB。`run_in_background=true` 会立即返回 `task_id` 与从启动时就持续写入的 `output_file`；安装 Agent mailbox 的 host 会在终态收到 internal `<task_notification>`，模型应等待通知后用 `read` 读取文件，而不是轮询。`bash_task_output` 仅作为已弃用的兼容路径保留，支持默认阻塞、`block=false` 和最长 600 秒的 `timeout`；`bash_task_stop` 停止整个进程组。Agent/registry 释放时也会取消遗留任务并清理其输出文件。
+- `bash`：在配置目录中执行 shell 命令并合并 stdout/stderr；默认超时 120 秒，调用参数中的 `timeout` 可覆盖，`BashTool::timeout`、`set_timeout` 和 `without_timeout` 可修改默认值。输出默认保留尾部 2000 行或 50KB，完整输出文件最多 5 GiB。`run_in_background=true` 会立即返回 `task_id` 与从启动时就持续写入的 `output_file`；安装 Agent mailbox 的 host 会在终态收到 internal `<task_notification>`，模型应等待通知后用 `read` 读取文件，而不是轮询。未安装 mailbox 时任务仍会写入 `output_file`，但不会主动唤醒 Agent；host 必须自行安排后续 turn 或从外部观察文件。`bash_task_stop` 停止整个进程组。Agent/registry 释放时也会取消遗留任务并清理其输出文件。
 - `edit`：一个调用可提交多个基于原文件快照的精确替换，默认要求 `oldText` 唯一，也可逐项设置 `replaceAll`；各替换不能重叠。它限制输入文件大小，保留 UTF-8 BOM 和未编辑区域的 CRLF/LF/CR 混合换行，并返回紧凑 diff 与结构化修改统计。
 - `write`：创建或完全覆盖文件，并递归创建父目录。
 
@@ -454,6 +454,9 @@ let claude = AnthropicMessagesProvider::new("anthropic-key", "model-name")?;
 - Chat Completions：assistant `tool_calls` 与 `tool` role
 - Responses：typed `message`、`function_call`、`function_call_output` Items
 - Claude Messages：`tool_use` 与 `tool_result` content blocks，system message 转顶层 `system`
+
+`GenerationConfig.max_tokens` 未设置时，各 adapter 都不向请求体添加对应的输出 token
+上限字段；Anthropic Messages 不再隐式填入 `4096`。需要固定上限时应由调用方显式配置。
 
 Adapter 会把可显示的思考文本规范化到 assistant `Message.reasoning`，并通过
 `AssistantDelta::Reasoning` 实时发布；同时完整思考数据仍作为 opaque `ProviderState`
@@ -912,9 +915,11 @@ HTTP/WebSocket 接口：
   profile 独立递增。
 - `GET /v1/mcp-profiles`、`GET/PUT /v1/mcp-profiles/{mcp_profile_id}`：管理独立的
   stdio/Streamable HTTP MCP 连接；公开响应只返回 secret 是否已配置或其键名。
+- `GET /v1/bot-accounts`、`GET/PUT /v1/bot-accounts/{bot_account_id}`：管理可复用的
+  Telegram Bot 账号；公开响应只返回 token 是否已配置。
 - `GET /v1/output-channels`、`GET/PUT /v1/output-channels/{output_channel_id}`：
-  管理定时任务的输出频道；当前支持 Telegram，公开响应不回显 bot token。
-- `POST /v1/output-channels/{output_channel_id}/test`：向已配置的输出频道发送测试消息。
+  管理定时任务的收件目标；目标引用 Bot 账号并保存 chat ID，不复制 bot token。
+- `POST /v1/output-channels/{output_channel_id}/test`：向已配置的收件目标发送测试消息。
 - `GET /v1/sessions`：列出已经持久化的 session；同时返回向后兼容的有序
   `sessions` 和由 daemon 按工作区投影的 `workspaces` 树。
 - `GET /v1/sessions/{session_id}`：查询单个 session 的当前模型与状态。
@@ -923,8 +928,9 @@ HTTP/WebSocket 接口：
 - `POST /v1/sessions/{session_id}/fork`：从指定 public assistant 消息之后，或从其
   `before_tool_calls` 持久化检查点，克隆一个新的离线 session；运行中的工具阶段也可用。
 - `GET/POST /v1/scheduled-tasks`：列出或创建持久化的每日/间隔定时任务。
-- `GET/PATCH/DELETE /v1/scheduled-tasks/{task_id}`：查询、暂停/恢复或删除任务；
-  `POST .../{task_id}/run` 可立即执行一次。
+- `GET/PUT/PATCH/DELETE /v1/scheduled-tasks/{task_id}`：查询、完整编辑、暂停/恢复或
+  删除任务；`POST .../{task_id}/run` 可立即执行一次。PUT 与 PATCH 都支持 revision
+  乐观并发控制。
 - `GET /v1/workspaces/browse?path=...`：从 daemon 默认 workspace 或指定绝对路径浏览
   可读取子目录，供新 session 选择工作目录。
 - `POST /v1/auth/token`：使用长期 bearer key 换取 60 秒有效、单次使用的 WebSocket subprotocol token。
@@ -945,7 +951,8 @@ child 的流式过程可通过独立只读 WebSocket 观察。问题通过广播
 定时任务由 daemon 进程调度，每次执行都创建独立 session，并把任务名作为
 session 标题。同一任务不重叠执行；下一次计划在开始 Agent 前持久化，避免进程
 崩溃后自动重放可能已发生的外部副作用。任务可通过 `output_channel_id` 选择
-Telegram 输出频道；daemon 会发送开始和终态（成功、失败、停止或中断）通知。
+Telegram 收件目标；多个目标可以复用一个 Bot 账号并分别指向不同 chat ID。daemon
+会发送开始和终态（成功、失败、停止或中断）通知。
 通知发送失败只记录脱敏警告，不会改变任务结果。daemon 必须持续运行才能准时触发。
 
 首个 prompt 入队后，daemon 会异步生成并持久化 session 标题，再向所有 attach 客户端
@@ -1008,8 +1015,9 @@ NODE_EXTRA_CA_CERTS=../.phi/daemon/tls/localhost.crt \
 ```
 
 首次使用需在设置中保存 daemon 长期 key 和至少一个 Provider profile。设置页会分别列出
-Provider、Agent Profile、MCP Profile 和输出频道；输出频道当前支持 Telegram，可保存
-bot token、chat ID 并发送测试消息。MCP 支持 Streamable HTTP 与 stdio，Agent
+Provider、Agent Profile、MCP Profile 和 Telegram 通知；通知设置把 Bot 账号与
+收件目标分层管理，token 只在 Bot 账号中保存一次，目标选择账号与 chat ID，并可发送
+测试消息。MCP 支持 Streamable HTTP 与 stdio，Agent
 Profile 可关联多个 MCP。daemon 已保存的 API key、Telegram bot token、MCP
 bearer/header/environment secret 不会返回浏览器。已有本地配置时，页面会自动连接
 一个 prepared session；它仍然只有在首个 prompt 后才创建并持久化 session。
@@ -1026,7 +1034,9 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 会保留当前 workspace 并重建 `/new` 连接；session 激活后，列表中的 profile 只作为模型
 预设，通过 `set_model` 修改下一次用户请求使用的 model，并保留输入草稿。已激活 session
 继续使用创建时固定的 Provider adapter、base URL 和凭据，不会热替换连接或混用协议特有
-历史；如需切换完整 Provider 连接，应新建对话。输入 `/` 会显示 `/compact` 和当前 session 中允许
+历史；如需切换完整 Provider 连接，应新建对话。聊天页右上角还会列出
+`GET /v1/agent-profiles` 返回的 Agent Profile；它只能在首条消息发送前选择，并通过重建
+prepared `/new` 连接应用，session 激活后保持只读且不能切换。输入 `/` 会显示 `/compact` 和当前 session 中允许
 用户显式调用的 skills，skill 正文仍只在 daemon/library 展开后进入模型上下文。界面
 同时提供独立 Stop/Queue 操作、自动生成的会话标题、默认折叠的流式思考块、响应式会话
 导航和移动端布局。侧栏直接消费 daemon 返回的工作区树，并以默认展开的分支展示；
@@ -1038,8 +1048,15 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 工具结果带入新 session。分叉成功后直接切换到新 session。时间线尾部会额外保留 composer
 之外的安全区，避免最后一行操作贴住浮动输入框。
 侧栏的“定时任务”页面可创建每日（IANA 时区与工作日）或间隔调度，并展示
-运行中/已暂停分组、下次时间与最近结果；可暂停、恢复、立即运行、删除或打开最近
-执行产生的 session，并可选择一个已配置的 Telegram 输出频道接收开始和终态通知。
+运行中/已暂停分组、下次时间与最近结果；可编辑任务定义、暂停、恢复、立即运行、删除
+或打开最近执行产生的 session，并可选择一个已配置的 Telegram 收件目标接收开始和
+终态通知。终态通知包含本次执行的工具调用总数、按工具名汇总的次数，以及最后一条
+public assistant 文本；同时列出累计 token 总数、输入、输出、缓存输入和缓存率，其中
+缓存率按缓存输入 token 除以输入 token 计算。通知不会包含 reasoning、internal 消息或 provider replay state。
+通知标题为 `scheduled task started`/`scheduled task finished`，状态只显示 emoji，
+计划时间使用“年月日 时:分:秒”的 24 小时制格式；每日任务按其 IANA 时区显示，间隔
+任务按 daemon 本地时区显示。通知不显示 session ID，仍可从任务的 `last_run` 打开 session。
+内容超过 Telegram 单条消息的 4096 字符限制时会安全截断最终文本。
 任务可指定 Agent Profile，因此也会继承该 profile 引用的 MCP；
 定时运行不暴露 `askuser`，也没有交互审批；MCP 工具需要 `full_access` 才会可用。
 
@@ -1047,8 +1064,9 @@ Provider 列表来自 `GET /v1/providers`。prepared 对话发送首个 prompt �
 
 `flutter/` 提供与 Web 客户端并列的 Flutter 应用，复用 daemon 的 REST、单次 WS token、
 prepared session、attach/resync 和 sequence gap 语义。应用包含 session/chat、workspace、
-scheduled task（含输出频道选择）、askuser、工具权限审批、模型与 capability 控制，当前平台工程覆盖 Android、iOS、macOS、
-Windows 与 HarmonyOS/OpenHarmony。Provider 与输出频道配置仍由 Web 客户端或 HTTP API 管理。
+scheduled task（含创建、编辑与收件目标选择）、askuser、工具权限审批、模型与 capability 控制，当前平台工程覆盖 Android、iOS、macOS、
+Windows 与 HarmonyOS/OpenHarmony。Provider、Bot 账号与收件目标配置仍由 Web
+客户端或 HTTP API 管理。
 应用随包提供未裁剪的 Noto Sans SC 可变字体，以统一各平台的中英文界面字形和
 100–900 字重；字体按 SIL Open Font License 1.1 再分发，并可从 Settings → About →
 Open-source licenses 查看完整许可证。

@@ -8,7 +8,7 @@ import '../../state/session_controller.dart';
 import '../widgets/workspace_picker.dart';
 import 'chat_page.dart';
 
-/// Scheduled-task CRUD: list, create, enable/disable, run now, delete.
+/// Scheduled-task CRUD: list, create, edit, enable/disable, run now, delete.
 class ScheduledTasksPage extends StatefulWidget {
   const ScheduledTasksPage({
     super.key,
@@ -148,7 +148,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _showCreateDialog(),
+        onPressed: () => _showTaskDialog(),
         icon: const Icon(Icons.add),
         label: Text(S.of(context).newTask),
       ),
@@ -210,6 +210,8 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
                 PopupMenuButton<String>(
                   onSelected: (value) {
                     switch (value) {
+                      case 'edit':
+                        _showTaskDialog(task);
                       case 'run':
                         _runNow(task);
                       case 'delete':
@@ -220,6 +222,10 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
                     }
                   },
                   itemBuilder: (context) => [
+                    PopupMenuItem(
+                      value: 'edit',
+                      child: Text(S.of(context).editTask),
+                    ),
                     PopupMenuItem(
                       value: 'run',
                       child: Text(S.of(context).runNow),
@@ -319,46 +325,41 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
     return '${local.month}/${local.day} ${two(local.hour)}:${two(local.minute)}';
   }
 
-  Future<void> _showCreateDialog() async {
-    final created = await showDialog<bool>(
+  Future<void> _showTaskDialog([ScheduledTask? task]) async {
+    final saved = await showDialog<bool>(
       context: context,
-      builder: (context) => _CreateTaskDialog(app: _app),
+      builder: (context) => _TaskEditorDialog(app: _app, task: task),
     );
-    if (created == true) _load();
+    if (saved == true) _load();
   }
 }
 
 /* ------------------------------------------------------------------------- */
-/* Create-task dialog                                                        */
+/* Task editor dialog                                                        */
 /* ------------------------------------------------------------------------- */
 
-class _CreateTaskDialog extends StatefulWidget {
-  const _CreateTaskDialog({required this.app});
+class _TaskEditorDialog extends StatefulWidget {
+  const _TaskEditorDialog({required this.app, this.task});
 
   final AppState app;
+  final ScheduledTask? task;
 
   @override
-  State<_CreateTaskDialog> createState() => _CreateTaskDialogState();
+  State<_TaskEditorDialog> createState() => _TaskEditorDialogState();
 }
 
-class _CreateTaskDialogState extends State<_CreateTaskDialog> {
-  final _name = TextEditingController();
-  final _prompt = TextEditingController();
-  final _timezone = TextEditingController(text: 'UTC');
-  final _every = TextEditingController(text: '1');
-  String? _workspace;
-  String _kind = 'interval';
-  String _unit = 'hours';
+class _TaskEditorDialogState extends State<_TaskEditorDialog> {
+  late final TextEditingController _name;
+  late final TextEditingController _prompt;
+  late final TextEditingController _timezone;
+  late final TextEditingController _every;
+  late String? _workspace;
+  late String _kind;
+  late String _unit;
   List<PublicOutputChannel> _outputChannels = const [];
-  String _outputChannelId = '';
-  TimeOfDay _time = const TimeOfDay(hour: 9, minute: 0);
-  final Set<String> _weekdays = {
-    'monday',
-    'tuesday',
-    'wednesday',
-    'thursday',
-    'friday',
-  };
+  late String _outputChannelId;
+  late TimeOfDay _time;
+  late Set<String> _weekdays;
   bool _submitting = false;
   bool _loadingOutputChannels = true;
   String? _error;
@@ -373,9 +374,39 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
     'sunday',
   ];
 
+  static TimeOfDay? _parseTime(String? value) {
+    final parts = value?.split(':');
+    if (parts == null || parts.length != 2) return null;
+    final hour = int.tryParse(parts[0]);
+    final minute = int.tryParse(parts[1]);
+    if (hour == null ||
+        minute == null ||
+        hour < 0 ||
+        hour > 23 ||
+        minute < 0 ||
+        minute > 59) {
+      return null;
+    }
+    return TimeOfDay(hour: hour, minute: minute);
+  }
+
   @override
   void initState() {
     super.initState();
+    final task = widget.task;
+    final schedule = task?.schedule;
+    _name = TextEditingController(text: task?.name ?? '');
+    _prompt = TextEditingController(text: task?.prompt ?? '');
+    _workspace = task?.workspace;
+    _kind = schedule?.type ?? 'interval';
+    _unit = schedule?.unit ?? 'hours';
+    _outputChannelId = task?.outputChannelId ?? '';
+    _time = _parseTime(schedule?.time) ?? const TimeOfDay(hour: 9, minute: 0);
+    _timezone = TextEditingController(text: schedule?.timezone ?? 'UTC');
+    _every = TextEditingController(text: (schedule?.every ?? 1).toString());
+    _weekdays = schedule?.type == 'daily'
+        ? schedule!.weekdays.toSet()
+        : {'monday', 'tuesday', 'wednesday', 'thursday', 'friday'};
     _loadOutputChannels();
   }
 
@@ -437,15 +468,34 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
               every: int.tryParse(_every.text.trim()) ?? 1,
               unit: _unit,
             );
-      await widget.app.client.createScheduledTask(
-        name: _name.text.trim(),
-        prompt: _prompt.text.trim(),
-        workspace: _workspace,
-        outputChannelId: _outputChannelId.isEmpty ? null : _outputChannelId,
-        schedule: schedule,
-      );
+      final task = widget.task;
+      if (task == null) {
+        await widget.app.client.createScheduledTask(
+          name: _name.text.trim(),
+          prompt: _prompt.text.trim(),
+          workspace: _workspace,
+          outputChannelId: _outputChannelId.isEmpty ? null : _outputChannelId,
+          schedule: schedule,
+        );
+      } else {
+        final workspace =
+            _workspace ?? (await widget.app.client.browseWorkspace()).path;
+        await widget.app.client.replaceScheduledTask(
+          taskId: task.taskId,
+          name: _name.text.trim(),
+          prompt: _prompt.text.trim(),
+          workspace: workspace,
+          profileId: task.profileId ?? 'default',
+          agentProfileId: task.agentProfileId ?? 'default',
+          capabilityMode: task.capabilityMode,
+          outputChannelId: _outputChannelId.isEmpty ? null : _outputChannelId,
+          schedule: schedule,
+          expectedRevision: task.revision,
+        );
+      }
       if (mounted) Navigator.of(context).pop(true);
     } catch (error) {
+      if (!mounted) return;
       setState(() {
         _submitting = false;
         _error = '$error';
@@ -455,8 +505,13 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final editing = widget.task != null;
+    final outputChannelIds = {
+      if (_outputChannelId.isNotEmpty) _outputChannelId,
+      ..._outputChannels.map((channel) => channel.outputChannelId),
+    };
     return AlertDialog(
-      title: Text(S.of(context).newTask),
+      title: Text(editing ? S.of(context).editTask : S.of(context).newTask),
       content: SizedBox(
         width: 460,
         child: SingleChildScrollView(
@@ -521,11 +576,11 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
                     value: '',
                     child: Text(S.of(context).noOutputChannel),
                   ),
-                  for (final channel in _outputChannels)
+                  for (final outputChannelId in outputChannelIds)
                     DropdownMenuItem(
-                      value: channel.outputChannelId,
+                      value: outputChannelId,
                       child: Text(
-                        '${channel.outputChannelId} · Telegram',
+                        '$outputChannelId · Telegram',
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
@@ -667,7 +722,7 @@ class _CreateTaskDialogState extends State<_CreateTaskDialog> {
                   height: 16,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : Text(S.of(context).create),
+              : Text(editing ? S.of(context).save : S.of(context).create),
         ),
       ],
     );

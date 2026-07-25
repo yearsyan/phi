@@ -162,7 +162,7 @@ impl BashTool {
         let notification_note = if completion_notification {
             "You will receive a task_notification when it finishes. Do not poll; use read on output_file after that notification."
         } else {
-            "This host has no automatic completion mailbox. Use the deprecated bash_task_output compatibility tool if you must wait for completion."
+            "This host has no automatic completion mailbox. The task will keep writing output_file, but it will not wake the Agent when it finishes."
         };
         Ok(ToolOutput::success(format!(
             "Background command running with task ID: {}\nOutput is being written to: {}\n{notification_note}\nUse bash_task_stop to stop it.",
@@ -367,7 +367,7 @@ impl Tool for BashTool {
         ToolDefinition::new(
             "bash",
             format!(
-                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. The optional timeout is measured in seconds and overrides the configured default{}. Set run_in_background=true only when the result is not needed immediately. A background call returns task_id and output_file immediately; when the Agent host supports notifications, wait for task_notification instead of polling, then use read on output_file. Use bash_task_stop to stop it. bash_task_output is a deprecated compatibility fallback.",
+                "Execute a shell command in the configured working directory. Returns combined stdout and stderr, truncated to the last {} lines or {} bytes. Truncated full output is saved to a temporary file. The optional timeout is measured in seconds and overrides the configured default{}. Set run_in_background=true only when the result is not needed immediately. A background call returns task_id and output_file immediately; when the Agent host supports notifications, wait for task_notification instead of polling, then use read on output_file. Use bash_task_stop to stop it.",
                 self.max_lines,
                 self.max_bytes,
                 self.default_timeout.map_or_else(
@@ -1113,7 +1113,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::tool::builtins::bash_task::{BashTaskOutputTool, BashTaskStopTool};
+    use crate::tool::builtins::bash_task::{
+        BashTaskRegistry, BashTaskSnapshot, BashTaskStatus, BashTaskStopTool,
+    };
     use crate::types::Content;
 
     #[test]
@@ -1178,23 +1180,15 @@ mod tests {
             .to_owned()
     }
 
-    fn task_output_text(output: &ToolOutput) -> &str {
-        output
-            .content
-            .split_once("<output>\n")
-            .and_then(|(_, output)| output.rsplit_once("\n</output>"))
-            .map(|(output, _)| output)
-            .unwrap_or_default()
+    fn task_output_text(snapshot: &BashTaskSnapshot) -> &str {
+        &snapshot.output
     }
 
-    async fn wait_for_terminal(output_tool: &BashTaskOutputTool, task_id: &str) -> ToolOutput {
+    async fn wait_for_terminal(registry: &BashTaskRegistry, task_id: &str) -> BashTaskSnapshot {
         for _ in 0..100 {
-            let output = output_tool
-                .execute(json!({ "task_id": task_id, "timeout": 2_000 }))
-                .await
-                .unwrap();
-            if output.metadata.as_ref().unwrap()["status"] != "running" {
-                return output;
+            let snapshot = registry.snapshot(task_id).unwrap();
+            if snapshot.status.is_terminal() {
+                return snapshot;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1339,7 +1333,6 @@ mod tests {
     async fn background_task_returns_immediately_and_exposes_live_then_final_output() {
         let directory = tempdir().unwrap();
         let tool = BashTool::new(directory.path()).without_timeout();
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
         let started = std::time::Instant::now();
         let started_output = tool
@@ -1354,30 +1347,16 @@ mod tests {
 
         let mut saw_live_output = false;
         for _ in 0..50 {
-            let output = output_tool
-                .execute(json!({ "task_id": task_id, "block": false }))
-                .await
-                .unwrap();
-            saw_live_output |= output.content.contains("started");
-            if output.metadata.as_ref().unwrap()["status"] != "running" {
-                assert_eq!(output.metadata.as_ref().unwrap()["status"], "completed");
-                assert!(
-                    output
-                        .content
-                        .contains("<retrieval_status>success</retrieval_status>")
-                );
-                assert!(output.content.contains("<status>completed</status>"));
-                assert!(output.content.contains("started"));
-                assert!(output.content.contains("finished"));
+            let snapshot = tool.task_registry.snapshot(&task_id).unwrap();
+            saw_live_output |= snapshot.output.contains("started");
+            if snapshot.status.is_terminal() {
+                assert_eq!(snapshot.status, BashTaskStatus::Completed);
+                assert!(snapshot.output.contains("started"));
+                assert!(snapshot.output.contains("finished"));
                 assert!(saw_live_output);
                 return;
             }
-            assert!(
-                output
-                    .content
-                    .contains("<retrieval_status>not_ready</retrieval_status>")
-            );
-            assert!(output.content.contains("<status>running</status>"));
+            assert_eq!(snapshot.status, BashTaskStatus::Running);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -1469,7 +1448,6 @@ mod tests {
     async fn background_task_reports_failed_exit_with_output() {
         let directory = tempdir().unwrap();
         let tool = BashTool::new(directory.path()).without_timeout();
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let started_output = tool
             .execute(json!({
                 "command": "printf failure; exit 7",
@@ -1479,18 +1457,17 @@ mod tests {
             .unwrap();
         let task_id = task_id(&started_output);
 
-        let output = wait_for_terminal(&output_tool, &task_id).await;
-        assert_eq!(output.metadata.as_ref().unwrap()["status"], "failed");
-        assert_eq!(output.metadata.as_ref().unwrap()["exit_code"], 7);
-        assert!(output.content.contains("failure"));
-        assert!(output.content.contains("exited with code 7"));
+        let snapshot = wait_for_terminal(&tool.task_registry, &task_id).await;
+        assert_eq!(snapshot.status, BashTaskStatus::Failed);
+        assert_eq!(snapshot.exit_code, Some(7));
+        assert!(snapshot.output.contains("failure"));
+        assert!(snapshot.output.contains("exited with code 7"));
     }
 
     #[tokio::test]
     async fn background_task_preserves_timeout_and_reports_it_structurally() {
         let directory = tempdir().unwrap();
         let tool = BashTool::new(directory.path()).without_timeout();
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let started_output = tool
             .execute(json!({
                 "command": "sleep 30",
@@ -1501,17 +1478,16 @@ mod tests {
             .unwrap();
         let task_id = task_id(&started_output);
 
-        let output = wait_for_terminal(&output_tool, &task_id).await;
-        assert_eq!(output.metadata.as_ref().unwrap()["status"], "failed");
-        assert_eq!(output.metadata.as_ref().unwrap()["timed_out"], true);
-        assert!(output.content.contains("timed out"));
+        let snapshot = wait_for_terminal(&tool.task_registry, &task_id).await;
+        assert_eq!(snapshot.status, BashTaskStatus::Failed);
+        assert!(snapshot.timed_out);
+        assert!(snapshot.output.contains("timed out"));
     }
 
     #[tokio::test]
     async fn stopping_background_task_is_idempotent() {
         let directory = tempdir().unwrap();
         let tool = BashTool::new(directory.path()).without_timeout();
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
         let started_output = tool
             .execute(json!({
@@ -1523,11 +1499,8 @@ mod tests {
         let task_id = task_id(&started_output);
         let mut saw_ready = false;
         for _ in 0..50 {
-            let output = output_tool
-                .execute(json!({ "task_id": task_id, "block": false }))
-                .await
-                .unwrap();
-            if task_output_text(&output).contains("ready") {
+            let snapshot = tool.task_registry.snapshot(&task_id).unwrap();
+            if task_output_text(&snapshot).contains("ready") {
                 saw_ready = true;
                 break;
             }
@@ -1561,7 +1534,6 @@ mod tests {
         let tool = BashTool::new(directory.path())
             .without_timeout()
             .output_limits(2, 1_024);
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let started_output = tool
             .execute(json!({
                 "command": "printf 'one\\ntwo\\nthree\\n'",
@@ -1570,15 +1542,13 @@ mod tests {
             .await
             .unwrap();
         let task_id = task_id(&started_output);
-        let output = wait_for_terminal(&output_tool, &task_id).await;
+        let snapshot = wait_for_terminal(&tool.task_registry, &task_id).await;
 
-        assert_eq!(output.metadata.as_ref().unwrap()["exit_code"], 0);
-        assert!(task_output_text(&output).starts_with("two\nthree"));
-        let path = output.metadata.as_ref().unwrap()["output_file"]
-            .as_str()
-            .unwrap();
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert!(task_output_text(&snapshot).starts_with("two\nthree"));
+        let path = snapshot.output_path;
         assert_eq!(
-            tokio::fs::read_to_string(path).await.unwrap(),
+            tokio::fs::read_to_string(&path).await.unwrap(),
             "one\ntwo\nthree\n"
         );
         tokio::fs::remove_file(path).await.unwrap();
@@ -1589,7 +1559,6 @@ mod tests {
     async fn stopping_background_task_terminates_descendant_process_group() {
         let directory = tempdir().unwrap();
         let tool = BashTool::new(directory.path()).without_timeout();
-        let output_tool = BashTaskOutputTool::new(tool.task_registry.clone());
         let stop_tool = BashTaskStopTool::new(tool.task_registry.clone());
         let started_output = tool
             .execute(json!({
@@ -1602,11 +1571,8 @@ mod tests {
 
         let mut child_pid = None;
         for _ in 0..100 {
-            let output = output_tool
-                .execute(json!({ "task_id": task_id, "block": false }))
-                .await
-                .unwrap();
-            if let Ok(pid) = task_output_text(&output)
+            let snapshot = tool.task_registry.snapshot(&task_id).unwrap();
+            if let Ok(pid) = task_output_text(&snapshot)
                 .lines()
                 .next()
                 .unwrap_or_default()

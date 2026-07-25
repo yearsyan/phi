@@ -34,7 +34,7 @@ use crate::{
     store::{
         DiskAgentProfileStore, DiskControlStore, DiskMcpProfileStore, DiskOutputChannelStore,
         DiskProviderStore, DiskScheduledTaskStore, McpProfileStore, OutputChannelStore,
-        ProviderStore, ScheduledTaskStore,
+        OutputChannelStoreError, ProviderStore, ScheduledTaskStore,
     },
 };
 
@@ -59,9 +59,11 @@ pub async fn run(config: DaemonConfig) -> Result<(), DaemonError> {
         None => None,
     };
     let service = Arc::new(application_service(&config, provider_http_client.clone()));
-    let output_channel_store: Arc<dyn OutputChannelStore> = Arc::new(DiskOutputChannelStore::new(
+    let disk_output_channel_store = Arc::new(DiskOutputChannelStore::new(
         config.data_dir().join(OUTPUT_CHANNEL_CONFIG_FILE),
     ));
+    disk_output_channel_store.migrate_legacy().await?;
+    let output_channel_store: Arc<dyn OutputChannelStore> = disk_output_channel_store;
     let output_channels = Arc::new(OutputChannelManager::new(
         output_channel_store,
         Arc::new(TelegramOutputChannelSender::new(provider_http_client)),
@@ -381,6 +383,9 @@ pub enum DaemonError {
 
     #[error(transparent)]
     ScheduledTask(#[from] ScheduledTaskError),
+
+    #[error(transparent)]
+    OutputChannelStore(#[from] OutputChannelStoreError),
 
     #[error("could not bind daemon to {address}: {source}")]
     Bind {

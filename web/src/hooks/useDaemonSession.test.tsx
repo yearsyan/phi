@@ -175,6 +175,7 @@ describe('useDaemonSession', () => {
     });
     expect(socket.send).toHaveBeenCalledTimes(2);
     expect(result.current.state.pendingPrompts).toHaveLength(2);
+    expect(result.current.canReconfigurePreparedSession).toBe(false);
 
     act(() => {
       handlers?.onClose(
@@ -185,6 +186,7 @@ describe('useDaemonSession', () => {
     // never resend it automatically.
     expect(result.current.connectionPhase).toBe('error');
     expect(result.current.state.pendingPrompts).toHaveLength(0);
+    expect(result.current.canReconfigurePreparedSession).toBe(false);
 
     act(() => {
       expect(result.current.sendPrompt('must not be displayed')).toBe(false);

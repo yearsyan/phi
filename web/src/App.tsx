@@ -8,7 +8,7 @@ import {
   writeCapabilityMode,
   writeProfileId,
 } from './api/config.ts';
-import { forkSession, listProviders } from './api/http.ts';
+import { forkSession, listAgentProfiles, listProviders } from './api/http.ts';
 import { Chat } from './components/Chat/Chat.tsx';
 import { ScheduledTasksPage } from './components/ScheduledTasks/ScheduledTasksPage.tsx';
 import { SettingsModal } from './components/Settings/SettingsModal.tsx';
@@ -25,6 +25,7 @@ import { readLocale, type Theme, writeLocale } from './prefs.ts';
 import type {
   CapabilityMode,
   ForkPosition,
+  PublicAgentProfile,
   PublicProviderConfig,
 } from './types/wire.ts';
 
@@ -83,7 +84,8 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
   const [providerProfiles, setProviderProfiles] = useState<
     PublicProviderConfig[]
   >([]);
-  const providerAuthKey = config.authKey.trim();
+  const [agentProfiles, setAgentProfiles] = useState<PublicAgentProfile[]>([]);
+  const daemonAuthKey = config.authKey.trim();
 
   useEffect(() => {
     if (!isConfigured(config)) setSettingsOpen(true);
@@ -91,11 +93,11 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
 
   useEffect(() => {
     let cancelled = false;
-    if (!providerAuthKey) {
+    if (!daemonAuthKey) {
       setProviderProfiles([]);
       return;
     }
-    void listProviders(providerAuthKey)
+    void listProviders(daemonAuthKey)
       .then((response) => {
         if (!cancelled) setProviderProfiles(response.providers);
       })
@@ -105,7 +107,26 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
     return () => {
       cancelled = true;
     };
-  }, [providerAuthKey]);
+  }, [daemonAuthKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!daemonAuthKey) {
+      setAgentProfiles([]);
+      return;
+    }
+    if (settingsOpen) return;
+    void listAgentProfiles(daemonAuthKey)
+      .then((response) => {
+        if (!cancelled) setAgentProfiles(response.agent_profiles);
+      })
+      .catch(() => {
+        if (!cancelled) setAgentProfiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [daemonAuthKey, settingsOpen]);
 
   const target = useMemo(
     () =>
@@ -350,9 +371,12 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
             authKey={config.authKey}
             profileId={config.profileId}
             providerProfiles={providerProfiles}
+            agentProfileId={config.agentProfileId}
+            agentProfiles={agentProfiles}
             conversationKey={conversationKey}
             onFork={handleFork}
             onSelectProvider={handleSelectProvider}
+            onSelectAgentProfile={handleSaveAgentProfileId}
             onSelectWorkspace={handleSelectWorkspace}
             onOpenSidebar={() => setSidebarOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}

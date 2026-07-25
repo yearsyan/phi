@@ -246,6 +246,10 @@ impl ApiError {
                 "output_channel_not_found",
                 error.to_string(),
             ),
+            OutputChannelError::BotAccountNotFound { .. }
+            | OutputChannelError::Store(OutputChannelStoreError::BotAccountNotFound { .. }) => {
+                Self::bad_request("bot_account_not_found", error.to_string())
+            }
             OutputChannelError::Store(OutputChannelStoreError::Validation(_)) => {
                 Self::bad_request("invalid_output_channel", error.to_string())
             }
@@ -258,6 +262,29 @@ impl ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "output channel storage failed",
+            ),
+        }
+    }
+
+    fn bot_account(error: OutputChannelError) -> Self {
+        match error {
+            OutputChannelError::BotAccountNotFound { .. } => Self::new(
+                StatusCode::NOT_FOUND,
+                "bot_account_not_found",
+                error.to_string(),
+            ),
+            OutputChannelError::Store(OutputChannelStoreError::Validation(_)) => {
+                Self::bad_request("invalid_bot_account", error.to_string())
+            }
+            OutputChannelError::Store(_) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "bot account storage failed",
+            ),
+            OutputChannelError::NotFound { .. } | OutputChannelError::Delivery(_) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "unexpected bot account operation failed",
             ),
         }
     }

@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '../../i18n/I18nProvider.tsx';
 import type {
   PublicAgentProfile,
+  PublicBotAccount,
   PublicMcpProfile,
   PublicOutputChannel,
   PublicProviderConfig,
@@ -19,10 +20,12 @@ import { SettingsModal } from './SettingsModal.tsx';
 
 const apiMocks = vi.hoisted(() => ({
   listAgentProfiles: vi.fn(),
+  listBotAccounts: vi.fn(),
   listMcpProfiles: vi.fn(),
   listOutputChannels: vi.fn(),
   listProviders: vi.fn(),
   putAgentProfile: vi.fn(),
+  putBotAccount: vi.fn(),
   putMcpProfile: vi.fn(),
   putOutputChannel: vi.fn(),
   putProvider: vi.fn(),
@@ -95,9 +98,11 @@ describe('SettingsModal', () => {
     apiMocks.listMcpProfiles.mockResolvedValue({
       mcp_profiles: [remoteMcpProfile],
     });
+    apiMocks.listBotAccounts.mockResolvedValue({ bot_accounts: [] });
     apiMocks.listOutputChannels.mockResolvedValue({ output_channels: [] });
     apiMocks.putProvider.mockReset();
     apiMocks.putAgentProfile.mockReset();
+    apiMocks.putBotAccount.mockReset();
     apiMocks.putMcpProfile.mockReset();
     apiMocks.putOutputChannel.mockReset();
     apiMocks.testOutputChannel.mockReset();
@@ -506,17 +511,28 @@ describe('SettingsModal', () => {
     });
   });
 
-  it('configures and tests a Telegram output channel', async () => {
-    const created: PublicOutputChannel = {
+  it('configures a Telegram bot account and recipient target, then tests delivery', async () => {
+    const createdBot: PublicBotAccount = {
+      type: 'telegram',
+      bot_account_id: 'primary',
+      revision: 1,
+      bot_token_configured: true,
+    };
+    const createdTarget: PublicOutputChannel = {
       type: 'telegram',
       output_channel_id: 'alerts',
       revision: 1,
+      bot_account_id: 'primary',
       bot_token_configured: true,
       chat_id: '-1001234567890',
     };
+    apiMocks.putBotAccount.mockResolvedValue({
+      configured: true,
+      bot_account: createdBot,
+    });
     apiMocks.putOutputChannel.mockResolvedValue({
       configured: true,
-      output_channel: created,
+      output_channel: createdTarget,
     });
     apiMocks.testOutputChannel.mockResolvedValue(undefined);
     render(
@@ -537,15 +553,33 @@ describe('SettingsModal', () => {
       </I18nProvider>,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Output channels' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Telegram delivery' }));
     await waitFor(() => {
+      expect(apiMocks.listBotAccounts).toHaveBeenCalledWith('daemon-key');
       expect(apiMocks.listOutputChannels).toHaveBeenCalledWith('daemon-key');
     });
-    fireEvent.change(screen.getByLabelText('Output channel id'), {
-      target: { value: 'alerts' },
+    fireEvent.change(screen.getByLabelText('Bot account id'), {
+      target: { value: 'primary' },
     });
     fireEvent.change(screen.getByLabelText(/Bot token/), {
       target: { value: '123456789:test_bot_token_with_enough_chars' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(apiMocks.putBotAccount).toHaveBeenCalledWith(
+        'daemon-key',
+        'primary',
+        {
+          type: 'telegram',
+          bot_token: '123456789:test_bot_token_with_enough_chars',
+        },
+      );
+    });
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Recipients' }));
+    fireEvent.change(screen.getByLabelText('Recipient target id'), {
+      target: { value: 'alerts' },
     });
     fireEvent.change(screen.getByLabelText(/Chat id/), {
       target: { value: '-1001234567890' },
@@ -558,7 +592,7 @@ describe('SettingsModal', () => {
         'alerts',
         {
           type: 'telegram',
-          bot_token: '123456789:test_bot_token_with_enough_chars',
+          bot_account_id: 'primary',
           chat_id: '-1001234567890',
         },
       );

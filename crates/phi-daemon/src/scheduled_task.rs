@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt,
     panic::AssertUnwindSafe,
     sync::{
@@ -10,11 +10,14 @@ use std::{
 };
 
 use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, LocalResult, NaiveTime, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveTime, TimeZone, Utc,
+    Weekday,
 };
 use chrono_tz::Tz;
 use futures_util::{FutureExt, StreamExt, stream};
-use phi::{CapabilityMode, Content, Workspace};
+use phi::{
+    CapabilityMode, Content, ContentPart, Message, MessageVisibility, Role, TokenUsage, Workspace,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -24,7 +27,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    output_channel::{OutputChannelManager, validate_output_channel_id},
+    output_channel::{
+        MAX_TELEGRAM_MESSAGE_CHARS, OutputChannelManager, validate_output_channel_id,
+    },
     runtime::{RunId, RuntimeEventKind, SessionId},
     service::{ApplicationService, ServiceError},
     store::{ScheduledTaskStore, ScheduledTaskStoreError},
@@ -35,6 +40,8 @@ const MAX_CONCURRENT_RUNS: usize = 8;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_PROMPT_CHARS: usize = 20_000;
 const MAX_INTERVAL_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
+const MAX_REPORTED_TOOL_NAMES: usize = 20;
+const MAX_REPORTED_TOOL_NAME_CHARS: usize = 80;
 const SCHEDULER_TICK: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -207,6 +214,19 @@ pub struct UpdateScheduledTask {
     pub expected_revision: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReplaceScheduledTask {
+    pub name: String,
+    pub prompt: String,
+    pub workspace: Workspace,
+    pub profile_id: String,
+    pub agent_profile_id: String,
+    pub capability_mode: Option<CapabilityMode>,
+    pub output_channel_id: Option<String>,
+    pub schedule: ScheduledTaskSchedule,
+    pub expected_revision: u64,
+}
+
 #[derive(Default)]
 struct CoordinatorState {
     running: HashSet<ScheduledTaskId>,
@@ -329,42 +349,7 @@ impl ScheduledTaskManager {
     ) -> Result<ScheduledTask, ScheduledTaskError> {
         self.ensure_open()?;
         let request = normalize_create(request)?;
-        if self
-            .service
-            .provider_config_for(&request.profile_id)
-            .await?
-            .is_none()
-        {
-            return Err(ScheduledTaskError::ProviderNotFound {
-                profile_id: request.profile_id,
-            });
-        }
-        if self
-            .service
-            .agent_profile(&request.agent_profile_id)
-            .await?
-            .is_none()
-        {
-            return Err(ScheduledTaskError::AgentProfileNotFound {
-                agent_profile_id: request.agent_profile_id,
-            });
-        }
-        if let Some(output_channel_id) = &request.output_channel_id {
-            let output_channels = self
-                .output_channels
-                .as_ref()
-                .ok_or(ScheduledTaskError::OutputChannelManagementUnavailable)?;
-            if output_channels
-                .get_channel(output_channel_id)
-                .await
-                .map_err(ScheduledTaskError::OutputChannel)?
-                .is_none()
-            {
-                return Err(ScheduledTaskError::OutputChannelNotFound {
-                    output_channel_id: output_channel_id.clone(),
-                });
-            }
-        }
+        self.validate_definition_references(&request).await?;
 
         let _coordinator = self.coordinator.lock().await;
         if self.store.list_tasks().await?.len() >= MAX_SCHEDULED_TASKS {
@@ -395,6 +380,49 @@ impl ScheduledTaskManager {
         drop(_coordinator);
         self.wake.notify_one();
         Ok(task)
+    }
+
+    async fn validate_definition_references(
+        &self,
+        request: &CreateScheduledTask,
+    ) -> Result<(), ScheduledTaskError> {
+        if self
+            .service
+            .provider_config_for(&request.profile_id)
+            .await?
+            .is_none()
+        {
+            return Err(ScheduledTaskError::ProviderNotFound {
+                profile_id: request.profile_id.clone(),
+            });
+        }
+        if self
+            .service
+            .agent_profile(&request.agent_profile_id)
+            .await?
+            .is_none()
+        {
+            return Err(ScheduledTaskError::AgentProfileNotFound {
+                agent_profile_id: request.agent_profile_id.clone(),
+            });
+        }
+        if let Some(output_channel_id) = &request.output_channel_id {
+            let output_channels = self
+                .output_channels
+                .as_ref()
+                .ok_or(ScheduledTaskError::OutputChannelManagementUnavailable)?;
+            if output_channels
+                .get_channel(output_channel_id)
+                .await
+                .map_err(ScheduledTaskError::OutputChannel)?
+                .is_none()
+            {
+                return Err(ScheduledTaskError::OutputChannelNotFound {
+                    output_channel_id: output_channel_id.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<ScheduledTask>, ScheduledTaskError> {
@@ -454,6 +482,77 @@ impl ScheduledTaskManager {
                 .ok_or(ScheduledTaskError::RevisionExhausted { task_id })?;
             self.store.update_task(task.clone()).await?;
         }
+        drop(_coordinator);
+        self.wake.notify_one();
+        Ok(task)
+    }
+
+    pub async fn replace_task(
+        &self,
+        task_id: ScheduledTaskId,
+        replacement: ReplaceScheduledTask,
+    ) -> Result<ScheduledTask, ScheduledTaskError> {
+        self.ensure_open()?;
+        let expected_revision = replacement.expected_revision;
+        let replacement = normalize_create(CreateScheduledTask {
+            name: replacement.name,
+            prompt: replacement.prompt,
+            workspace: replacement.workspace,
+            profile_id: replacement.profile_id,
+            agent_profile_id: replacement.agent_profile_id,
+            capability_mode: replacement.capability_mode,
+            output_channel_id: replacement.output_channel_id,
+            schedule: replacement.schedule,
+        })?;
+
+        let _coordinator = self.coordinator.lock().await;
+        let mut task = self
+            .store
+            .get_task(task_id)
+            .await?
+            .ok_or(ScheduledTaskError::NotFound { task_id })?;
+        if task.revision != expected_revision {
+            return Err(ScheduledTaskError::RevisionConflict {
+                task_id,
+                expected: expected_revision,
+                actual: task.revision,
+            });
+        }
+        self.validate_definition_references(&replacement).await?;
+        let schedule_changed = task.schedule != replacement.schedule;
+        let changed = task.name != replacement.name
+            || task.prompt != replacement.prompt
+            || task.workspace != replacement.workspace
+            || task.profile_id != replacement.profile_id
+            || task.agent_profile_id != replacement.agent_profile_id
+            || task.capability_mode != replacement.capability_mode
+            || task.output_channel_id != replacement.output_channel_id
+            || schedule_changed;
+        if !changed {
+            return Ok(task);
+        }
+
+        let now = Utc::now();
+        let next_run_at = if schedule_changed && task.enabled {
+            Some(initial_next_run(&replacement.schedule, now)?)
+        } else {
+            task.next_run_at
+        };
+        task.name = replacement.name;
+        task.prompt = replacement.prompt;
+        task.workspace = replacement.workspace;
+        task.profile_id = replacement.profile_id;
+        task.agent_profile_id = replacement.agent_profile_id;
+        task.capability_mode = replacement.capability_mode;
+        task.output_channel_id = replacement.output_channel_id;
+        task.schedule = replacement.schedule;
+        task.next_run_at = next_run_at;
+        task.updated_at = now;
+        task.revision = task
+            .revision
+            .checked_add(1)
+            .ok_or(ScheduledTaskError::RevisionExhausted { task_id })?;
+        self.store.update_task(task.clone()).await?;
         drop(_coordinator);
         self.wake.notify_one();
         Ok(task)
@@ -609,9 +708,14 @@ impl ScheduledTaskManager {
                 "could not persist the scheduled run session id"
             );
         }
-        wait_for_run(&mut events, queued.run_id)
+        let completion = wait_for_run(&mut events, queued.run_id)
             .await
-            .with_session_id(session_id)
+            .with_session_id(session_id);
+        let snapshot = handle.snapshot();
+        completion.with_report(ScheduledRunReport::from_messages(
+            &snapshot.display_messages,
+            snapshot.cumulative_usage,
+        ))
     }
 
     async fn cleanup_failed_session(&self, session_id: SessionId) {
@@ -750,11 +854,7 @@ impl ScheduledTaskManager {
     }
 
     async fn notify_task_started(&self, task: &ScheduledTask, scheduled_for: DateTime<Utc>) {
-        let message = format!(
-            "Phi scheduled task started\nTask: {}\nStatus: running\nScheduled for: {}",
-            task.name,
-            scheduled_for.to_rfc3339()
-        );
+        let message = started_notification(task, scheduled_for);
         self.notify_output_channel(task, &message, "started").await;
     }
 
@@ -764,15 +864,7 @@ impl ScheduledTaskManager {
         scheduled_for: DateTime<Utc>,
         completion: &TaskCompletion,
     ) {
-        let mut message = format!(
-            "Phi scheduled task finished\nTask: {}\nStatus: {}\nScheduled for: {}",
-            task.name,
-            outcome_name(completion.outcome),
-            scheduled_for.to_rfc3339()
-        );
-        if let Some(session_id) = completion.session_id {
-            message.push_str(&format!("\nSession: {session_id}"));
-        }
+        let message = finished_notification(task, scheduled_for, completion);
         self.notify_output_channel(task, &message, "finished").await;
     }
 
@@ -858,6 +950,7 @@ struct TaskCompletion {
     outcome: ScheduledRunOutcome,
     error: Option<String>,
     session_id: Option<SessionId>,
+    report: Option<ScheduledRunReport>,
 }
 
 impl TaskCompletion {
@@ -866,6 +959,7 @@ impl TaskCompletion {
             outcome: ScheduledRunOutcome::Succeeded,
             error: None,
             session_id: None,
+            report: None,
         }
     }
 
@@ -874,6 +968,7 @@ impl TaskCompletion {
             outcome: ScheduledRunOutcome::Stopped,
             error: None,
             session_id: None,
+            report: None,
         }
     }
 
@@ -882,6 +977,7 @@ impl TaskCompletion {
             outcome: ScheduledRunOutcome::Failed,
             error: Some(error.into()),
             session_id: None,
+            report: None,
         }
     }
 
@@ -890,6 +986,7 @@ impl TaskCompletion {
             outcome: ScheduledRunOutcome::Interrupted,
             error: Some(error.into()),
             session_id: None,
+            report: None,
         }
     }
 
@@ -902,6 +999,213 @@ impl TaskCompletion {
         self.session_id = session_id;
         self
     }
+
+    fn with_report(mut self, report: ScheduledRunReport) -> Self {
+        self.report = Some(report);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ScheduledRunReport {
+    final_response: Option<String>,
+    tool_call_count: usize,
+    tools: Vec<(String, usize)>,
+    usage: TokenUsage,
+}
+
+impl ScheduledRunReport {
+    fn from_messages(messages: &[Message], usage: TokenUsage) -> Self {
+        let mut tool_call_count = 0_usize;
+        let mut tools = BTreeMap::<String, usize>::new();
+        for message in messages.iter().filter(|message| {
+            message.role == Role::Assistant && message.visibility == MessageVisibility::Public
+        }) {
+            for call in &message.tool_calls {
+                tool_call_count = tool_call_count.saturating_add(1);
+                let name = if call.name.trim().is_empty() {
+                    "(unnamed)".to_owned()
+                } else {
+                    call.name.clone()
+                };
+                let count = tools.entry(name).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+
+        let final_response = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::Assistant && message.visibility == MessageVisibility::Public
+            })
+            .and_then(|message| message.content.as_ref())
+            .and_then(notification_content_text);
+
+        Self {
+            final_response,
+            tool_call_count,
+            tools: tools.into_iter().collect(),
+            usage,
+        }
+    }
+}
+
+fn finished_notification(
+    task: &ScheduledTask,
+    scheduled_for: DateTime<Utc>,
+    completion: &TaskCompletion,
+) -> String {
+    let mut message = format!(
+        "scheduled task finished\nTask: {}\nStatus: {}\nScheduled for: {}",
+        task.name,
+        outcome_emoji(completion.outcome),
+        format_notification_time(task, scheduled_for)
+    );
+    let Some(report) = &completion.report else {
+        return message;
+    };
+
+    message.push_str(&format!(
+        "\nToken usage: total {}, input {}, output {}, cached {}",
+        report.usage.total_tokens,
+        report.usage.input_tokens,
+        report.usage.output_tokens,
+        report.usage.cached_input_tokens
+    ));
+    message.push_str("\nToken cache rate: ");
+    match token_cache_rate_percent(report.usage) {
+        Some(rate) => message.push_str(&format!("{rate:.1}%")),
+        None => message.push_str("n/a"),
+    }
+    message.push_str(&format!("\nTool calls: {}", report.tool_call_count));
+    if !report.tools.is_empty() {
+        message.push_str("\nTools: ");
+        for (index, (name, count)) in report
+            .tools
+            .iter()
+            .take(MAX_REPORTED_TOOL_NAMES)
+            .enumerate()
+        {
+            if index > 0 {
+                message.push_str(", ");
+            }
+            let name = sanitize_notification_inline(name);
+            message.push_str(&truncate_with_ellipsis(&name, MAX_REPORTED_TOOL_NAME_CHARS));
+            message.push_str(&format!(" ×{count}"));
+        }
+        if report.tools.len() > MAX_REPORTED_TOOL_NAMES {
+            message.push_str(&format!(
+                ", … (+{} more)",
+                report.tools.len() - MAX_REPORTED_TOOL_NAMES
+            ));
+        }
+    }
+
+    message.push_str("\n\nFinal response:\n");
+    let final_response = report
+        .final_response
+        .as_deref()
+        .map(sanitize_notification_text)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| "(none)".to_owned());
+    let remaining = MAX_TELEGRAM_MESSAGE_CHARS.saturating_sub(message.chars().count());
+    message.push_str(&truncate_with_ellipsis(&final_response, remaining));
+    debug_assert!(message.chars().count() <= MAX_TELEGRAM_MESSAGE_CHARS);
+    message
+}
+
+fn started_notification(task: &ScheduledTask, scheduled_for: DateTime<Utc>) -> String {
+    format!(
+        "scheduled task started\nTask: {}\nStatus: {}\nScheduled for: {}",
+        task.name,
+        outcome_emoji(ScheduledRunOutcome::Running),
+        format_notification_time(task, scheduled_for)
+    )
+}
+
+fn format_notification_time(task: &ScheduledTask, scheduled_for: DateTime<Utc>) -> String {
+    const FORMAT: &str = "%Y年%m月%d日 %H:%M:%S";
+    match &task.schedule {
+        ScheduledTaskSchedule::Daily { timezone, .. } => timezone
+            .parse::<Tz>()
+            .map(|timezone| {
+                scheduled_for
+                    .with_timezone(&timezone)
+                    .format(FORMAT)
+                    .to_string()
+            })
+            .unwrap_or_else(|_| {
+                scheduled_for
+                    .with_timezone(&Local)
+                    .format(FORMAT)
+                    .to_string()
+            }),
+        ScheduledTaskSchedule::Interval { .. } => scheduled_for
+            .with_timezone(&Local)
+            .format(FORMAT)
+            .to_string(),
+    }
+}
+
+fn token_cache_rate_percent(usage: TokenUsage) -> Option<f64> {
+    (usage.input_tokens > 0).then(|| {
+        ((usage.cached_input_tokens as f64 / usage.input_tokens as f64) * 100.0).min(100.0)
+    })
+}
+
+fn notification_content_text(content: &Content) -> Option<String> {
+    let text = match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } | ContentPart::Document { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn sanitize_notification_text(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\n' | '\t' => character,
+            '\r' => '\n',
+            character if character.is_control() => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+fn sanitize_notification_inline(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn running_record(scheduled_for: DateTime<Utc>, started_at: DateTime<Utc>) -> ScheduledTaskRun {
@@ -915,13 +1219,13 @@ fn running_record(scheduled_for: DateTime<Utc>, started_at: DateTime<Utc>) -> Sc
     }
 }
 
-fn outcome_name(outcome: ScheduledRunOutcome) -> &'static str {
+fn outcome_emoji(outcome: ScheduledRunOutcome) -> &'static str {
     match outcome {
-        ScheduledRunOutcome::Running => "running",
-        ScheduledRunOutcome::Succeeded => "succeeded",
-        ScheduledRunOutcome::Failed => "failed",
-        ScheduledRunOutcome::Stopped => "stopped",
-        ScheduledRunOutcome::Interrupted => "interrupted",
+        ScheduledRunOutcome::Running => "⏳",
+        ScheduledRunOutcome::Succeeded => "✅",
+        ScheduledRunOutcome::Failed => "❌",
+        ScheduledRunOutcome::Stopped => "⏹️",
+        ScheduledRunOutcome::Interrupted => "⚠️",
     }
 }
 
@@ -1254,6 +1558,7 @@ pub enum ScheduledTaskError {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use phi::ToolCall;
 
     use super::*;
 
@@ -1344,5 +1649,117 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn scheduled_run_report_uses_last_public_assistant_text_and_groups_tools() {
+        let messages = vec![
+            Message::assistant(
+                None,
+                vec![
+                    ToolCall::new("call-1", "read", serde_json::json!({})),
+                    ToolCall::new("call-2", "bash", serde_json::json!({})),
+                ],
+            ),
+            Message::assistant(
+                Some(Content::parts([
+                    ContentPart::text("final"),
+                    ContentPart::text("answer"),
+                ])),
+                vec![ToolCall::new("call-3", "read", serde_json::json!({}))],
+            ),
+            Message::assistant(
+                Some(Content::text("private coordination")),
+                vec![ToolCall::new(
+                    "call-4",
+                    "private_tool",
+                    serde_json::json!({}),
+                )],
+            )
+            .with_visibility(MessageVisibility::Internal),
+        ];
+
+        let usage = TokenUsage::new(200, 20, 120);
+        let report = ScheduledRunReport::from_messages(&messages, usage);
+
+        assert_eq!(report.final_response.as_deref(), Some("final\nanswer"));
+        assert_eq!(report.tool_call_count, 3);
+        assert_eq!(
+            report.tools,
+            vec![("bash".to_owned(), 1), ("read".to_owned(), 2)]
+        );
+        assert_eq!(report.usage, usage);
+    }
+
+    #[test]
+    fn finished_notification_truncates_unicode_to_telegram_limit() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 25, 9, 30, 0).unwrap();
+        let task = ScheduledTask {
+            id: ScheduledTaskId::new(),
+            name: "Long report".to_owned(),
+            prompt: "Generate a long report".to_owned(),
+            workspace: Workspace::new("/workspace"),
+            profile_id: "default".to_owned(),
+            agent_profile_id: "default".to_owned(),
+            capability_mode: None,
+            output_channel_id: Some("alerts".to_owned()),
+            schedule: ScheduledTaskSchedule::Daily {
+                time: "09:30".to_owned(),
+                weekdays: vec![ScheduledWeekday::Friday],
+                timezone: "Asia/Singapore".to_owned(),
+            },
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            next_run_at: Some(now),
+            last_run: None,
+            skipped_runs: 0,
+            revision: 1,
+        };
+        let completion = TaskCompletion::succeeded()
+            .with_session_id(SessionId::new())
+            .with_report(ScheduledRunReport {
+                final_response: Some("界".repeat(MAX_TELEGRAM_MESSAGE_CHARS + 100)),
+                tool_call_count: 3,
+                tools: vec![("read".to_owned(), 2), ("bash".to_owned(), 1)],
+                usage: TokenUsage::new(200, 20, 120),
+            });
+
+        let notification = finished_notification(&task, now, &completion);
+        let started = started_notification(&task, now);
+
+        assert_eq!(
+            started,
+            "scheduled task started\nTask: Long report\nStatus: ⏳\nScheduled for: 2026年07月25日 17:30:00"
+        );
+        assert_eq!(notification.chars().count(), MAX_TELEGRAM_MESSAGE_CHARS);
+        assert!(notification.starts_with(
+            "scheduled task finished\nTask: Long report\nStatus: ✅\nScheduled for: 2026年07月25日 17:30:00"
+        ));
+        assert!(!notification.contains("Phi scheduled task"));
+        assert!(!notification.contains("\nSession:"));
+        assert!(notification.contains("Token usage: total 220, input 200, output 20, cached 120"));
+        assert!(notification.contains("Token cache rate: 60.0%"));
+        assert!(notification.contains("Tool calls: 3"));
+        assert!(notification.contains("Tools: read ×2, bash ×1"));
+        assert!(notification.ends_with('…'));
+    }
+
+    #[test]
+    fn token_cache_rate_is_unavailable_without_input_tokens() {
+        assert_eq!(token_cache_rate_percent(TokenUsage::default()), None);
+        assert_eq!(
+            token_cache_rate_percent(TokenUsage::new(10, 2, 20)),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn scheduled_run_outcomes_use_status_only_emojis() {
+        assert_eq!(outcome_emoji(ScheduledRunOutcome::Running), "⏳");
+        assert_eq!(outcome_emoji(ScheduledRunOutcome::Succeeded), "✅");
+        assert_eq!(outcome_emoji(ScheduledRunOutcome::Failed), "❌");
+        assert_eq!(outcome_emoji(ScheduledRunOutcome::Stopped), "⏹️");
+        assert_eq!(outcome_emoji(ScheduledRunOutcome::Interrupted), "⚠️");
     }
 }

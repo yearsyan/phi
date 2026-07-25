@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use phi_daemon::{
     api::AppState,
     output_channel::{
-        OutputChannelDefinition, OutputChannelDeliveryError, OutputChannelManager,
-        OutputChannelSender,
+        BotAccountDefinition, OutputChannelDefinition, OutputChannelDeliveryError,
+        OutputChannelManager, OutputChannelSender,
     },
     serve,
     service::ApplicationService,
@@ -23,7 +23,7 @@ const AUTH_KEY: &str = "a-secure-test-key-with-at-least-32-bytes";
 const BOT_TOKEN: &str = "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG";
 
 #[tokio::test]
-async fn authenticated_api_persists_redacted_telegram_channel_and_tests_delivery() {
+async fn authenticated_api_separates_redacted_bot_accounts_and_recipient_targets() {
     let sender = Arc::new(RecordingSender::default());
     let manager = Arc::new(OutputChannelManager::new(
         Arc::new(MemoryOutputChannelStore::new()),
@@ -43,12 +43,11 @@ async fn authenticated_api_persists_redacted_telegram_channel_and_tests_delivery
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
     let invalid = client
-        .put(format!("{base}/v1/output-channels/invalid"))
+        .put(format!("{base}/v1/bot-accounts/invalid"))
         .bearer_auth(AUTH_KEY)
         .json(&json!({
             "type": BOT_TOKEN,
-            "bot_token": BOT_TOKEN,
-            "chat_id": "-1001234567890"
+            "bot_token": BOT_TOKEN
         }))
         .send()
         .await
@@ -56,27 +55,59 @@ async fn authenticated_api_persists_redacted_telegram_channel_and_tests_delivery
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     assert!(!invalid.text().await.unwrap().contains(BOT_TOKEN));
 
-    let saved = client
+    let saved_bot = client
+        .put(format!("{base}/v1/bot-accounts/primary"))
+        .bearer_auth(AUTH_KEY)
+        .json(&json!({
+            "type": "telegram",
+            "bot_token": BOT_TOKEN
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved_bot.status(), StatusCode::OK);
+    let saved_bot: Value = saved_bot.json().await.unwrap();
+    assert_eq!(saved_bot["configured"], true);
+    assert_eq!(saved_bot["bot_account"]["type"], "telegram");
+    assert_eq!(saved_bot["bot_account"]["bot_account_id"], "primary");
+    assert_eq!(
+        saved_bot["bot_account"]["bot_token_configured"],
+        Value::Bool(true)
+    );
+    assert!(!saved_bot.to_string().contains(BOT_TOKEN));
+
+    let saved_target = client
         .put(format!("{base}/v1/output-channels/telegram-alerts"))
         .bearer_auth(AUTH_KEY)
         .json(&json!({
             "type": "telegram",
-            "bot_token": BOT_TOKEN,
+            "bot_account_id": "primary",
             "chat_id": "-1001234567890"
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(saved.status(), StatusCode::OK);
-    let saved: Value = saved.json().await.unwrap();
-    assert_eq!(saved["configured"], true);
-    assert_eq!(saved["output_channel"]["type"], "telegram");
+    assert_eq!(saved_target.status(), StatusCode::OK);
+    let saved_target: Value = saved_target.json().await.unwrap();
+    assert_eq!(saved_target["configured"], true);
+    assert_eq!(saved_target["output_channel"]["type"], "telegram");
+    assert_eq!(saved_target["output_channel"]["bot_account_id"], "primary");
     assert_eq!(
-        saved["output_channel"]["bot_token_configured"],
+        saved_target["output_channel"]["bot_token_configured"],
         Value::Bool(true)
     );
-    assert!(saved.get("bot_token").is_none());
-    assert!(!saved.to_string().contains(BOT_TOKEN));
+    assert!(!saved_target.to_string().contains(BOT_TOKEN));
+
+    let listed_bots = client
+        .get(format!("{base}/v1/bot-accounts"))
+        .bearer_auth(AUTH_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed_bots.status(), StatusCode::OK);
+    let listed_bots: Value = listed_bots.json().await.unwrap();
+    assert_eq!(listed_bots["bot_accounts"].as_array().unwrap().len(), 1);
+    assert!(!listed_bots.to_string().contains(BOT_TOKEN));
 
     let listed = client
         .get(format!("{base}/v1/output-channels"))
@@ -88,6 +119,22 @@ async fn authenticated_api_persists_redacted_telegram_channel_and_tests_delivery
     let listed: Value = listed.json().await.unwrap();
     assert_eq!(listed["output_channels"].as_array().unwrap().len(), 1);
     assert!(!listed.to_string().contains(BOT_TOKEN));
+
+    let legacy_target = client
+        .put(format!("{base}/v1/output-channels/legacy"))
+        .bearer_auth(AUTH_KEY)
+        .json(&json!({
+            "type": "telegram",
+            "bot_token": BOT_TOKEN,
+            "chat_id": "5050551393"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_target.status(), StatusCode::OK);
+    let legacy_target: Value = legacy_target.json().await.unwrap();
+    assert_eq!(legacy_target["output_channel"]["bot_account_id"], "legacy");
+    assert!(!legacy_target.to_string().contains(BOT_TOKEN));
 
     let tested = client
         .post(format!("{base}/v1/output-channels/telegram-alerts/test"))
@@ -114,6 +161,7 @@ struct RecordingSender {
 impl OutputChannelSender for RecordingSender {
     async fn send(
         &self,
+        _bot_account: &BotAccountDefinition,
         definition: &OutputChannelDefinition,
         message: &str,
     ) -> Result<(), OutputChannelDeliveryError> {

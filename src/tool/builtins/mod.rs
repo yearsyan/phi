@@ -19,7 +19,7 @@ pub use read::ReadTool;
 pub use truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 pub use write::WriteTool;
 
-use self::bash_task::{BashTaskOutputTool, BashTaskRegistry, BashTaskStopTool};
+use self::bash_task::{BashTaskRegistry, BashTaskStopTool};
 use super::Tool;
 use crate::Workspace;
 
@@ -102,7 +102,7 @@ impl BuiltinTools {
     }
 
     pub(crate) fn into_tools(self) -> Vec<Arc<dyn Tool>> {
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(6);
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(5);
         let bash_registry = self
             .bash
             .then(|| BashTaskRegistry::new(DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES));
@@ -120,7 +120,6 @@ impl BuiltinTools {
             tools.push(Arc::new(
                 BashTool::new(self.workspace.root()).task_registry(registry.clone()),
             ));
-            tools.push(Arc::new(BashTaskOutputTool::new(registry.clone())));
             tools.push(Arc::new(BashTaskStopTool::new(registry)));
         }
         if self.edit {
@@ -169,7 +168,6 @@ mod tests {
         assert_eq!(effects["edit"], ToolEffect::WorkspaceWrite);
         assert_eq!(effects["write"], ToolEffect::WorkspaceWrite);
         assert_eq!(effects["bash"], ToolEffect::ExternalSideEffect);
-        assert_eq!(effects["bash_task_output"], ToolEffect::ReadOnly);
         assert_eq!(effects["bash_task_stop"], ToolEffect::ExternalSideEffect);
     }
 
@@ -181,7 +179,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.definition().name)
             .collect::<Vec<_>>();
-        assert_eq!(names, ["bash", "bash_task_output", "bash_task_stop"]);
+        assert_eq!(names, ["bash", "bash_task_stop"]);
     }
 
     #[tokio::test]
@@ -194,10 +192,6 @@ mod tests {
         let bash = tools
             .iter()
             .find(|tool| tool.definition().name == "bash")
-            .unwrap();
-        let task_output = tools
-            .iter()
-            .find(|tool| tool.definition().name == "bash_task_output")
             .unwrap();
         let read = tools
             .iter()
@@ -212,12 +206,19 @@ mod tests {
             .await
             .unwrap();
         let metadata = started.metadata.as_ref().unwrap();
-        let task_id = metadata["task_id"].as_str().unwrap();
         let output_file = metadata["output_file"].as_str().unwrap();
-        task_output
-            .execute(json!({ "task_id": task_id, "timeout": 2_000 }))
-            .await
-            .unwrap();
+        let mut finished = false;
+        for _ in 0..100 {
+            if tokio::fs::read_to_string(output_file)
+                .await
+                .is_ok_and(|output| output.contains("background file"))
+            {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(finished, "background task did not write its output file");
 
         let context = ToolExecutionContext::detached("read-background-output")
             .with_workspace_policy(

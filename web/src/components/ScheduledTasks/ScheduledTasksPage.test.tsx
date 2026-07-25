@@ -15,6 +15,7 @@ import { ScheduledTasksPage } from './ScheduledTasksPage.tsx';
 
 const hookMocks = vi.hoisted(() => ({
   createTask: vi.fn(),
+  editTask: vi.fn(),
   setEnabled: vi.fn(),
   runNow: vi.fn(),
   deleteTask: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock('../../hooks/useScheduledTasks.ts', () => ({
     error: null,
     refresh: hookMocks.refresh,
     createTask: hookMocks.createTask,
+    editTask: hookMocks.editTask,
     setEnabled: hookMocks.setEnabled,
     runNow: hookMocks.runNow,
     deleteTask: hookMocks.deleteTask,
@@ -39,6 +41,7 @@ describe('ScheduledTasksPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hookMocks.setEnabled.mockResolvedValue(undefined);
+    hookMocks.editTask.mockResolvedValue(undefined);
     hookMocks.runNow.mockResolvedValue(undefined);
     hookMocks.deleteTask.mockResolvedValue(undefined);
     hookMocks.tasks = [task('active-task', true), task('paused-task', false)];
@@ -89,6 +92,36 @@ describe('ScheduledTasksPage', () => {
     );
     await waitFor(() =>
       expect(hookMocks.deleteTask).toHaveBeenCalledWith('active-task'),
+    );
+  });
+
+  it('opens an editor with the current task and saves through its revision', async () => {
+    renderPage(vi.fn());
+    const activeCard = screen.getByText('active-task').closest('article');
+    fireEvent.click(
+      within(activeCard as HTMLElement).getByRole('button', { name: 'Edit' }),
+    );
+
+    expect(
+      screen.getByRole('heading', { name: 'Edit scheduled task' }),
+    ).toBeTruthy();
+    const name = screen.getByLabelText('Name');
+    expect((name as HTMLInputElement).value).toBe('active-task');
+    fireEvent.change(name, { target: { value: 'Edited task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(hookMocks.editTask).toHaveBeenCalledWith(
+        'active-task',
+        expect.objectContaining({
+          name: 'Edited task',
+          prompt: 'Review the workspace',
+          workspace: '/workspace/phi',
+          profile_id: 'default',
+          agent_profile_id: 'default',
+          expected_revision: 1,
+        }),
+      ),
     );
   });
 });
