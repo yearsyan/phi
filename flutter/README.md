@@ -152,11 +152,14 @@ The runner references Windows App SDK Interactive Experiences 1.8 and
 Microsoft.Windows.CppWinRT through NuGet. Flutter builds request CMake's
 aggregate `INSTALL` target, so a generated MSBuild hook restores these packages
 before the runner is evaluated. The selected Windows App SDK component is
-self-contained in the application bundle. A subtle one-physical-pixel outline
-and lightly differentiated title surface keep the floating window distinct
-from content behind it. The DPI-aware minimum window size is 640×480 logical
-pixels; when maximized, both the client area and DWM visible frame match the
-current monitor's work area.
+self-contained in the application bundle. The runner is compiled as C++20 and
+only uses synchronous C++/WinRT APIs, so its legacy C++17 coroutine integration
+is disabled. CppWinRT therefore uses the standard `<coroutine>` header instead
+of the deprecated `/await` and `<experimental/coroutine>` path. A subtle
+one-physical-pixel outline and lightly differentiated title surface keep the
+floating window distinct from content behind it. The DPI-aware minimum window
+size is 640×480 logical pixels; when maximized, both the client area and DWM
+visible frame match the current monitor's work area.
 
 On every GitHub push, `.github/workflows/build-windows-client-release.yml`
 builds this release bundle with Flutter 3.44.6 and uploads the

@@ -22,6 +22,10 @@ add_executable(${BINARY_NAME} WIN32
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+# C++/WinRT 2.x falls back to <experimental/coroutine> in C++17. Visual Studio
+# 18 rejects that removed path with STL1011, so compile this target with the
+# standard C++20 coroutine library instead.
+target_compile_features(${BINARY_NAME} PRIVATE cxx_std_20)
 
 # AppWindowTitleBar provides the Windows title-bar overlay while preserving the
 # system caption buttons. Keep the Windows App SDK component self-contained so
@@ -39,6 +43,10 @@ set_property(TARGET ${BINARY_NAME} PROPERTY
   VS_GLOBAL_TargetFrameworkMoniker "native,Version=v0.0")
 set_property(TARGET ${BINARY_NAME} PROPERTY
   VS_GLOBAL_NuGetTargetMoniker "native,Version=v0.0")
+# Phi only consumes synchronous C++/WinRT APIs. Also keep the package from
+# re-enabling its legacy /await integration if surrounding defaults change.
+set_property(TARGET ${BINARY_NAME} PROPERTY
+  VS_GLOBAL_CppWinRTEnableLegacyCoroutines "false")
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")
