@@ -1,13 +1,17 @@
-name: Build Android release
+name: Build client releases
 
 on:
   push:
+    branches:
+      - "**"
+    tags:
+      - "v**"
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-release-${{ github.ref }}
+  group: client-releases-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -96,3 +100,94 @@ jobs:
           path: flutter/build/app/outputs/flutter-apk/phi-client-android-release.apk
           if-no-files-found: error
           archive: false
+
+  windows-release:
+    name: Windows x64 release bundle
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.6
+          cache: true
+
+      - name: Enable long Git paths
+        run: git config --global core.longpaths true
+
+      - name: Install Flutter dependencies
+        working-directory: flutter
+        run: flutter pub get
+
+      - name: Build Windows release
+        working-directory: flutter
+        run: flutter build windows --release
+
+      - name: Package Windows release bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundlePath = "flutter/build/windows/x64/runner/Release"
+          $executablePath = Join-Path $bundlePath "phi_client.exe"
+          if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            throw "Expected Windows executable was not built: $executablePath"
+          }
+          Compress-Archive `
+            -Path "$bundlePath/*" `
+            -DestinationPath "phi-client-windows-x64.zip"
+
+      - name: Upload Windows release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: phi-client-windows-x64.zip
+          path: phi-client-windows-x64.zip
+          if-no-files-found: error
+          archive: false
+
+  github-release:
+    name: Publish GitHub Release assets
+    if: github.ref_type == 'tag'
+    needs:
+      - android-release
+      - windows-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Android release APK
+        uses: actions/download-artifact@v8
+        with:
+          name: phi-client-android-release.apk
+          path: dist
+          skip-decompress: true
+
+      - name: Download Windows release bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: phi-client-windows-x64.zip
+          path: dist
+          skip-decompress: true
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(
+            dist/phi-client-android-release.apk
+            dist/phi-client-windows-x64.zip
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

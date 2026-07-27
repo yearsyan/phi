@@ -161,9 +161,11 @@ floating window distinct from content behind it. The DPI-aware minimum window
 size is 640×480 logical pixels; when maximized, both the client area and DWM
 visible frame match the current monitor's work area.
 
-On every GitHub push, `.github/workflows/build-windows-client-release.yml`
-builds this release bundle with Flutter 3.44.6 and uploads the
-`phi-client-windows-x64` Actions artifact.
+On every GitHub branch push, `.github/workflows/build-client-releases.yml`
+builds this release bundle with Flutter 3.44.6, packages the runnable directory
+as `phi-client-windows-x64.zip`, and uploads it as an Actions artifact. Pushing
+a tag matching `v**` also publishes that ZIP and the signed Android APK to the
+matching GitHub Release.
 
 ### Android
 
@@ -182,14 +184,16 @@ Then build the signed APK with:
 flutter build apk --release --target-platform android-arm64
 ```
 
-On every GitHub push, `.github/workflows/build-android-release.yml` restores
-the ignored keystore from `ANDROID_RELEASE_KEYSTORE_BASE64`, builds the signed
-ARM64-only APK, verifies its packaged ABI and signature, and uploads
-`phi-client-android-release.apk` to the Actions run. The repository must define
-the base64 keystore secret plus the other three variables above as Actions
-secrets. Never commit the keystore, passwords, generated APK, or a local
-`key.properties`; keep a secure backup because future upgrades must use the
-same signing identity.
+On every GitHub branch push, `.github/workflows/build-client-releases.yml`
+restores the ignored keystore from `ANDROID_RELEASE_KEYSTORE_BASE64`, builds
+the signed ARM64-only APK, verifies its packaged ABI and signature, and uploads
+`phi-client-android-release.apk` to the Actions run. Pushing a tag matching
+`v**` waits for both client builds, creates or updates the matching GitHub
+Release, and attaches the APK together with `phi-client-windows-x64.zip`. The
+repository must define the base64 keystore secret plus the other three
+variables above as Actions secrets. Never commit the keystore, passwords,
+generated APK, or a local `key.properties`; keep a secure backup because future
+upgrades must use the same signing identity.
 
 ### iOS
 
