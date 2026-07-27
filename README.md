@@ -25,5 +25,8 @@ OpenHarmony AES）保存，不再写入明文 SharedPreferences。
 定时任务的 Telegram 通知使用 Rich Markdown，可原生展示标题、加粗、列表和表格；格式被
 Telegram 拒绝时会回退为纯文本，避免通知因模型生成的 Markdown 不完整而丢失。
 
+daemon 默认从 `~/.phi/skills` 发现全局 skills；可通过
+`PHI_DAEMON_GLOBAL_SKILLS_DIRS` 覆盖为操作系统原生 path-list。
+
 Provider 配置、HTTP/WS 协议和停止语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。

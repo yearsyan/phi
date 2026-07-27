@@ -31,7 +31,7 @@ pub const HTTP_PROXY_ENV: &str = "HTTP_PROXY";
 pub const HTTPS_PROXY_ENV: &str = "HTTPS_PROXY";
 pub const ALL_PROXY_ENV: &str = "ALL_PROXY";
 pub const NO_PROXY_ENV: &str = "NO_PROXY";
-pub const DEFAULT_GLOBAL_SKILLS_DIR: &str = ".phy/skills";
+pub const DEFAULT_GLOBAL_SKILLS_DIR: &str = ".phi/skills";
 pub const DEFAULT_WORKSPACE_SKILLS_DIRS: [&str; 2] = [".phy/skills", ".claude/skills"];
 
 const MIN_AUTH_KEY_BYTES: usize = 32;
@@ -779,11 +779,13 @@ mod tests {
         assert!(config.skills_enabled());
         assert!(config.subagents_enabled());
         assert_eq!(config.session_title_profile_id(), None);
-        assert!(
-            config
-                .global_skill_dirs()
-                .iter()
-                .all(|path| path.ends_with(DEFAULT_GLOBAL_SKILLS_DIR))
+        assert_eq!(DEFAULT_GLOBAL_SKILLS_DIR, ".phi/skills");
+        let expected_global_skill_dirs = home_directory()
+            .map(|home| vec![home.join(DEFAULT_GLOBAL_SKILLS_DIR)])
+            .unwrap_or_default();
+        assert_eq!(
+            config.global_skill_dirs(),
+            expected_global_skill_dirs.as_slice()
         );
         assert_eq!(
             config.workspace_skill_dirs(),

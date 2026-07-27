@@ -100,7 +100,7 @@ profiles     AgentRegistry
 | `PHI_DAEMON_SKILLS_ENABLED` | `true` | 是否为 daemon session 启用 skills |
 | `PHI_DAEMON_SUBAGENTS_ENABLED` | `true` | 是否启用父 subagent 工具和 observer |
 | `PHI_DAEMON_SESSION_TITLE_PROFILE_ID` | 未设置 | 可选的独立标题生成 Provider Profile |
-| `PHI_DAEMON_GLOBAL_SKILLS_DIRS` | `~/.phy/skills` | 全局 skill 根目录 path-list |
+| `PHI_DAEMON_GLOBAL_SKILLS_DIRS` | `~/.phi/skills` | 全局 skill 根目录 path-list |
 | `PHI_DAEMON_WORKSPACE_SKILLS_DIRS` | `.phy/skills`、`.claude/skills` | 相对 session workspace 的 skill 根目录 path-list |
 | `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` | 未设置 | Provider 和标题请求的出站代理；兼容小写变量 |
 | `RUST_LOG` | `phi_daemon=info` | tracing filter |
