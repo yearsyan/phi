@@ -22,5 +22,8 @@ Web 客户端把长期 key 存于 `sessionStorage`（关闭 tab 即清除），F
 secure storage（Android EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI /
 OpenHarmony AES）保存，不再写入明文 SharedPreferences。
 
+定时任务的 Telegram 通知使用 Rich Markdown，可原生展示标题、加粗、列表和表格；格式被
+Telegram 拒绝时会回退为纯文本，避免通知因模型生成的 Markdown 不完整而丢失。
+
 Provider 配置、HTTP/WS 协议和停止语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。

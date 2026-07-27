@@ -392,18 +392,20 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
     assert_eq!(notifications.failures_remaining.load(Ordering::Acquire), 0);
     let messages = notifications.messages.lock().await;
     assert_eq!(messages.len(), 2);
-    assert!(messages[0].starts_with("scheduled task started\n"));
-    assert!(messages[0].contains("Status: ⏳"));
-    assert!(messages[1].starts_with("scheduled task finished\n"));
-    assert!(messages[1].contains("Status: ✅"));
+    assert!(messages[0].starts_with("## Scheduled task started\n"));
+    assert!(messages[0].contains("- **Status:** ⏳"));
+    assert!(messages[1].starts_with("## Scheduled task finished\n"));
+    assert!(messages[1].contains("- **Status:** ✅"));
     assert!(!messages[0].contains("Phi scheduled task"));
     assert!(!messages[1].contains("Phi scheduled task"));
     assert!(!messages[1].contains("Session:"));
-    assert!(messages[1].contains("Token usage: total 220, input 200, output 20, cached 120"));
-    assert!(messages[1].contains("Token cache rate: 60.0%"));
-    assert!(messages[1].contains("Tool calls: 1"));
-    assert!(messages[1].contains("Tools: scheduled_inspection ×1"));
-    assert!(messages[1].contains("Final response:\nscheduled result"));
+    assert!(messages[1].contains(
+        "| Total | Input | Output | Cached |\n| ---: | ---: | ---: | ---: |\n| 220 | 200 | 20 | 120 |"
+    ));
+    assert!(messages[1].contains("- **Token cache rate:** 60.0%"));
+    assert!(messages[1].contains("- **Tool calls:** 1"));
+    assert!(messages[1].contains(r"- **Tools:** scheduled\_inspection ×1"));
+    assert!(messages[1].contains("### Final response\n\nscheduled result"));
 
     manager.shutdown().await;
     assert!(service.shutdown().await.is_empty());

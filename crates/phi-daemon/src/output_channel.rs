@@ -286,6 +286,43 @@ impl TelegramOutputChannelSender {
             api_base_url: api_base_url.into(),
         }
     }
+
+    async fn post(
+        &self,
+        bot_token: &str,
+        method: &str,
+        body: Vec<u8>,
+    ) -> Result<(), OutputChannelDeliveryError> {
+        let url = format!(
+            "{}/bot{bot_token}/{method}",
+            self.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .timeout(TELEGRAM_REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| OutputChannelDeliveryError::Transport)?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| OutputChannelDeliveryError::ResponseRead)?;
+        let telegram = serde_json::from_slice::<TelegramResponse>(&bytes).ok();
+        if !(200..300).contains(&status) || !telegram.as_ref().is_some_and(|body| body.ok) {
+            let description = telegram
+                .and_then(|body| body.description)
+                .map(|description| sanitize_remote_description(&description, bot_token));
+            return Err(OutputChannelDeliveryError::Rejected {
+                status,
+                description,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for TelegramOutputChannelSender {
@@ -301,6 +338,17 @@ impl fmt::Debug for TelegramOutputChannelSender {
 struct TelegramSendMessage<'a> {
     chat_id: &'a str,
     text: &'a str,
+}
+
+#[derive(Serialize)]
+struct TelegramSendRichMessage<'a> {
+    chat_id: &'a str,
+    rich_message: TelegramInputRichMessage<'a>,
+}
+
+#[derive(Serialize)]
+struct TelegramInputRichMessage<'a> {
+    markdown: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -337,40 +385,28 @@ impl OutputChannelSender for TelegramOutputChannelSender {
             )));
         }
 
-        let body = serde_json::to_vec(&TelegramSendMessage {
+        let body = serde_json::to_vec(&TelegramSendRichMessage {
             chat_id: &chat_id,
-            text: message,
+            rich_message: TelegramInputRichMessage { markdown: message },
         })
         .map_err(|_| OutputChannelDeliveryError::RequestEncoding)?;
-        let url = format!(
-            "{}/bot{bot_token}/sendMessage",
-            self.api_base_url.trim_end_matches('/')
-        );
-        let response = self
-            .client
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .timeout(TELEGRAM_REQUEST_TIMEOUT)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| OutputChannelDeliveryError::Transport)?;
-        let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| OutputChannelDeliveryError::ResponseRead)?;
-        let telegram = serde_json::from_slice::<TelegramResponse>(&bytes).ok();
-        if !(200..300).contains(&status) || !telegram.as_ref().is_some_and(|body| body.ok) {
-            let description = telegram
-                .and_then(|body| body.description)
-                .map(|description| sanitize_remote_description(&description, &bot_token));
-            return Err(OutputChannelDeliveryError::Rejected {
-                status,
-                description,
-            });
+        match self.post(&bot_token, "sendRichMessage", body).await {
+            // Rich Markdown can be rejected when a self-hosted Bot API is too
+            // old or the generated Markdown is malformed. Telegram has
+            // definitively rejected these requests, so a plain-text fallback
+            // cannot duplicate a delivered message.
+            Err(OutputChannelDeliveryError::Rejected {
+                status: 400 | 404, ..
+            }) => {
+                let body = serde_json::to_vec(&TelegramSendMessage {
+                    chat_id: &chat_id,
+                    text: message,
+                })
+                .map_err(|_| OutputChannelDeliveryError::RequestEncoding)?;
+                self.post(&bot_token, "sendMessage", body).await
+            }
+            result => result,
         }
-        Ok(())
     }
 }
 
@@ -614,13 +650,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegram_sender_posts_json_and_redacts_remote_token_echoes() {
+    async fn telegram_sender_posts_rich_markdown_and_redacts_remote_token_echoes() {
         let token = "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG";
         let received = Arc::new(Mutex::new(None));
         let state = (Arc::clone(&received), token.to_owned());
         let app = Router::new()
             .route(
-                &format!("/bot{token}/sendMessage"),
+                &format!("/bot{token}/sendRichMessage"),
                 post(
                     |State((received, token)): State<(Arc<Mutex<Option<Value>>>, String)>,
                      Json(body): Json<Value>| async move {
@@ -652,11 +688,12 @@ mod tests {
             reqwest::Client::new(),
             format!("http://{address}"),
         );
+        let markdown = "**hello**\n\n| Result | Value |\n| --- | ---: |\n| Passed | 1 |";
         let error = sender
             .send(
                 &telegram_bot(token),
                 &telegram_definition("telegram-bot"),
-                "hello",
+                markdown,
             )
             .await
             .unwrap_err();
@@ -667,8 +704,101 @@ mod tests {
             *received.lock().await,
             Some(json!({
                 "chat_id": "-1001234567890",
-                "text": "hello"
+                "rich_message": {
+                    "markdown": markdown
+                }
             }))
+        );
+
+        let _ = stop.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn telegram_sender_falls_back_to_plain_text_after_rich_markdown_rejection() {
+        let token = "123456789:abcdefghijklmnopqrstuvwxyz_ABCDEFG";
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app =
+            Router::new()
+                .route(
+                    &format!("/bot{token}/sendRichMessage"),
+                    post(
+                        |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                         Json(body): Json<Value>| async move {
+                            received.lock().await.push(json!({
+                                "method": "sendRichMessage",
+                                "body": body,
+                            }));
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "description": "can't parse rich Markdown"
+                                })),
+                            )
+                        },
+                    ),
+                )
+                .route(
+                    &format!("/bot{token}/sendMessage"),
+                    post(
+                        |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                         Json(body): Json<Value>| async move {
+                            received.lock().await.push(json!({
+                                "method": "sendMessage",
+                                "body": body,
+                            }));
+                            (StatusCode::OK, Json(json!({ "ok": true })))
+                        },
+                    ),
+                )
+                .with_state(Arc::clone(&received));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let sender = TelegramOutputChannelSender::with_api_base_url(
+            reqwest::Client::new(),
+            format!("http://{address}"),
+        );
+        let markdown = "**unclosed";
+        sender
+            .send(
+                &telegram_bot(token),
+                &telegram_definition("telegram-bot"),
+                markdown,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *received.lock().await,
+            vec![
+                json!({
+                    "method": "sendRichMessage",
+                    "body": {
+                        "chat_id": "-1001234567890",
+                        "rich_message": {
+                            "markdown": markdown
+                        }
+                    }
+                }),
+                json!({
+                    "method": "sendMessage",
+                    "body": {
+                        "chat_id": "-1001234567890",
+                        "text": markdown
+                    }
+                }),
+            ]
         );
 
         let _ = stop.send(());

@@ -146,7 +146,9 @@ Agent Profile 的 `prompt.mode` 可为 `extend` 或 `full`；daemon 始终追加
 定时任务支持每日计划（本地时间、工作日、IANA 时区）和分钟/小时/天间隔。每次执行创建
 一个独立、可 attach 的 session；同一任务不重叠，daemon 停机后最多补一次。任务定义使用
 revision 做乐观并发控制。开始和终态可发送到 Telegram Output Channel，但消息发送失败只
-记录脱敏日志。
+记录脱敏日志。通知通过 Telegram `sendRichMessage` 发送 Rich Markdown，标题、加粗、列表
+及 GFM 表格会原生渲染；若 Telegram 以 `400`/`404` 明确拒绝 Rich Markdown（例如语法不完整
+或自托管 Bot API 版本过旧），daemon 会用 `sendMessage` 回退为纯文本。
 
 ## HTTP API
 

@@ -1056,9 +1056,9 @@ fn finished_notification(
     scheduled_for: DateTime<Utc>,
     completion: &TaskCompletion,
 ) -> String {
+    let task_name = escape_notification_markdown_inline(&task.name);
     let mut message = format!(
-        "scheduled task finished\nTask: {}\nStatus: {}\nScheduled for: {}",
-        task.name,
+        "## Scheduled task finished\n\n- **Task:** {task_name}\n- **Status:** {}\n- **Scheduled for:** {}",
         outcome_emoji(completion.outcome),
         format_notification_time(task, scheduled_for)
     );
@@ -1067,20 +1067,20 @@ fn finished_notification(
     };
 
     message.push_str(&format!(
-        "\nToken usage: total {}, input {}, output {}, cached {}",
+        "\n\n| Total | Input | Output | Cached |\n| ---: | ---: | ---: | ---: |\n| {} | {} | {} | {} |",
         report.usage.total_tokens,
         report.usage.input_tokens,
         report.usage.output_tokens,
         report.usage.cached_input_tokens
     ));
-    message.push_str("\nToken cache rate: ");
+    message.push_str("\n\n- **Token cache rate:** ");
     match token_cache_rate_percent(report.usage) {
         Some(rate) => message.push_str(&format!("{rate:.1}%")),
         None => message.push_str("n/a"),
     }
-    message.push_str(&format!("\nTool calls: {}", report.tool_call_count));
+    message.push_str(&format!("\n- **Tool calls:** {}", report.tool_call_count));
     if !report.tools.is_empty() {
-        message.push_str("\nTools: ");
+        message.push_str("\n- **Tools:** ");
         for (index, (name, count)) in report
             .tools
             .iter()
@@ -1091,7 +1091,8 @@ fn finished_notification(
                 message.push_str(", ");
             }
             let name = sanitize_notification_inline(name);
-            message.push_str(&truncate_with_ellipsis(&name, MAX_REPORTED_TOOL_NAME_CHARS));
+            let name = truncate_with_ellipsis(&name, MAX_REPORTED_TOOL_NAME_CHARS);
+            message.push_str(&escape_notification_markdown_inline(&name));
             message.push_str(&format!(" ×{count}"));
         }
         if report.tools.len() > MAX_REPORTED_TOOL_NAMES {
@@ -1102,7 +1103,7 @@ fn finished_notification(
         }
     }
 
-    message.push_str("\n\nFinal response:\n");
+    message.push_str("\n\n### Final response\n\n");
     let final_response = report
         .final_response
         .as_deref()
@@ -1116,9 +1117,9 @@ fn finished_notification(
 }
 
 fn started_notification(task: &ScheduledTask, scheduled_for: DateTime<Utc>) -> String {
+    let task_name = escape_notification_markdown_inline(&task.name);
     format!(
-        "scheduled task started\nTask: {}\nStatus: {}\nScheduled for: {}",
-        task.name,
+        "## Scheduled task started\n\n- **Task:** {task_name}\n- **Status:** {}\n- **Scheduled for:** {}",
         outcome_emoji(ScheduledRunOutcome::Running),
         format_notification_time(task, scheduled_for)
     )
@@ -1190,6 +1191,40 @@ fn sanitize_notification_inline(text: &str) -> String {
             }
         })
         .collect()
+}
+
+fn escape_notification_markdown_inline(text: &str) -> String {
+    let sanitized = sanitize_notification_inline(text);
+    let mut escaped = String::with_capacity(sanitized.len());
+    for character in sanitized.chars() {
+        if matches!(
+            character,
+            '\\' | '`'
+                | '*'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '#'
+                | '+'
+                | '-'
+                | '.'
+                | '!'
+                | '|'
+                | '~'
+                | '='
+                | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
@@ -1730,19 +1765,34 @@ mod tests {
 
         assert_eq!(
             started,
-            "scheduled task started\nTask: Long report\nStatus: ⏳\nScheduled for: 2026年07月25日 17:30:00"
+            "## Scheduled task started\n\n- **Task:** Long report\n- **Status:** ⏳\n- **Scheduled for:** 2026年07月25日 17:30:00"
         );
         assert_eq!(notification.chars().count(), MAX_TELEGRAM_MESSAGE_CHARS);
         assert!(notification.starts_with(
-            "scheduled task finished\nTask: Long report\nStatus: ✅\nScheduled for: 2026年07月25日 17:30:00"
+            "## Scheduled task finished\n\n- **Task:** Long report\n- **Status:** ✅\n- **Scheduled for:** 2026年07月25日 17:30:00"
         ));
         assert!(!notification.contains("Phi scheduled task"));
         assert!(!notification.contains("\nSession:"));
-        assert!(notification.contains("Token usage: total 220, input 200, output 20, cached 120"));
-        assert!(notification.contains("Token cache rate: 60.0%"));
-        assert!(notification.contains("Tool calls: 3"));
-        assert!(notification.contains("Tools: read ×2, bash ×1"));
+        assert!(notification.contains(
+            "| Total | Input | Output | Cached |\n| ---: | ---: | ---: | ---: |\n| 220 | 200 | 20 | 120 |"
+        ));
+        assert!(notification.contains("- **Token cache rate:** 60.0%"));
+        assert!(notification.contains("- **Tool calls:** 3"));
+        assert!(notification.contains("- **Tools:** read ×2, bash ×1"));
+        assert!(notification.contains("### Final response\n\n"));
         assert!(notification.ends_with('…'));
+    }
+
+    #[test]
+    fn notification_inline_values_are_markdown_escaped() {
+        assert_eq!(
+            escape_notification_markdown_inline("nightly_report | **release**"),
+            r"nightly\_report \| \*\*release\*\*"
+        );
+        assert_eq!(
+            escape_notification_markdown_inline("line\nbreak"),
+            "line break"
+        );
     }
 
     #[test]
