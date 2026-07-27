@@ -167,11 +167,35 @@ floating window distinct from content behind it. The DPI-aware minimum window
 size is 640×480 logical pixels; when maximized, both the client area and DWM
 visible frame match the current monitor's work area.
 
-On every GitHub branch push, `.github/workflows/build-client-releases.yml`
-builds this release bundle with Flutter 3.44.6, packages the runnable directory
-as `phi-client-windows-x64.zip`, and uploads it as an Actions artifact. Pushing
-a tag matching `v**` also publishes that ZIP and the signed Android APK to the
-matching GitHub Release.
+The `.github/workflows/build-client-releases.yml` workflow only runs for tags
+matching `v**`; ordinary branch pushes do not start client release builds. For
+each matching tag, it builds this release bundle with Flutter 3.44.6, packages
+the runnable directory as `phi-client-windows-x64.zip`, and uploads it as an
+Actions artifact.
+
+### macOS
+
+Pushing a tag matching `v**` builds a universal ARM64 and x86-64 release app on
+the macOS runner, signs the app and its embedded code with a Developer ID
+Application identity and hardened runtime, packages it as
+`phi-client-macos.dmg`, submits the DMG to Apple's notary service, and staples
+the accepted notarization ticket. The DMG contains the app plus an
+Applications-folder shortcut and is published to the matching GitHub Release
+alongside the Windows ZIP and Android APK.
+
+The repository must define all five Actions secrets below:
+
+- `MACOS_CERTIFICATE_P12_BASE64`
+- `MACOS_CERTIFICATE_PASSWORD`
+- `APPLE_API_KEY_P8_BASE64`
+- `APPLE_API_KEY_ID`
+- `APPLE_API_ISSUER_ID`
+
+The certificate secret is the base64-encoded PKCS#12 export containing the
+Developer ID Application certificate and private key. The API-key secret is
+the base64-encoded App Store Connect team-key `.p8`; individual API keys cannot
+authenticate `notarytool`. Never commit either private key, their decoded
+copies, passwords, or notarization credentials.
 
 ### Android
 
@@ -190,16 +214,16 @@ Then build the signed APK with:
 flutter build apk --release --target-platform android-arm64
 ```
 
-On every GitHub branch push, `.github/workflows/build-client-releases.yml`
+For every tag matching `v**`, `.github/workflows/build-client-releases.yml`
 restores the ignored keystore from `ANDROID_RELEASE_KEYSTORE_BASE64`, builds
 the signed ARM64-only APK, verifies its packaged ABI and signature, and uploads
-`phi-client-android-release.apk` to the Actions run. Pushing a tag matching
-`v**` waits for both client builds, creates or updates the matching GitHub
-Release, and attaches the APK together with `phi-client-windows-x64.zip`. The
-repository must define the base64 keystore secret plus the other three
-variables above as Actions secrets. Never commit the keystore, passwords,
-generated APK, or a local `key.properties`; keep a secure backup because future
-upgrades must use the same signing identity.
+`phi-client-android-release.apk` to the Actions run. The release job waits for
+all three client builds, creates or updates the matching GitHub Release, and
+attaches the APK together with `phi-client-windows-x64.zip` and
+`phi-client-macos.dmg`. The repository must define the base64 keystore secret
+plus the other three variables above as Actions secrets. Never commit the
+keystore, passwords, generated APK, or a local `key.properties`; keep a secure
+backup because future upgrades must use the same signing identity.
 
 ### iOS
 
