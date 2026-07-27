@@ -22,6 +22,7 @@ use thiserror::Error;
 use tokio::sync::{
     OwnedSemaphorePermit, Semaphore, TryAcquireError, broadcast, mpsc, oneshot, watch,
 };
+use tracing::error;
 
 use super::{
     AskUserId, PinnedAgentProfile, RunId, SessionId, ToolPermissionId,
@@ -1145,12 +1146,10 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         };
                         hub.initialized(&agent, &record, subagents.as_ref());
                         for failure in restore_report.failures {
+                            error!(error = %failure.error, agent_id = %failure.agent_id, "subagent_restore failed");
                             hub.operation_failed(
                                 "subagent_restore",
-                                format!(
-                                    "could not restore subagent {}: {}",
-                                    failure.agent_id, failure.error
-                                ),
+                                format!("could not restore subagent {}", failure.agent_id),
                             );
                         }
                         binding = Some(MetadataBinding {
@@ -1520,7 +1519,11 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         | ContextCompactionRunOutcome::Stopped,
                     ) => {}
                     Err(error) => {
-                        hub.operation_failed("compact_context", error.to_string());
+                        error!(error = %error, "compact_context failed");
+                        hub.operation_failed(
+                            "compact_context",
+                            "context compaction failed".to_owned(),
+                        );
                     }
                 }
                 drop(compaction_permit);
@@ -2138,7 +2141,7 @@ async fn apply_model(
             .store
             .update_session(next.clone())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| redact_metadata_error("update_session", &error))?;
         binding.record = next;
     }
     agent.set_model(model.clone());
@@ -2164,7 +2167,7 @@ async fn apply_title(
         .store
         .update_session(next.clone())
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| redact_metadata_error("update_session", &error))?;
     binding.record = next;
     hub.title_changed(title);
     Ok(())
@@ -2183,7 +2186,7 @@ async fn apply_pinned(binding: &mut Option<MetadataBinding>, pinned: bool) -> Re
         .store
         .update_session(next.clone())
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| redact_metadata_error("update_session", &error))?;
     binding.record = next;
     Ok(())
 }
@@ -2225,7 +2228,7 @@ async fn apply_capability_mode(
     let result = agent
         .set_capability_mode(capability_mode)
         .await
-        .map_err(|error| error.to_string());
+        .map_err(|error| redact_metadata_error("set_capability_mode", &error));
     let effective = agent.capability_mode();
     if let Some(subagents) = subagents {
         subagents.set_capability_ceiling(effective);
@@ -2234,6 +2237,23 @@ async fn apply_capability_mode(
         hub.capability_mode_changed(effective);
     }
     result
+}
+
+/// Redact an error before it enters [`AgentHandleError::Operation`] and gets
+/// broadcast to WS clients as an `operation_failed` event. The original error
+/// is logged server-side via `tracing::error!`; the returned string is a
+/// generic, stable message that never carries disk paths, temp file names,
+/// provider response bodies, URLs, or command lines.
+///
+/// Use this for any error whose `Display` may originate from a store, storage,
+/// provider, or MCP layer. Errors whose `Display` is a pure validation message
+/// (e.g. [`SessionTitleError`]) may be passed through unchanged.
+fn redact_metadata_error<E: std::fmt::Debug + std::fmt::Display>(
+    operation: &'static str,
+    error: &E,
+) -> String {
+    error!(error = %error, operation, "metadata operation failed");
+    "session metadata could not be persisted".to_owned()
 }
 
 struct EventHub {

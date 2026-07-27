@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use phi::{CapabilityMode, Content, SkillInvocation, Workspace};
 use serde::Deserialize;
 use tokio::sync::broadcast;
+use tracing::error;
 
 use super::{
     AppState,
@@ -204,11 +205,12 @@ async fn handle_new(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
+            error!(error = %error, "agent build failed during /v1/ws/new");
             let _ = send_json(
                 &mut sender,
                 &ServerMessage::FatalError {
                     code: "agent_build_failed",
-                    message: error.to_string(),
+                    message: "agent could not be built".to_owned(),
                 },
             )
             .await;
@@ -264,11 +266,12 @@ async fn handle_attach(socket: WebSocket, service: Arc<ApplicationService>, sess
     let handle = match service.attach_session(session_id).await {
         Ok(handle) => handle,
         Err(error) => {
+            error!(error = %error, session_id = %session_id, "attach failed during /v1/ws/attach");
             let _ = send_json(
                 &mut sender,
                 &ServerMessage::FatalError {
                     code: "attach_failed",
-                    message: error.to_string(),
+                    message: "session could not be attached".to_owned(),
                 },
             )
             .await;
@@ -313,11 +316,12 @@ async fn handle_subagent_attach(
     let handle = match service.attach_session(parent_session_id).await {
         Ok(handle) => handle,
         Err(error) => {
+            error!(error = %error, parent_session_id = %parent_session_id, agent_id = %agent_id, "subagent attach failed");
             let _ = send_json(
                 &mut sender,
                 &ServerMessage::FatalError {
                     code: "attach_failed",
-                    message: error.to_string(),
+                    message: "session could not be attached".to_owned(),
                 },
             )
             .await;

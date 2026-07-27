@@ -9,6 +9,7 @@ use axum::{
 use phi::Workspace;
 use serde::Deserialize;
 use tokio::fs;
+use tracing::error;
 
 use super::{
     ApiError, AppState,
@@ -55,9 +56,10 @@ pub(super) async fn resolve_workspace_path(path: &Path) -> Result<Workspace, Api
         .await
         .map_err(|error| workspace_io_error(&canonical, &error))?;
     if !metadata.is_dir() {
+        error!(path = %canonical.display(), "workspace path is not a directory");
         return Err(ApiError::bad_request(
             "invalid_workspace",
-            format!("workspace is not a directory: {}", canonical.display()),
+            "workspace path is not a directory",
         ));
     }
     drop(
@@ -149,11 +151,12 @@ fn workspace_io_error(path: &Path, error: &io::Error) -> ApiError {
         io::ErrorKind::PermissionDenied => (StatusCode::FORBIDDEN, "workspace_unreadable"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "workspace_io_error"),
     };
-    ApiError::new(
-        status,
-        code,
-        format!("could not access workspace {}: {error}", path.display()),
-    )
+    // Log the path and OS error server-side only; the client-facing message
+    // is generic so the daemon never discloses its on-disk layout. Clients
+    // branch on `code` (workspace_not_found / workspace_unreadable /
+    // workspace_io_error) for UX, not on the message text.
+    error!(error = %error, path = %path.display(), code, "workspace I/O error");
+    ApiError::new(status, code, "could not access workspace")
 }
 
 #[cfg(test)]

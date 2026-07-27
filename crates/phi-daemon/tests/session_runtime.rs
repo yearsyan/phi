@@ -3728,7 +3728,12 @@ async fn mcp_profile_http_supports_http_and_stdio_without_echoing_secrets() {
     let build_failure = socket.receive_json().await;
     assert_eq!(build_failure["type"], "fatal_error");
     assert_eq!(build_failure["code"], "agent_build_failed");
-    assert!(build_failure["message"].as_str().unwrap().contains("local"));
+    // The failure is redacted to a generic message: the stdio command path,
+    // env secrets, and the profile id must never reach the client.
+    let build_message = build_failure["message"].as_str().unwrap();
+    assert!(!build_message.contains("phi-missing-mcp-executable-for-test"));
+    assert!(!build_message.contains(env_secret));
+    assert!(!build_message.contains("local"));
     drop(socket);
 
     let (status, missing_reference) = http_json(

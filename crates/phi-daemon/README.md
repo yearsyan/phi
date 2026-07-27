@@ -118,6 +118,10 @@ profiles     AgentRegistry
 - 同时配置 TLS 证书和私钥后，同一 listener 改为 HTTPS/WSS，不再开放明文端口。
 - daemon 没有 origin 校验、租户隔离或 OS sandbox。绑定非 loopback 地址时必须使用可信
   前置代理或等效安全边界；二维码和长期 key 都应视为可执行工作区命令的高权限凭据。
+- 5xx 与 `mcp_connection_failed` / `Provider(_)` 类错误对外只回显稳定的 generic message
+  （如 `"daemon operation failed"`），原始错误（磁盘路径、临时文件名、上游响应体、URL、
+  MCP 命令行）通过 `tracing` 记录到服务端日志，不会进入 HTTP 响应体或 WebSocket 事件。
+  客户端应始终依据 `code` 字段分支，不要解析 `message` 文本。
 - `read_only`、`workspace_edit`、`full_access` 是工具 effect 与 workspace path 的应用层
   限制。它们不提供进程隔离、系统调用过滤或 network namespace。
 
@@ -152,6 +156,10 @@ revision 做乐观并发控制。开始和终态可发送到 Telegram Output Cha
 ```json
 {"code":"stable_error_code","message":"human-readable message"}
 ```
+
+`code` 是稳定标识，客户端应基于它分支。`message` 仅用于人类阅读：4xx 的校验类错误会
+回显字段级原因，但任何可能携带内部数据（磁盘路径、临时文件名、provider 响应体、URL、
+命令行）的错误一律被替换为 generic 文本，原始细节只写入服务端 `tracing` 日志。
 
 | 方法与路径 | 作用 |
 | --- | --- |
