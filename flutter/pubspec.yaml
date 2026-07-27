@@ -73,6 +73,12 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+# jni 1.0.1 assumes AGP 9 built-in Kotlin is enabled, but Flutter 3.44 keeps
+# legacy Kotlin mode enabled while plugins migrate. That combination fails
+# during Gradle configuration. Remove this pin once jni ships a compatible fix.
+dependency_overrides:
+  jni: 1.0.0
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
