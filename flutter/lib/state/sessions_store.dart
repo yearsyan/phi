@@ -1,16 +1,14 @@
-import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 
 import '../core/models/wire.dart';
 import 'daemon_client.dart';
 
 /// Holds the daemon-wide session list (flat + workspace-grouped) and scheduled
-/// tasks, polling periodically and on demand.
+/// tasks. Refreshes are operation-driven; this store never polls.
 class SessionsStore extends ChangeNotifier {
   SessionsStore(this._client);
 
-  final DaemonClient _client;
+  DaemonClient _client;
 
   List<SessionSummary> sessions = [];
   List<WorkspaceSessionGroup> workspaces = [];
@@ -19,39 +17,59 @@ class SessionsStore extends ChangeNotifier {
   Object? error;
   DateTime? lastLoadedAt;
 
-  Timer? _pollTimer;
   bool _disposed = false;
+  bool _active = false;
+  int _clientGeneration = 0;
 
-  /// Start polling (call when the sessions UI is visible).
-  void startPolling({Duration interval = const Duration(seconds: 8)}) {
-    _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(interval, (_) => refresh(silent: true));
-    unawaited(refresh());
+  /// Performs the initial sessions request and enables automatic refreshes
+  /// when the active daemon changes. Calling this more than once is a no-op.
+  Future<void> activate() async {
+    if (_disposed || _active) return;
+    _active = true;
+    await refresh();
   }
 
-  void stopPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
+  /// Rebinds the store to a different daemon. If the sessions UI has already
+  /// called [activate], a machine switch immediately loads the replacement
+  /// daemon exactly once.
+  ///
+  /// The generation check in [refresh] prevents an in-flight response from
+  /// the previous machine from overwriting the replacement machine's list.
+  Future<void> replaceClient(DaemonClient client) async {
+    if (_disposed) return;
+    _client = client;
+    _clientGeneration++;
+    sessions = [];
+    workspaces = [];
+    scheduledTasks = [];
+    loading = false;
+    error = null;
+    lastLoadedAt = null;
+    notifyListeners();
+
+    if (_active) await refresh();
   }
 
   Future<void> refresh({bool silent = false}) async {
     if (_disposed) return;
+    final generation = _clientGeneration;
+    final client = _client;
     if (!silent) {
       loading = true;
       notifyListeners();
     }
     try {
-      final result = await _client.listSessions();
-      if (_disposed) return;
+      final result = await client.listSessions();
+      if (_disposed || generation != _clientGeneration) return;
       sessions = result.sessions;
       workspaces = result.workspaces;
       error = null;
       lastLoadedAt = DateTime.now();
     } catch (e) {
-      if (_disposed) return;
+      if (_disposed || generation != _clientGeneration) return;
       error = e;
     } finally {
-      if (!_disposed) {
+      if (!_disposed && generation == _clientGeneration) {
         loading = false;
         notifyListeners();
       }
@@ -109,7 +127,6 @@ class SessionsStore extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    stopPolling();
     super.dispose();
   }
 }

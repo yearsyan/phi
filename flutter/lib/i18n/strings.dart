@@ -353,6 +353,8 @@ class S {
     '这是当前使用的机器，删除后应用将回到未配置状态。',
   );
   String get machineSaved => _t('Machine saved', '机器已保存');
+  String machineSaveFailed(Object error) =>
+      _t('Could not save machine: $error', '无法保存机器：$error');
   String get machineDeleted => _t('Machine deleted', '机器已删除');
   String get machineUrlKeyRequired =>
       _t('URL and auth key are required.', '地址和密钥必填。');
@@ -369,6 +371,10 @@ class S {
       _t('Default capability mode for new sessions', '新会话的默认能力模式');
   String get language => _t('Language', '语言');
   String get languageSystem => _t('System', '跟随系统');
+  String get appearance => _t('Appearance', '外观');
+  String get appearanceSystem => _t('System', '跟随系统');
+  String get appearanceLight => _t('Light', '浅色');
+  String get appearanceDark => _t('Dark', '深色');
   String get about => _t('About', '关于');
   String get openSourceLicenses => _t('Open-source licenses', '开源许可证');
   String get thirdPartyLegalese => _t(

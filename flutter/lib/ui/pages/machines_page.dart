@@ -153,7 +153,8 @@ class MachinesPage extends StatelessWidget {
                     ),
                     const SizedBox(height: 12),
                     FilledButton.icon(
-                      onPressed: () => showMachineEditor(context),
+                      onPressed: () =>
+                          showMachineEditor(context, makeActive: true),
                       icon: const Icon(Icons.add, size: 18),
                       label: Text(s.addMachine),
                     ),
@@ -186,7 +187,7 @@ class MachinesPage extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: OutlinedButton.icon(
-                  onPressed: () => showMachineEditor(context),
+                  onPressed: () => showMachineEditor(context, makeActive: true),
                   icon: const Icon(Icons.add, size: 18),
                   label: Text(s.addMachine),
                 ),

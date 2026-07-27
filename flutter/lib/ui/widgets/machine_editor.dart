@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../app.dart';
@@ -10,11 +11,16 @@ import '../../state/app_state.dart';
 import '../../state/daemon_client.dart';
 import '../pages/scan_connection_page.dart';
 
+/// Test hook for verifying the adaptive save-action placement.
+@visibleForTesting
+bool? debugMachineEditorDesktopActionsOverride;
+
 /// Shows the add/edit machine form as a full-screen route.
 ///
 /// [existing] edits that machine; [prefill] (e.g. a scanned QR payload)
 /// starts a new machine with the fields filled in. Saves directly through
-/// [AppSettings]; new machines become active when [makeActive] is set.
+/// [AppSettings]; machine-management entry points set [makeActive] so saving
+/// a new connection immediately reloads the home session list from it.
 Future<void> showMachineEditor(
   BuildContext context, {
   MachineConnection? existing,
@@ -58,12 +64,22 @@ class _MachineEditorPageState extends State<MachineEditorPage> {
   late bool _allowUntrustedCerts;
   bool _obscureKey = true;
   bool _testing = false;
+  bool _saving = false;
   String? _testResult;
   bool _testOk = false;
 
   AppState get _app => AppScope.of(context);
 
   bool get _isEditing => widget.existing != null;
+
+  bool get _usesDesktopActions =>
+      debugMachineEditorDesktopActionsOverride ??
+      switch (defaultTargetPlatform) {
+        TargetPlatform.macOS ||
+        TargetPlatform.windows ||
+        TargetPlatform.linux => true,
+        _ => false,
+      };
 
   @override
   void initState() {
@@ -137,6 +153,7 @@ class _MachineEditorPageState extends State<MachineEditorPage> {
   }
 
   Future<void> _save() async {
+    if (_saving) return;
     final s = S.of(context);
     if (_baseUrl.text.trim().isEmpty || _authKey.text.trim().isEmpty) {
       ScaffoldMessenger.of(
@@ -144,31 +161,40 @@ class _MachineEditorPageState extends State<MachineEditorPage> {
       ).showSnackBar(SnackBar(content: Text(s.machineUrlKeyRequired)));
       return;
     }
-    final settings = _app.settings;
-    final existing = widget.existing;
-    if (existing != null) {
-      await settings.updateMachine(
-        existing.copyWith(
+    setState(() => _saving = true);
+    try {
+      final settings = _app.settings;
+      final existing = widget.existing;
+      if (existing != null) {
+        await settings.updateMachine(
+          existing.copyWith(
+            name: _name.text,
+            baseUrl: _baseUrl.text,
+            authKey: _authKey.text,
+            allowUntrustedCerts: _allowUntrustedCerts,
+          ),
+        );
+      } else {
+        await settings.addMachine(
           name: _name.text,
           baseUrl: _baseUrl.text,
           authKey: _authKey.text,
           allowUntrustedCerts: _allowUntrustedCerts,
-        ),
-      );
-    } else {
-      await settings.addMachine(
-        name: _name.text,
-        baseUrl: _baseUrl.text,
-        authKey: _authKey.text,
-        allowUntrustedCerts: _allowUntrustedCerts,
-        makeActive: widget.makeActive,
-      );
-    }
-    if (mounted) {
+          makeActive: widget.makeActive,
+        );
+      }
+      if (!mounted) return;
+      setState(() => _saving = false);
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(s.machineSaved)));
       Navigator.of(context).pop();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(s.machineSaveFailed(error))));
     }
   }
 
@@ -176,10 +202,22 @@ class _MachineEditorPageState extends State<MachineEditorPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final s = S.of(context);
+    final usesDesktopActions = _usesDesktopActions;
     return Scaffold(
       appBar: AppBar(
         title: Text(_isEditing ? s.editMachine : s.addMachine),
-        actions: [TextButton(onPressed: _save, child: Text(s.save))],
+        actions: [
+          if (!usesDesktopActions)
+            TextButton(
+              onPressed: _saving ? null : _save,
+              child: _saving
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(s.save),
+            ),
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
@@ -253,11 +291,19 @@ class _MachineEditorPageState extends State<MachineEditorPage> {
                     spacing: 12,
                     runSpacing: 8,
                     children: [
-                      FilledButton.icon(
-                        onPressed: _save,
-                        icon: const Icon(Icons.save_outlined, size: 18),
-                        label: Text(s.save),
-                      ),
+                      if (usesDesktopActions)
+                        FilledButton.icon(
+                          onPressed: _saving ? null : _save,
+                          icon: _saving
+                              ? const SizedBox.square(
+                                  dimension: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.save_outlined, size: 18),
+                          label: Text(s.save),
+                        ),
                       OutlinedButton.icon(
                         onPressed: _testing ? null : _test,
                         icon: _testing

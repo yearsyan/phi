@@ -4,6 +4,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'state/app_state.dart';
 import 'ui/home_shell.dart';
 import 'ui/theme.dart';
+import 'ui/widgets/macos_window_frame.dart';
 import 'ui/widgets/windows_title_bar.dart';
 
 /// Root widget: injects [AppState] and builds the adaptive shell.
@@ -27,10 +28,15 @@ class PhiApp extends StatelessWidget {
             'zh' => const Locale('zh'),
             _ => null, // system
           };
+          final themeMode = switch (appState.settings.appTheme) {
+            'light' => ThemeMode.light,
+            'dark' => ThemeMode.dark,
+            _ => ThemeMode.system,
+          };
           return MaterialApp(
             title: 'Phi',
             debugShowCheckedModeBanner: false,
-            themeMode: ThemeMode.system,
+            themeMode: themeMode,
             locale: localeOverride,
             supportedLocales: const [Locale('en'), Locale('zh')],
             localizationsDelegates: const [
@@ -40,8 +46,9 @@ class PhiApp extends StatelessWidget {
             ],
             theme: AppTheme.light(),
             darkTheme: AppTheme.dark(),
-            builder: (context, child) =>
-                WindowsWindowFrame(child: child ?? const SizedBox.shrink()),
+            builder: (context, child) => WindowsWindowFrame(
+              child: MacosWindowFrame(child: child ?? const SizedBox.shrink()),
+            ),
             home: const HomeShell(),
           );
         },

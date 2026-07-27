@@ -9,7 +9,7 @@ import 'package:phi_client/ui/pages/settings_page.dart';
 import 'package:phi_client/ui/theme.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-Future<void> _pumpSettings(WidgetTester tester) async {
+Future<AppSettings> _pumpSettings(WidgetTester tester) async {
   SharedPreferences.setMockInitialValues({});
   final settings = await AppSettings.load();
   final app = AppState(settings);
@@ -27,6 +27,7 @@ Future<void> _pumpSettings(WidgetTester tester) async {
     ),
   );
   await tester.pump();
+  return settings;
 }
 
 void main() {
@@ -42,5 +43,24 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byType(LicensePage), findsOneWidget);
+  });
+
+  testWidgets('appearance can be switched to light mode', (tester) async {
+    final settings = await _pumpSettings(tester);
+    final appearanceField = find.byWidgetPredicate(
+      (widget) =>
+          widget is DropdownButtonFormField<String> &&
+          widget.decoration.labelText == '外观',
+    );
+
+    expect(appearanceField, findsOneWidget);
+    await tester.tap(appearanceField);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('浅色').last);
+    await tester.pumpAndSettle();
+
+    expect(settings.appTheme, 'light');
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('ui.app_theme'), 'light');
   });
 }

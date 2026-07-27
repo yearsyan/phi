@@ -100,6 +100,33 @@ class SettingsPage extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
+                    initialValue: settings.appTheme,
+                    decoration: InputDecoration(
+                      labelText: s.appearance,
+                      border: const OutlineInputBorder(),
+                    ),
+                    items: [
+                      DropdownMenuItem(
+                        value: 'system',
+                        child: Text(s.appearanceSystem),
+                      ),
+                      DropdownMenuItem(
+                        value: 'light',
+                        child: Text(s.appearanceLight),
+                      ),
+                      DropdownMenuItem(
+                        value: 'dark',
+                        child: Text(s.appearanceDark),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        settings.setAppTheme(value);
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
                     initialValue: settings.defaultCapabilityMode,
                     decoration: InputDecoration(
                       labelText: s.defaultCapabilityMode,

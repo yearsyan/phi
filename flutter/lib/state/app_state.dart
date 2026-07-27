@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../core/settings/app_settings.dart';
@@ -6,8 +8,8 @@ import 'daemon_client.dart';
 import 'sessions_store.dart';
 
 /// Root application state: owns settings, the current daemon client and the
-/// sessions store. When connection settings change, the transport (and hence
-/// client/store) is rebuilt and listeners are notified.
+/// sessions store. When connection settings change, the transport/client is
+/// rebuilt, the store is rebound to it, and listeners are notified.
 class AppState extends ChangeNotifier {
   AppState(this.settings, {DaemonTransport? transportOverride})
     : _transportOverride = transportOverride {
@@ -19,7 +21,7 @@ class AppState extends ChangeNotifier {
 
   final AppSettings settings;
   late DaemonClient client;
-  late SessionsStore sessionsStore;
+  late final SessionsStore sessionsStore;
 
   /// Test hook: when set, this transport is always used instead of the one
   /// built from [AppSettings] (keeps widget tests off the network).
@@ -34,8 +36,7 @@ class AppState extends ChangeNotifier {
     if (!identical(transport, _lastTransport)) {
       _lastTransport = transport;
       client = DaemonClient(transport);
-      sessionsStore.dispose();
-      sessionsStore = SessionsStore(client);
+      unawaited(sessionsStore.replaceClient(client));
       notifyListeners();
     }
   }

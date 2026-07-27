@@ -47,6 +47,33 @@ void main() {
     expect(settings.machines, isEmpty);
     expect(settings.activeMachine, isNull);
     expect(settings.isConfigured, isFalse);
+    expect(settings.appTheme, 'system');
+  });
+
+  test('appearance preference is validated and persists', () async {
+    SharedPreferences.setMockInitialValues({});
+    final settings = await AppSettings.load();
+    var notified = 0;
+    settings.addListener(() => notified++);
+
+    await settings.setAppTheme('light');
+
+    expect(settings.appTheme, 'light');
+    expect(notified, 1);
+    expect((await AppSettings.load()).appTheme, 'light');
+
+    await settings.setAppTheme('unsupported');
+    expect(settings.appTheme, 'system');
+    expect(notified, 2);
+    expect((await AppSettings.load()).appTheme, 'system');
+  });
+
+  test('invalid stored appearance preference falls back to system', () async {
+    SharedPreferences.setMockInitialValues({'ui.app_theme': 'sepia'});
+
+    final settings = await AppSettings.load();
+
+    expect(settings.appTheme, 'system');
   });
 
   test(

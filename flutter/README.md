@@ -7,7 +7,9 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
 ## Features
 
 - **Session management** — workspace-grouped session list (pinned first),
-  filter, pin/unpin, delete, pull-to-refresh, live status dots.
+  filter, pin/unpin, delete, pull-to-refresh, live status dots. The list loads
+  on entry and after machine/session operations; it does not periodically
+  poll the daemon.
 - **Chat** — streaming assistant text with markdown + syntax highlighting,
   collapsible reasoning blocks, expandable tool-call rows (streaming args,
   progress lines, results, error states), per-turn activity summaries,
@@ -22,7 +24,11 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
   optional configured recipient target) / enable / run now / delete, open the
   session produced by the last run.
 - **Adaptive layout** — phone: stacked navigation; wide screens (macOS,
-  Windows, tablets): sidebar + detail pane.
+  Windows, tablets): sidebar + detail pane. On macOS the app surface extends
+  into a transparent native title bar while retaining the standard traffic-
+  light window controls.
+- **Appearance** — follow the system appearance or manually select light or
+  dark mode from Settings.
 
 Provider, bot-account, and recipient-target configuration are intentionally not
 included (managed via the web client or the daemon's corresponding APIs). The
@@ -61,7 +67,7 @@ lib/
     daemon_client.dart        # Typed REST client over DaemonTransport
     session_controller.dart   # Per-session WS state machine (snapshot,
                               #   event reduction, reconnect/backoff, resync)
-    sessions_store.dart       # Session list polling store
+    sessions_store.dart       # Operation-driven session list store
     app_state.dart            # Root state: settings → transport → client
   ui/                 # Pages (sessions, chat, tasks, machines, settings) + widgets
 ```
@@ -230,10 +236,13 @@ is intentionally removed.
 Daemon auth keys are stored via `flutter_secure_storage` (Android
 EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI) plus the
 `flutter_secure_storage_ohos` endpoint (OpenHarmony AES + RSA-wrapped key),
-following the same OHOS-fork pattern as `shared_preferences`. After changing
-these dependencies, re-resolve with the Flutter-OH 3.35 toolchain and verify
-`ohos/entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets` picks up the
-new plugin registration.
+following the same OHOS-fork pattern as `shared_preferences`. macOS explicitly
+uses the legacy system Keychain rather than the Data Protection Keychain so
+Flutter's default ad-hoc signed desktop builds do not fail with Keychain status
+`-34018`; no secret is written to plaintext preferences. After changing these dependencies,
+re-resolve with the Flutter-OH 3.35 toolchain and verify
+`ohos/entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets` picks up the new
+plugin registration.
 
 Set up the Flutter-OH environment (adjust `FLUTTER_OHOS_HOME` if needed):
 

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../app.dart';
@@ -30,8 +32,6 @@ class _HomeShellState extends State<HomeShell> {
 
   AppState get _app => AppScope.of(context);
 
-  bool _pollingStarted = false;
-
   /// AppState binding used to detect machine switches: when the client
   /// identity changes, the wide-pane selection (which references sessions
   /// on the previous machine) is reset.
@@ -41,16 +41,13 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (!_pollingStarted) {
-      _pollingStarted = true;
-      _app.sessionsStore.startPolling();
-    }
     final app = _app;
     if (!identical(app, _boundApp)) {
       _boundApp?.removeListener(_onAppChanged);
       _boundApp = app;
       _boundClient = app.client;
       app.addListener(_onAppChanged);
+      unawaited(app.sessionsStore.activate());
     }
   }
 

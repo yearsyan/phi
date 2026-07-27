@@ -27,6 +27,7 @@ class AppSettings extends ChangeNotifier {
   static const _kRecentWorkspaces = 'ui.recent_workspaces';
   static const _kDefaultCapabilityMode = 'ui.default_capability_mode';
   static const _kAppLanguage = 'ui.app_language';
+  static const _kAppTheme = 'ui.app_theme';
 
   /// Optional build-time seed values (development / CI convenience):
   /// `--dart-define=PHI_DAEMON_URL=... --dart-define=PHI_DAEMON_KEY=...`
@@ -44,8 +45,14 @@ class AppSettings extends ChangeNotifier {
     settings._defaultCapabilityMode =
         prefs.getString(_kDefaultCapabilityMode) ?? 'workspace_edit';
     settings._appLanguage = prefs.getString(_kAppLanguage) ?? 'system';
+    settings._appTheme = _normalizeAppTheme(prefs.getString(_kAppTheme));
     return settings;
   }
+
+  static String _normalizeAppTheme(String? theme) => switch (theme) {
+    'light' || 'dark' => theme!,
+    _ => 'system',
+  };
 
   Future<void> _loadMachines(SharedPreferences prefs) async {
     final stored = prefs.getString(_kMachines);
@@ -133,6 +140,7 @@ class AppSettings extends ChangeNotifier {
   final Map<String, List<String>> _recentByMachine = {};
   String _defaultCapabilityMode = 'workspace_edit';
   String _appLanguage = 'system'; // system | en | zh
+  String _appTheme = 'system'; // system | light | dark
 
   /// All configured machines, in user order.
   List<MachineConnection> get machines => List.unmodifiable(_machines);
@@ -175,6 +183,9 @@ class AppSettings extends ChangeNotifier {
 
   /// Language override: `system`, `en` or `zh`.
   String get appLanguage => _appLanguage;
+
+  /// Appearance override: `system`, `light` or `dark`.
+  String get appTheme => _appTheme;
 
   bool get isConfigured => activeMachine?.isConfigured ?? false;
 
@@ -301,6 +312,14 @@ class AppSettings extends ChangeNotifier {
   Future<void> setAppLanguage(String language) async {
     _appLanguage = language;
     await _prefs.setString(_kAppLanguage, language);
+    notifyListeners();
+  }
+
+  Future<void> setAppTheme(String theme) async {
+    final normalized = _normalizeAppTheme(theme);
+    if (normalized == _appTheme) return;
+    _appTheme = normalized;
+    await _prefs.setString(_kAppTheme, normalized);
     notifyListeners();
   }
 

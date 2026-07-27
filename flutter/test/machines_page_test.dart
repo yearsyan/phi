@@ -3,10 +3,42 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phi_client/app.dart';
 import 'package:phi_client/core/settings/app_settings.dart';
+import 'package:phi_client/platform/secure_storage.dart';
 import 'package:phi_client/state/app_state.dart';
 import 'package:phi_client/ui/pages/machines_page.dart';
 import 'package:phi_client/ui/theme.dart';
+import 'package:phi_client/ui/widgets/machine_editor.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+class _InMemorySecureStorage implements SecureKeyValueStore {
+  final Map<String, String> _values = {};
+
+  @override
+  Future<String?> read(String key) async => _values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    _values.remove(key);
+  }
+}
+
+class _FailingSecureStorage implements SecureKeyValueStore {
+  @override
+  Future<String?> read(String key) async => null;
+
+  @override
+  Future<void> write(String key, String value) async {
+    throw StateError('keychain unavailable');
+  }
+
+  @override
+  Future<void> delete(String key) async {}
+}
 
 Future<AppState> _pumpApp(WidgetTester tester, {int machineCount = 0}) async {
   SharedPreferences.setMockInitialValues({});
@@ -37,6 +69,16 @@ Future<AppState> _pumpApp(WidgetTester tester, {int machineCount = 0}) async {
 }
 
 void main() {
+  setUp(() {
+    debugSecureStorageOverride = _InMemorySecureStorage();
+    debugMachineEditorDesktopActionsOverride = true;
+  });
+
+  tearDown(() {
+    debugSecureStorageOverride = null;
+    debugMachineEditorDesktopActionsOverride = null;
+  });
+
   testWidgets('empty state offers to add a machine', (tester) async {
     await _pumpApp(tester);
 
@@ -64,6 +106,68 @@ void main() {
     expect(app.settings.activeMachine!.displayName, 'Workstation');
     expect(find.text('Workstation'), findsOneWidget);
     expect(find.text('当前使用'), findsOneWidget);
+  });
+
+  testWidgets('a newly added machine replaces the active connection', (
+    tester,
+  ) async {
+    final app = await _pumpApp(tester, machineCount: 1);
+    final previousId = app.settings.activeMachine!.id;
+
+    await tester.tap(find.text('添加机器'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).at(0), 'Replacement');
+    await tester.enterText(find.byType(TextField).at(1), '192.0.2.20:8787');
+    await tester.enterText(find.byType(TextField).at(2), 'fixture-key-new');
+    await tester.tap(find.byIcon(Icons.save_outlined));
+    await tester.pumpAndSettle();
+
+    expect(app.settings.activeMachine?.id, isNot(previousId));
+    expect(app.settings.activeMachine?.displayName, 'Replacement');
+  });
+
+  testWidgets('desktop editor shows exactly one in-form save action', (
+    tester,
+  ) async {
+    await _pumpApp(tester);
+
+    await tester.tap(find.text('添加机器'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('保存'), findsOneWidget);
+    expect(find.byIcon(Icons.save_outlined), findsOneWidget);
+    expect(find.widgetWithText(TextButton, '保存'), findsNothing);
+  });
+
+  testWidgets('mobile editor shows exactly one app-bar save action', (
+    tester,
+  ) async {
+    debugMachineEditorDesktopActionsOverride = false;
+    await _pumpApp(tester);
+
+    await tester.tap(find.text('添加机器'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('保存'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, '保存'), findsOneWidget);
+    expect(find.byIcon(Icons.save_outlined), findsNothing);
+  });
+
+  testWidgets('save failures are visible and leave settings unchanged', (
+    tester,
+  ) async {
+    debugSecureStorageOverride = _FailingSecureStorage();
+    final app = await _pumpApp(tester);
+
+    await tester.tap(find.text('添加机器'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).at(1), '192.0.2.10:8787');
+    await tester.enterText(find.byType(TextField).at(2), 'fixture-key-new');
+    await tester.tap(find.byIcon(Icons.save_outlined));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('无法保存机器'), findsOneWidget);
+    expect(app.settings.machines, isEmpty);
   });
 
   testWidgets('saving without URL/key shows a validation message', (

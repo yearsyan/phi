@@ -3,10 +3,28 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phi_client/app.dart';
 import 'package:phi_client/core/settings/app_settings.dart';
+import 'package:phi_client/platform/secure_storage.dart';
 import 'package:phi_client/state/app_state.dart';
 import 'package:phi_client/ui/pages/sessions_page.dart';
 import 'package:phi_client/ui/theme.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+class _InMemorySecureStorage implements SecureKeyValueStore {
+  final Map<String, String> _values = {};
+
+  @override
+  Future<String?> read(String key) async => _values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    _values.remove(key);
+  }
+}
 
 Future<AppState> _pumpSessions(WidgetTester tester) async {
   SharedPreferences.setMockInitialValues({});
@@ -47,6 +65,14 @@ Future<AppState> _pumpSessions(WidgetTester tester) async {
 }
 
 void main() {
+  setUp(() {
+    debugSecureStorageOverride = _InMemorySecureStorage();
+  });
+
+  tearDown(() {
+    debugSecureStorageOverride = null;
+  });
+
   testWidgets('app bar shows the active machine name', (tester) async {
     await _pumpSessions(tester);
 

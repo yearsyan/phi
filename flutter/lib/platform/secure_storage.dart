@@ -43,6 +43,12 @@ class _FlutterSecureStorageAdapter implements SecureKeyValueStore {
 
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    // Flutter's macOS runner is ad-hoc signed by default. The data-protection
+    // Keychain requires a provisioned application identifier, so it fails
+    // with errSecMissingEntitlement (-34018) in local desktop builds. The
+    // legacy macOS Keychain remains encrypted and managed by Keychain
+    // Services, while working with the runner's default signing setup.
+    mOptions: MacOsOptions(useDataProtectionKeyChain: false),
   );
 
   @override
