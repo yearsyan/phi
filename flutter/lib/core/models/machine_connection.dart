@@ -1,8 +1,11 @@
 /// A configured daemon machine the app can connect to.
 ///
-/// The [authKey] carries the long-term daemon key. It must never be written
-/// to logs, error messages, snapshots, or test fixtures; [toString] and
-/// [toJson] callers must treat the JSON output as sensitive.
+/// The [authKey] carries the long-term daemon key. It is persisted outside
+/// this model — in the platform secure store (see `SecureKeyValueStore`) —
+/// keyed by the machine [id]. The [toJson] output therefore never contains
+/// the key; [toString] omits it as well. [tryFromJson] still tolerates a
+/// legacy `auth_key` field so older plaintext SharedPreferences snapshots
+/// can be migrated once into secure storage.
 class MachineConnection {
   const MachineConnection({
     required this.id,
@@ -12,7 +15,8 @@ class MachineConnection {
     this.allowUntrustedCerts = false,
   });
 
-  /// Stable unique id (uuid), used as the active-machine reference.
+  /// Stable unique id (uuid), used as the active-machine reference and as the
+  /// secure-storage key namespace for [authKey].
   final String id;
 
   /// User-assigned label. May be empty; see [displayName].
@@ -21,7 +25,8 @@ class MachineConnection {
   /// Daemon base URL, e.g. `http://192.0.2.10:8787`.
   final String baseUrl;
 
-  /// Long-term daemon auth key.
+  /// Long-term daemon auth key. Held in memory only; persisted via
+  /// `SecureKeyValueStore`, never via [toJson].
   final String authKey;
 
   /// Allow self-signed / untrusted TLS certificates for this machine.
@@ -58,16 +63,22 @@ class MachineConnection {
     );
   }
 
+  /// Persists the non-secret metadata only. The auth key is written
+  /// separately via `SecureKeyValueStore`; it must never appear here.
   Map<String, Object?> toJson() => {
     'id': id,
     'name': name,
     'base_url': baseUrl,
-    'auth_key': authKey,
     'allow_untrusted_certs': allowUntrustedCerts,
   };
 
   /// Tolerant parser: unknown fields are ignored, missing fields fall back
   /// to defaults. Returns `null` when the entry has no usable id.
+  ///
+  /// For migration compatibility this still reads a legacy `auth_key` field
+  /// (older versions stored it in plaintext SharedPreferences). Callers
+  /// should move any such value into secure storage and rewrite the JSON
+  /// without it; see `AppSettings._loadMachines`.
   static MachineConnection? tryFromJson(Object? decoded) {
     if (decoded is! Map<String, Object?>) return null;
     final id = decoded['id'];

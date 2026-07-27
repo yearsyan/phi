@@ -15,7 +15,7 @@ void main() {
     allowUntrustedCerts: true,
   );
 
-  test('JSON round trip preserves all fields', () {
+  test('JSON round trip preserves metadata but never the auth key', () {
     final machine = sample();
     final restored = MachineConnection.tryFromJson(
       jsonDecode(jsonEncode(machine.toJson())),
@@ -24,8 +24,29 @@ void main() {
     expect(restored!.id, machine.id);
     expect(restored.name, machine.name);
     expect(restored.baseUrl, machine.baseUrl);
-    expect(restored.authKey, machine.authKey);
+    // The auth key is intentionally excluded from toJson (it lives in the
+    // platform secure store), so a round trip through JSON must yield empty.
+    expect(restored.authKey, '');
     expect(restored.allowUntrustedCerts, machine.allowUntrustedCerts);
+  });
+
+  test('toJson never emits the auth key', () {
+    final encoded = jsonEncode(sample().toJson());
+    expect(encoded, isNot(contains('auth_key')));
+    expect(encoded, isNot(contains(fixtureKey)));
+  });
+
+  test('tryFromJson still reads a legacy auth_key for migration', () {
+    // Older versions stored the key inside the prefs JSON. The parser must
+    // still surface it so AppSettings can move it into secure storage once.
+    final restored = MachineConnection.tryFromJson({
+      'id': 'legacy-1',
+      'name': 'Legacy',
+      'base_url': 'http://legacy:8787',
+      'auth_key': fixtureKey,
+    });
+    expect(restored, isNotNull);
+    expect(restored!.authKey, fixtureKey);
   });
 
   test('tolerant parsing fills missing fields with defaults', () {

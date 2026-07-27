@@ -56,7 +56,7 @@ lib/
       daemon_transport.dart   # DaemonTransport / DaemonSocket interfaces
       direct_transport.dart   # Direct HTTP(S) + WS(WSS) implementation
     models/wire.dart  # Dart mirror of the daemon wire protocol (dto.rs)
-    settings/         # SharedPreferences-backed settings
+    settings/         # SharedPreferences (UI prefs) + secure storage (auth keys)
   state/
     daemon_client.dart        # Typed REST client over DaemonTransport
     session_controller.dart   # Per-session WS state machine (snapshot,
@@ -226,6 +226,14 @@ The committed `pubspec.lock` is resolved with this Flutter-OH 3.35 / Dart 3.9
 toolchain. Newer stable Flutter SDKs may rewrite SDK-pinned test dependencies;
 do not commit that lockfile-only churn unless the Dart 3.9 compatibility floor
 is intentionally removed.
+
+Daemon auth keys are stored via `flutter_secure_storage` (Android
+EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI) plus the
+`flutter_secure_storage_ohos` endpoint (OpenHarmony AES + RSA-wrapped key),
+following the same OHOS-fork pattern as `shared_preferences`. After changing
+these dependencies, re-resolve with the Flutter-OH 3.35 toolchain and verify
+`ohos/entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets` picks up the
+new plugin registration.
 
 Set up the Flutter-OH environment (adjust `FLUTTER_OHOS_HOME` if needed):
 

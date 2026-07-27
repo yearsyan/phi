@@ -47,6 +47,12 @@ dependencies:
       url: https://gitcode.com/CPF-Flutter/flutter_packages.git
       ref: shared_preferences-v2.5.4-ohos-1.0.0
       path: packages/shared_preferences/shared_preferences
+  # Long-lived daemon keys are stored via the platform keystore / keychain /
+  # DPAPI rather than plaintext SharedPreferences. The upstream federated host
+  # covers Android, iOS, macOS, Windows, Linux, web; the OHOS endpoint below
+  # adds OpenHarmony support (same pattern as shared_preferences above).
+  flutter_secure_storage: ^9.2.4
+  flutter_secure_storage_ohos: ^1.0.0
   uuid: ^4.5.1
   # QR scanning for daemon connection codes. Camera-based; the scan entry is
   # only shown on Android/iOS (no OpenHarmony implementation exists).

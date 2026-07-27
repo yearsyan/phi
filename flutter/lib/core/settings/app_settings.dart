@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../platform/secure_storage.dart';
 import '../models/machine_connection.dart';
 import '../transport/daemon_transport.dart';
 import '../transport/direct_transport.dart';
@@ -38,6 +39,7 @@ class AppSettings extends ChangeNotifier {
     final settings = AppSettings._();
     final prefs = await SharedPreferences.getInstance();
     settings._prefs = prefs;
+    settings._secureStore = defaultSecureStorage();
     await settings._loadMachines(prefs);
     settings._defaultCapabilityMode =
         prefs.getString(_kDefaultCapabilityMode) ?? 'workspace_edit';
@@ -48,7 +50,35 @@ class AppSettings extends ChangeNotifier {
   Future<void> _loadMachines(SharedPreferences prefs) async {
     final stored = prefs.getString(_kMachines);
     if (stored != null) {
-      _machines = _decodeMachines(stored);
+      final decoded = _decodeMachines(stored);
+      // For each machine, resolve its auth key from secure storage. Older
+      // versions stored the key inside the prefs JSON; migrate any such
+      // legacy value into secure storage, then flag the JSON for a rewrite
+      // so the plaintext copy is removed.
+      final migrated = <MachineConnection>[];
+      var needsRewrite = false;
+      for (final machine in decoded) {
+        final storedKey = await _secureStore.read(
+          _authKeyStorageKey(machine.id),
+        );
+        if (storedKey != null && storedKey.isNotEmpty) {
+          // Secure storage already has the key; drop any stale plaintext.
+          if (machine.authKey.isNotEmpty) needsRewrite = true;
+          migrated.add(machine.copyWith(authKey: storedKey));
+        } else if (machine.authKey.isNotEmpty) {
+          // Legacy plaintext path: move once into secure storage.
+          await _secureStore.write(
+            _authKeyStorageKey(machine.id),
+            machine.authKey,
+          );
+          needsRewrite = true;
+          migrated.add(machine);
+        } else {
+          migrated.add(machine);
+        }
+      }
+      _machines = migrated;
+      if (needsRewrite) await _persistMachines();
       final activeId = prefs.getString(_kActiveMachine);
       if (activeId != null && _machines.any((m) => m.id == activeId)) {
         _activeMachineId = activeId;
@@ -66,6 +96,9 @@ class AppSettings extends ChangeNotifier {
             : 'http://127.0.0.1:8787',
         authKey: _seedKey.trim(),
       );
+      // Persist the seeded key via secure storage before the metadata write,
+      // so a reload can recover it.
+      await _secureStore.write(_authKeyStorageKey(machine.id), machine.authKey);
       _machines = [machine];
       _activeMachineId = machine.id;
       await _persistMachines();
@@ -84,6 +117,13 @@ class AppSettings extends ChangeNotifier {
   }
 
   late final SharedPreferences _prefs;
+  late SecureKeyValueStore _secureStore;
+
+  /// Secure-storage key for a machine's auth key. Namespaced by machine id so
+  /// each machine keeps its own secret, and the key never collides with other
+  /// secure-storage consumers.
+  static String _authKeyStorageKey(String machineId) =>
+      'daemon.machine.$machineId.auth_key';
 
   List<MachineConnection> _machines = [];
   String? _activeMachineId;
@@ -197,6 +237,7 @@ class AppSettings extends ChangeNotifier {
       authKey: authKey.trim(),
       allowUntrustedCerts: allowUntrustedCerts,
     );
+    await _secureStore.write(_authKeyStorageKey(machine.id), machine.authKey);
     _machines = [..._machines, machine];
     final activates = makeActive || _activeMachineId == null;
     if (activates) {
@@ -213,6 +254,12 @@ class AppSettings extends ChangeNotifier {
   Future<void> updateMachine(MachineConnection updated) async {
     final index = _machines.indexWhere((m) => m.id == updated.id);
     if (index < 0) return;
+    // Persist the auth key only when it actually changed, to avoid touching
+    // the keystore on cosmetic edits (e.g. renaming a machine).
+    final current = _machines[index];
+    if (current.authKey != updated.authKey) {
+      await _secureStore.write(_authKeyStorageKey(updated.id), updated.authKey);
+    }
     _machines = [..._machines]..[index] = updated;
     await _persistMachines();
     if (updated.id == _activeMachineId) _replaceTransport();
@@ -229,6 +276,7 @@ class AppSettings extends ChangeNotifier {
     if (wasActive) _activeMachineId = null;
     _recentByMachine.remove(id);
     await _prefs.remove(_recentsKey(id));
+    await _secureStore.delete(_authKeyStorageKey(id));
     await _persistMachines();
     if (wasActive) _replaceTransport();
     notifyListeners();

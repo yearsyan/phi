@@ -1,11 +1,44 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:phi_client/core/settings/app_settings.dart';
+import 'package:phi_client/platform/secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// In-memory SecureKeyValueStore for tests. Mirrors the contract of the
+/// production platform-backed store without touching the keystore.
+class _InMemorySecureStorage implements SecureKeyValueStore {
+  _InMemorySecureStorage();
+
+  final Map<String, String> _values = {};
+
+  @override
+  Future<String?> read(String key) async => _values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    _values[key] = value;
+  }
+
+  @override
+  Future<void> delete(String key) async {
+    _values.remove(key);
+  }
+}
 
 void main() {
   // Fixture values only — never real credentials.
   const keyA = 'fixture-key-a';
   const keyB = 'fixture-key-b';
+
+  late _InMemorySecureStorage secureStore;
+
+  setUp(() {
+    secureStore = _InMemorySecureStorage();
+    debugSecureStorageOverride = secureStore;
+  });
+
+  tearDown(() {
+    debugSecureStorageOverride = null;
+  });
 
   test('fresh install starts with no machines and is not configured', () async {
     SharedPreferences.setMockInitialValues({});
@@ -167,6 +200,91 @@ void main() {
 
     expect(settings.machines, hasLength(1));
     expect(settings.activeMachine, isNull);
+  });
+
+  test(
+    'legacy plaintext auth_key is migrated into secure storage and removed from prefs',
+    () async {
+      SharedPreferences.setMockInitialValues({
+        'daemon.machines':
+            '[{"id":"m-1","name":"","base_url":"http://a:1","auth_key":"$keyA"}]',
+      });
+      final settings = await AppSettings.load();
+
+      // The in-memory machine still carries the key so transports keep working.
+      expect(settings.machines.single.authKey, keyA);
+
+      // The key has been copied into the secure store...
+      expect(await secureStore.read('daemon.machine.m-1.auth_key'), keyA);
+      // ...and the plaintext copy is gone from SharedPreferences.
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('daemon.machines'), isNot(contains('auth_key')));
+      expect(prefs.getString('daemon.machines'), isNot(contains(keyA)));
+    },
+  );
+
+  test(
+    'auth keys are persisted via secure storage and survive a reload',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final settings = await AppSettings.load();
+      final machine = await settings.addMachine(
+        baseUrl: 'http://a:1',
+        authKey: keyA,
+      );
+
+      // The prefs JSON must not contain the key.
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('daemon.machines'), isNot(contains(keyA)));
+      expect(prefs.getString('daemon.machines'), isNot(contains('auth_key')));
+
+      // The secure store holds it, keyed by machine id.
+      expect(
+        await secureStore.read('daemon.machine.${machine.id}.auth_key'),
+        keyA,
+      );
+
+      // A fresh load (same secure-store instance) restores the key into memory.
+      final reloaded = await AppSettings.load();
+      expect(reloaded.machines.single.id, machine.id);
+      expect(reloaded.machines.single.authKey, keyA);
+      expect(reloaded.isConfigured, isTrue);
+    },
+  );
+
+  test('removing a machine deletes its auth key from secure storage', () async {
+    SharedPreferences.setMockInitialValues({});
+    final settings = await AppSettings.load();
+    final machine = await settings.addMachine(
+      baseUrl: 'http://a:1',
+      authKey: keyA,
+    );
+    expect(
+      await secureStore.read('daemon.machine.${machine.id}.auth_key'),
+      keyA,
+    );
+
+    await settings.removeMachine(machine.id);
+    expect(
+      await secureStore.read('daemon.machine.${machine.id}.auth_key'),
+      isNull,
+    );
+  });
+
+  test('updating a machine key writes through to secure storage', () async {
+    SharedPreferences.setMockInitialValues({});
+    final settings = await AppSettings.load();
+    final machine = await settings.addMachine(
+      baseUrl: 'http://a:1',
+      authKey: keyA,
+    );
+
+    await settings.updateMachine(machine.copyWith(authKey: keyB));
+    expect(
+      await secureStore.read('daemon.machine.${machine.id}.auth_key'),
+      keyB,
+    );
+    expect(settings.activeMachine?.authKey, keyB);
   });
 
   test('recent workspaces are scoped per machine', () async {

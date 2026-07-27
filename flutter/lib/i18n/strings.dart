@@ -266,6 +266,19 @@ class S {
   String get minutesLabel => _t('minutes', '分钟');
   String get hoursLabel => _t('hours', '小时');
   String get daysLabel => _t('days', '天');
+  String get everyDay => _t('every day', '每天');
+  String weekdayShort(String weekday) => switch (weekday) {
+    'monday' => _t('Mon', '周一'),
+    'tuesday' => _t('Tue', '周二'),
+    'wednesday' => _t('Wed', '周三'),
+    'thursday' => _t('Thu', '周四'),
+    'friday' => _t('Fri', '周五'),
+    'saturday' => _t('Sat', '周六'),
+    'sunday' => _t('Sun', '周日'),
+    _ => weekday,
+  };
+  String dailyScheduleValue(String time, String days, String timezone) =>
+      _t('Daily $time · $days [$timezone]', '$days $time [$timezone]');
   String get timezoneLabel => _t('Timezone (IANA)', '时区（IANA）');
   String get outputChannel => _t('Recipient target', '收件目标');
   String get noOutputChannel => _t('No notifications', '不发送通知');

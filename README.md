@@ -18,5 +18,9 @@ daemon 在交互式终端中默认显示包含连接地址和长期 key 的 App 
 时选择一个非 loopback 的本机 IPv4，仍不可用才回退 `127.0.0.1`。这会扩大网络暴露面。
 可用 `--no-qr` 关闭二维码，非终端 stderr 会自动跳过。
 
+Web 客户端把长期 key 存于 `sessionStorage`（关闭 tab 即清除），Flutter 客户端通过平台
+secure storage（Android EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI /
+OpenHarmony AES）保存，不再写入明文 SharedPreferences。
+
 Provider 配置、HTTP/WS 协议和停止语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。

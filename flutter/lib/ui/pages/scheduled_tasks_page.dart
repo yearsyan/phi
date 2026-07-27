@@ -255,33 +255,48 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
               ),
             ),
             const SizedBox(height: 6),
-            Wrap(
-              spacing: 12,
-              runSpacing: 4,
-              children: [
-                _meta(theme, Icons.schedule, _describeSchedule(task.schedule)),
-                if (task.workspace != null)
-                  _meta(theme, Icons.folder_outlined, task.workspace!),
-                if (task.outputChannelId != null)
+            LayoutBuilder(
+              builder: (context, constraints) => Wrap(
+                spacing: 12,
+                runSpacing: 4,
+                children: [
                   _meta(
                     theme,
-                    Icons.send_rounded,
-                    S.of(context).outputChannelValue(task.outputChannelId!),
+                    Icons.schedule,
+                    _describeSchedule(task.schedule),
+                    constraints.maxWidth,
                   ),
-                if (task.nextRunAt != null && task.enabled)
-                  _meta(
-                    theme,
-                    Icons.event_outlined,
-                    S.of(context).nextRun(_formatTime(task.nextRunAt!)),
-                  ),
-                if (lastRun != null)
-                  _meta(
-                    theme,
-                    Icons.history,
-                    lastRun.outcome,
-                    color: outcomeColor,
-                  ),
-              ],
+                  if (task.workspace != null)
+                    _meta(
+                      theme,
+                      Icons.folder_outlined,
+                      task.workspace!,
+                      constraints.maxWidth,
+                    ),
+                  if (task.outputChannelId != null)
+                    _meta(
+                      theme,
+                      Icons.send_rounded,
+                      S.of(context).outputChannelValue(task.outputChannelId!),
+                      constraints.maxWidth,
+                    ),
+                  if (task.nextRunAt != null && task.enabled)
+                    _meta(
+                      theme,
+                      Icons.event_outlined,
+                      S.of(context).nextRun(_formatTime(task.nextRunAt!)),
+                      constraints.maxWidth,
+                    ),
+                  if (lastRun != null)
+                    _meta(
+                      theme,
+                      Icons.history,
+                      lastRun.outcome,
+                      constraints.maxWidth,
+                      color: outcomeColor,
+                    ),
+                ],
+              ),
             ),
           ],
         ),
@@ -289,16 +304,30 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
     );
   }
 
-  Widget _meta(ThemeData theme, IconData icon, String text, {Color? color}) {
+  Widget _meta(
+    ThemeData theme,
+    IconData icon,
+    String text,
+    double maxWidth, {
+    Color? color,
+  }) {
     final effective = color ?? theme.colorScheme.outline;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Icon(icon, size: 12, color: effective),
         const SizedBox(width: 4),
-        Text(
-          text,
-          style: theme.textTheme.labelSmall?.copyWith(color: effective),
+        ConstrainedBox(
+          constraints: BoxConstraints(
+            // Icon + gap so the whole row stays inside the tile.
+            maxWidth: maxWidth > 16 ? maxWidth - 16 : 0,
+          ),
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.labelSmall?.copyWith(color: effective),
+          ),
         ),
       ],
     );
@@ -307,7 +336,14 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
   String _describeSchedule(ScheduledTaskSchedule schedule) {
     final s = S.of(context);
     if (schedule.type == 'daily') {
-      return '${s.dailyLabel} ${schedule.time} (${schedule.weekdays.join(', ')}) [${schedule.timezone}]';
+      final days = schedule.weekdays.length == 7
+          ? s.everyDay
+          : schedule.weekdays.map(s.weekdayShort).join(' ');
+      return s.dailyScheduleValue(
+        schedule.time ?? '',
+        days,
+        schedule.timezone ?? '',
+      );
     }
     final unit = switch (schedule.unit) {
       'minutes' => s.minutesLabel,
@@ -678,7 +714,7 @@ class _TaskEditorDialogState extends State<_TaskEditorDialog> {
                     for (final day in _weekdayOrder)
                       FilterChip(
                         label: Text(
-                          day.substring(0, 3),
+                          S.of(context).weekdayShort(day),
                           style: const TextStyle(fontSize: 11),
                         ),
                         selected: _weekdays.contains(day),
