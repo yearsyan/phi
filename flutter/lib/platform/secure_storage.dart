@@ -1,11 +1,12 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 /// Stores small secret strings (daemon auth keys) outside plaintext
 /// SharedPreferences.
 ///
-/// The production implementation delegates to `flutter_secure_storage`, which
-/// uses each platform's native credential store:
+/// Production uses each platform's native credential store, delegating to
+/// `flutter_secure_storage` except for the prompt-free macOS adapter below:
 /// - Android: EncryptedSharedPreferences (Jetpack Security, AES-GCM)
 /// - iOS / macOS: Keychain
 /// - Windows: DPAPI
@@ -35,7 +36,42 @@ SecureKeyValueStore? debugSecureStorageOverride;
 SecureKeyValueStore defaultSecureStorage() {
   final override = debugSecureStorageOverride;
   if (override != null) return override;
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.macOS) {
+    return const MacOsPromptFreeKeychainStore();
+  }
   return const _FlutterSecureStorageAdapter();
+}
+
+/// macOS Keychain adapter whose native implementation never permits
+/// SecurityAgent to display an authentication dialog.
+///
+/// Release builds use a stable Developer ID identity, but legacy items may
+/// still have an ACL created by an older ad-hoc build. The native side reads
+/// those items only when macOS can authorize the access without interaction,
+/// then migrates them into Phi's current service namespace.
+@visibleForTesting
+class MacOsPromptFreeKeychainStore implements SecureKeyValueStore {
+  const MacOsPromptFreeKeychainStore({
+    MethodChannel channel = const MethodChannel(
+      'dev.phi.phi_client/prompt_free_keychain',
+    ),
+  }) : _channel = channel;
+
+  final MethodChannel _channel;
+
+  @override
+  Future<String?> read(String key) =>
+      _channel.invokeMethod<String>('read', <String, Object?>{'key': key});
+
+  @override
+  Future<void> write(String key, String value) => _channel.invokeMethod<void>(
+    'write',
+    <String, Object?>{'key': key, 'value': value},
+  );
+
+  @override
+  Future<void> delete(String key) =>
+      _channel.invokeMethod<void>('delete', <String, Object?>{'key': key});
 }
 
 class _FlutterSecureStorageAdapter implements SecureKeyValueStore {
@@ -43,12 +79,6 @@ class _FlutterSecureStorageAdapter implements SecureKeyValueStore {
 
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
-    // Flutter's macOS runner is ad-hoc signed by default. The data-protection
-    // Keychain requires a provisioned application identifier, so it fails
-    // with errSecMissingEntitlement (-34018) in local desktop builds. The
-    // legacy macOS Keychain remains encrypted and managed by Keychain
-    // Services, while working with the runner's default signing setup.
-    mOptions: MacOsOptions(useDataProtectionKeyChain: false),
   );
 
   @override

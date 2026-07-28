@@ -261,10 +261,15 @@ Daemon auth keys are stored via `flutter_secure_storage` (Android
 EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI) plus the
 `flutter_secure_storage_ohos` endpoint (OpenHarmony AES + RSA-wrapped key),
 following the same OHOS-fork pattern as `shared_preferences`. macOS explicitly
-uses the legacy system Keychain rather than the Data Protection Keychain so
-Flutter's default ad-hoc signed desktop builds do not fail with Keychain status
-`-34018`; no secret is written to plaintext preferences. After changing these dependencies,
-re-resolve with the Flutter-OH 3.35 toolchain and verify
+uses a native legacy-Keychain adapter that sets
+`LAContext.interactionNotAllowed`, so an item created by an older ad-hoc build
+can never trigger a SecurityAgent password dialog. It migrates an old item only
+when the existing ACL already permits noninteractive access; otherwise the key
+is treated as missing and the machine must be paired again. New items use Phi's
+versioned Keychain service namespace; ad-hoc builds use a separate local
+namespace so they cannot poison the Developer ID app's ACL. No secret is
+written to plaintext preferences. After changing these dependencies, re-resolve
+with the Flutter-OH 3.35 toolchain and verify
 `ohos/entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets` picks up the new
 plugin registration.
 
