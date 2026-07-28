@@ -302,29 +302,20 @@
   gap: 8px;
 }
 
+.statusSlot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+}
+
 .statusDot {
+  display: block;
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--phi-success);
-}
-
-.statusBusy {
-  background: var(--phi-warning);
-  box-shadow: 0 0 0 4px var(--phi-warning-soft);
-}
-
-.statusWarning {
-  background: var(--phi-danger);
-}
-
-.statusOffline {
-  background: var(--phi-text-dim);
-}
-
-.statusReady {
-  background: var(--phi-success);
+  box-shadow: 0 0 0 4px var(--phi-success-soft);
 }
 
 .sessionTitle {

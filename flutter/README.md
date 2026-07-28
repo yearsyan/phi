@@ -7,9 +7,9 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
 ## Features
 
 - **Session management** — workspace-grouped session list (pinned first),
-  filter, pin/unpin, delete, pull-to-refresh, live status dots. The list loads
-  on entry and after machine/session operations; it does not periodically
-  poll the daemon.
+  filter, pin/unpin, delete, pull-to-refresh, and a dot shown only while a
+  session has an active generation run. The list loads on entry and after
+  machine/session operations; it does not periodically poll the daemon.
 - **Chat** — streaming assistant text with markdown + syntax highlighting,
   collapsible reasoning blocks, expandable tool-call rows (streaming args,
   progress lines, results, error states), per-turn activity summaries,

@@ -158,13 +158,21 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
     () =>
       workspaces.map((workspace) => ({
         ...workspace,
-        sessions: workspace.sessions.map((session) =>
-          session.session_id === liveSessionId && controls.state.title
-            ? { ...session, title: controls.state.title }
-            : session,
-        ),
+        sessions: workspace.sessions.map((session) => {
+          if (session.session_id !== liveSessionId) return session;
+          return {
+            ...session,
+            active_run_id: controls.state.activeRunId,
+            ...(controls.state.title ? { title: controls.state.title } : {}),
+          };
+        }),
       })),
-    [controls.state.title, liveSessionId, workspaces],
+    [
+      controls.state.activeRunId,
+      controls.state.title,
+      liveSessionId,
+      workspaces,
+    ],
   );
 
   const startNewSession = useCallback(() => {

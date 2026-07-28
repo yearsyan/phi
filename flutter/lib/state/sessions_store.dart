@@ -102,6 +102,31 @@ class SessionsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Projects the active run observed on an attached session socket into the
+  /// global list, so the generation indicator changes without HTTP polling.
+  void updateActiveRun(String sessionId, String? activeRunId) {
+    var changed = false;
+    for (var index = 0; index < sessions.length; index++) {
+      final session = sessions[index];
+      if (session.sessionId == sessionId &&
+          session.activeRunId != activeRunId) {
+        sessions[index] = _withActiveRunId(session, activeRunId);
+        changed = true;
+      }
+    }
+    for (final group in workspaces) {
+      for (var index = 0; index < group.sessions.length; index++) {
+        final session = group.sessions[index];
+        if (session.sessionId == sessionId &&
+            session.activeRunId != activeRunId) {
+          group.sessions[index] = _withActiveRunId(session, activeRunId);
+          changed = true;
+        }
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
   void _replaceSummary(SessionSummary updated) {
     final index = sessions.indexWhere((s) => s.sessionId == updated.sessionId);
     if (index >= 0) sessions[index] = updated;
@@ -130,3 +155,19 @@ class SessionsStore extends ChangeNotifier {
     super.dispose();
   }
 }
+
+SessionSummary _withActiveRunId(SessionSummary session, String? activeRunId) =>
+    SessionSummary(
+      sessionId: session.sessionId,
+      title: session.title,
+      pinned: session.pinned,
+      profileId: session.profileId,
+      workspace: session.workspace,
+      status: session.status,
+      activeRunId: activeRunId,
+      queuedRuns: session.queuedRuns,
+      capabilityMode: session.capabilityMode,
+      config: session.config,
+      messageCount: session.messageCount,
+      subagents: session.subagents,
+    );

@@ -295,23 +295,6 @@ class _SessionTile extends StatelessWidget {
   final VoidCallback onTogglePin;
   final VoidCallback onDelete;
 
-  Color _statusColor(ThemeData theme) {
-    switch (session.status) {
-      case SessionStatus.running:
-        return Colors.green;
-      case SessionStatus.compacting:
-        return Colors.orange;
-      case SessionStatus.stopping:
-      case SessionStatus.closing:
-        return Colors.orange;
-      case SessionStatus.offline:
-      case SessionStatus.closed:
-        return theme.colorScheme.outline;
-      default:
-        return theme.colorScheme.primary.withAlpha(160);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -325,15 +308,24 @@ class _SessionTile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           child: Row(
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: _statusColor(theme),
-                ),
+              SizedBox(
+                width: 18,
+                child: session.activeRunId == null
+                    ? null
+                    : Center(
+                        child: Container(
+                          key: ValueKey(
+                            'session-generating-${session.sessionId}',
+                          ),
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: theme.colorScheme.primary,
+                          ),
+                        ),
+                      ),
               ),
-              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,

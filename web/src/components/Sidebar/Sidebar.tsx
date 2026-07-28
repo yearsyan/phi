@@ -9,7 +9,6 @@ import { useI18n } from '../../i18n/I18nProvider.tsx';
 import { LOCALE_LABELS, LOCALES } from '../../i18n/translations.ts';
 import type { Theme } from '../../prefs.ts';
 import type {
-  SessionStatus,
   SessionSummary,
   WorkspaceSessionGroup,
 } from '../../types/wire.ts';
@@ -275,10 +274,13 @@ export function Sidebar({
                   <span className={styles.workspaceCount}>
                     {group.sessions.length}
                   </span>
-                  <span
-                    className={`${styles.statusDot} ${styles.workspaceStatus} ${statusClass(workspaceStatus(group.sessions), styles)}`}
-                    aria-hidden="true"
-                  />
+                  {workspaceIsGenerating(group.sessions) && (
+                    <span
+                      className={`${styles.statusDot} ${styles.workspaceStatus}`}
+                      data-workspace-generating-indicator
+                      aria-hidden="true"
+                    />
+                  )}
                 </button>
 
                 {!collapsed && (
@@ -307,8 +309,16 @@ export function Sidebar({
                         >
                           <div className={styles.sessionTop}>
                             <span
-                              className={`${styles.statusDot} ${statusClass(session.status, styles)}`}
-                            />
+                              className={styles.statusSlot}
+                              aria-hidden="true"
+                            >
+                              {session.active_run_id !== null && (
+                                <span
+                                  className={styles.statusDot}
+                                  data-session-generating-indicator
+                                />
+                              )}
+                            </span>
                             <span className={styles.sessionTitle}>
                               {session.title ??
                                 sessionTitle(session.session_id)}
@@ -444,51 +454,12 @@ function workspaceLabel(workspace: string | null, fallback: string): string {
   return normalized.split(/[\\/]/).pop() ?? normalized;
 }
 
-function workspaceStatus(sessions: readonly SessionSummary[]): SessionStatus {
-  if (
-    sessions.some(
-      (session) =>
-        session.status === 'running' || session.status === 'compacting',
-    )
-  ) {
-    return 'running';
-  }
-  if (
-    sessions.some(
-      (session) =>
-        session.status === 'stopping' || session.status === 'closing',
-    )
-  ) {
-    return 'stopping';
-  }
-  if (
-    sessions.some(
-      (session) => session.status !== 'closed' && session.status !== 'offline',
-    )
-  ) {
-    return 'idle';
-  }
-  return 'offline';
+function workspaceIsGenerating(sessions: readonly SessionSummary[]): boolean {
+  return sessions.some((session) => session.active_run_id !== null);
 }
 
 function sessionTitle(sessionId: string): string {
   return sessionId.length > 12
     ? `Session ${sessionId.slice(-6)}`
     : `Session ${sessionId}`;
-}
-
-function statusClass(
-  status: SessionStatus,
-  classes: Record<string, string>,
-): string {
-  if (status === 'running' || status === 'compacting') {
-    return classes.statusBusy ?? '';
-  }
-  if (status === 'stopping' || status === 'closing') {
-    return classes.statusWarning ?? '';
-  }
-  if (status === 'closed' || status === 'offline') {
-    return classes.statusOffline ?? '';
-  }
-  return classes.statusReady ?? '';
 }

@@ -124,6 +124,61 @@ describe('Sidebar', () => {
     expect(screen.queryByText('Session abc123')).toBeNull();
   });
 
+  it('shows dots only for sessions with an active generation run', () => {
+    const view = renderSidebar([
+      workspaceGroup('/workspace/idle', [
+        {
+          ...activatedSession,
+          session_id: 'idle-session',
+          title: 'Idle session',
+          workspace: '/workspace/idle',
+        },
+        {
+          ...activatedSession,
+          session_id: 'offline-session',
+          title: 'Offline session',
+          workspace: '/workspace/idle',
+          status: 'offline',
+        },
+      ]),
+      workspaceGroup('/workspace/generating', [
+        {
+          ...activatedSession,
+          session_id: 'generating-session',
+          title: 'Generating session',
+          workspace: '/workspace/generating',
+          status: 'running',
+          active_run_id: 'run-1',
+        },
+      ]),
+    ]);
+
+    expect(
+      view.container.querySelectorAll('[data-session-generating-indicator]'),
+    ).toHaveLength(1);
+    expect(
+      view.container.querySelectorAll('[data-workspace-generating-indicator]'),
+    ).toHaveLength(1);
+    expect(
+      screen
+        .getByText('Idle session')
+        .closest('button')
+        ?.querySelector('[data-session-generating-indicator]'),
+    ).toBeNull();
+    expect(
+      screen
+        .getByText('Offline session')
+        .closest('button')
+        ?.querySelector('[data-session-generating-indicator]'),
+    ).toBeNull();
+    expect(
+      screen
+        .getByText('Generating session')
+        .closest('button')
+        ?.querySelector('[data-session-generating-indicator]'),
+    ).not.toBeNull();
+  });
+
   it('renders the backend workspace tree without regrouping its sessions', () => {
     renderSidebar([
       workspaceGroup('/workspace/phi', [

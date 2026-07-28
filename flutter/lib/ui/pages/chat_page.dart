@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -46,6 +48,9 @@ class _ChatPageState extends State<ChatPage> {
   bool _stickToBottom = true;
   bool _userDragging = false;
   String? _lastCreatedSessionId;
+  String? _projectedSessionId;
+  String? _projectedActiveRunId;
+  bool _hasProjectedActiveRun = false;
   late SessionTarget _currentTarget = widget.target;
 
   @override
@@ -63,13 +68,16 @@ class _ChatPageState extends State<ChatPage> {
 
   void _createController() {
     final app = _app!;
+    _projectedSessionId = null;
+    _projectedActiveRunId = null;
+    _hasProjectedActiveRun = false;
     final controller =
         widget.controllerFactory?.call() ??
         SessionController(
           client: app.client,
           target: _currentTarget,
           onSessionListMayChange: () {
-            app.sessionsStore.refresh(silent: true);
+            unawaited(_refreshSessionList(app));
             final sessionId = _controller?.sessionId;
             if (sessionId != null &&
                 sessionId != _lastCreatedSessionId &&
@@ -102,7 +110,31 @@ class _ChatPageState extends State<ChatPage> {
     _createController();
   }
 
+  Future<void> _refreshSessionList(AppState app) async {
+    await app.sessionsStore.refresh(silent: true);
+    if (!mounted || !identical(_app, app)) return;
+    _projectActiveRun(force: true);
+  }
+
+  void _projectActiveRun({bool force = false}) {
+    final current = _controller;
+    if (current != null) {
+      final sessionId = current.sessionId;
+      if (sessionId != null &&
+          (force ||
+              !_hasProjectedActiveRun ||
+              sessionId != _projectedSessionId ||
+              current.activeRunId != _projectedActiveRunId)) {
+        _projectedSessionId = sessionId;
+        _projectedActiveRunId = current.activeRunId;
+        _hasProjectedActiveRun = true;
+        _app?.sessionsStore.updateActiveRun(sessionId, current.activeRunId);
+      }
+    }
+  }
+
   void _onControllerUpdate() {
+    _projectActiveRun();
     // Never fight an active drag: while streaming, yanking to the bottom on
     // every delta makes it impossible to scroll up and read earlier output.
     if (_stickToBottom && !_userDragging && _scroll.hasClients) {

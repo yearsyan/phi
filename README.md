@@ -24,6 +24,9 @@ OpenHarmony AES）保存，不再写入明文 SharedPreferences。
 macOS Keychain 访问显式禁止认证 UI；无法无交互读取的旧 ad-hoc 签名条目会被视为缺失，
 避免应用启动时弹出系统密码框。
 
+Web 与 Flutter 的会话列表只在会话存在 active run、正在生成时显示状态点；空闲、
+离线或仅已加载的会话不显示状态点。
+
 定时任务的 Telegram 通知使用 Rich Markdown，可原生展示标题、加粗、列表和表格；格式被
 Telegram 拒绝时会回退为纯文本，避免通知因模型生成的 Markdown 不完整而丢失。
 
