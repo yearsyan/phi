@@ -15,6 +15,7 @@ class AppTheme {
       PageTransitionsTheme(
         builders: <TargetPlatform, PageTransitionsBuilder>{
           ...const PageTransitionsTheme().builders,
+          TargetPlatform.macOS: const DesktopPageTransitionsBuilder(),
           TargetPlatform.windows: const WindowsPageTransitionsBuilder(),
         },
       );
@@ -340,12 +341,13 @@ class AppTheme {
   }
 }
 
-/// A compact desktop route transition without the default full-page zoom.
-class WindowsPageTransitionsBuilder extends PageTransitionsBuilder {
-  const WindowsPageTransitionsBuilder();
+/// A quick desktop route transition without a full-page zoom or horizontal
+/// page sweep.
+class DesktopPageTransitionsBuilder extends PageTransitionsBuilder {
+  const DesktopPageTransitionsBuilder();
 
-  static const forwardDuration = Duration(milliseconds: 180);
-  static const backwardDuration = Duration(milliseconds: 140);
+  static const forwardDuration = Duration(milliseconds: 140);
+  static const backwardDuration = Duration(milliseconds: 100);
   static const _beginOffset = Offset(0.012, 0);
 
   @override
@@ -379,4 +381,14 @@ class WindowsPageTransitionsBuilder extends PageTransitionsBuilder {
       ),
     );
   }
+}
+
+/// Backward-compatible Windows-specific name for the shared desktop
+/// transition.
+class WindowsPageTransitionsBuilder extends DesktopPageTransitionsBuilder {
+  const WindowsPageTransitionsBuilder();
+
+  static const forwardDuration = DesktopPageTransitionsBuilder.forwardDuration;
+  static const backwardDuration =
+      DesktopPageTransitionsBuilder.backwardDuration;
 }

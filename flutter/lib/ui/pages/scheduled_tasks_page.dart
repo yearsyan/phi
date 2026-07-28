@@ -144,13 +144,27 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
         automaticallyImplyLeading: !widget.embedded,
         title: Text(S.of(context).scheduledTasks),
         actions: [
-          IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: _load),
+          IconButton(
+            tooltip: MaterialLocalizations.of(
+              context,
+            ).refreshIndicatorSemanticLabel,
+            icon: const Icon(Icons.refresh_rounded),
+            onPressed: _load,
+          ),
+          Padding(
+            padding: const EdgeInsetsDirectional.only(end: 12),
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                minimumSize: const Size(0, 36),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                visualDensity: VisualDensity.compact,
+              ),
+              onPressed: () => _showTaskDialog(),
+              icon: const Icon(Icons.add, size: 18),
+              label: Text(S.of(context).newTask),
+            ),
+          ),
         ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _showTaskDialog(),
-        icon: const Icon(Icons.add),
-        label: Text(S.of(context).newTask),
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -168,7 +182,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage> {
           : RefreshIndicator(
               onRefresh: _load,
               child: ListView.builder(
-                padding: const EdgeInsets.only(bottom: 96),
+                padding: const EdgeInsets.only(bottom: 16),
                 itemCount: _tasks!.length,
                 itemBuilder: (context, index) => _buildTaskTile(_tasks![index]),
               ),

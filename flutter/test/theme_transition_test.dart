@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:phi_client/ui/theme.dart';
 
 void main() {
-  testWidgets('Windows routes use a compact non-scaling transition', (
+  testWidgets('desktop routes use a quick non-scaling transition', (
     tester,
   ) async {
     late BuildContext routeContext;
@@ -19,20 +19,20 @@ void main() {
       ),
     );
 
-    final builder = Theme.of(
-      routeContext,
-    ).pageTransitionsTheme.builders[TargetPlatform.windows];
-    expect(builder, isA<WindowsPageTransitionsBuilder>());
-    expect(
-      builder!.transitionDuration,
-      WindowsPageTransitionsBuilder.forwardDuration,
-    );
-    expect(
-      builder.reverseTransitionDuration,
-      WindowsPageTransitionsBuilder.backwardDuration,
-    );
+    final builders = Theme.of(routeContext).pageTransitionsTheme.builders;
+    final windowsBuilder = builders[TargetPlatform.windows];
+    final macosBuilder = builders[TargetPlatform.macOS];
+    expect(windowsBuilder, isA<DesktopPageTransitionsBuilder>());
+    expect(macosBuilder, isA<DesktopPageTransitionsBuilder>());
+    for (final builder in [windowsBuilder, macosBuilder]) {
+      expect(builder!.transitionDuration, const Duration(milliseconds: 140));
+      expect(
+        builder.reverseTransitionDuration,
+        const Duration(milliseconds: 100),
+      );
+    }
 
-    final transition = builder.buildTransitions<void>(
+    final transition = macosBuilder!.buildTransitions<void>(
       MaterialPageRoute<void>(builder: (_) => const SizedBox()),
       routeContext,
       const AlwaysStoppedAnimation<double>(0.5),

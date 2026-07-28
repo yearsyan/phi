@@ -120,6 +120,35 @@ Future<AppState> _pumpPage(
 }
 
 void main() {
+  testWidgets(
+    'new task action is in the app bar instead of a floating button',
+    (tester) async {
+      tester.view.physicalSize = const Size(1200, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      await _pumpPage(tester, _ScheduledTasksTransport(const []));
+
+      final newTaskButton = find.widgetWithText(FilledButton, '新建任务');
+      expect(newTaskButton, findsOneWidget);
+      expect(
+        find.ancestor(of: newTaskButton, matching: find.byType(AppBar)),
+        findsOneWidget,
+      );
+      expect(
+        tester.getCenter(newTaskButton).dx,
+        greaterThan(tester.getCenter(find.byIcon(Icons.refresh_rounded)).dx),
+      );
+      expect(find.byType(FloatingActionButton), findsNothing);
+
+      await tester.tap(newTaskButton);
+      await tester.pumpAndSettle();
+
+      expect(find.byType(AlertDialog), findsOneWidget);
+      expect(find.text('新建任务'), findsWidgets);
+    },
+  );
+
   testWidgets('long daily schedule description does not overflow a phone '
       'screen', (tester) async {
     tester.view.physicalSize = const Size(360, 740);

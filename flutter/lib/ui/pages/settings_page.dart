@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../app.dart';
 import '../../core/models/wire.dart';
 import '../../i18n/strings.dart';
+import '../widgets/desktop_navigation.dart';
 import 'machines_page.dart';
 
 /// App settings: entry point to machine management plus default preferences
@@ -18,7 +19,7 @@ class SettingsPage extends StatelessWidget {
     final app = AppScope.of(context);
     final settings = app.settings;
     final s = S.of(context);
-    return Scaffold(
+    final page = Scaffold(
       appBar: AppBar(
         automaticallyImplyLeading: !embedded,
         title: Text(s.settings),
@@ -171,5 +172,6 @@ class SettingsPage extends StatelessWidget {
         ],
       ),
     );
+    return DesktopRouteDismissRegion(enabled: !embedded, child: page);
   }
 }

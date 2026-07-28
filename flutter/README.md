@@ -27,6 +27,8 @@ platform-agnostic; Linux can use standard Flutter scaffolding.
   Windows, tablets): sidebar + detail pane. On macOS the app surface extends
   into a transparent native title bar while retaining the standard traffic-
   light window controls.
+- **Desktop navigation** — Windows and macOS use compact route transitions;
+  Escape closes dialogs and returns from Settings.
 - **Appearance** — follow the system appearance or manually select light or
   dark mode from Settings.
 
