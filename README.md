@@ -27,6 +27,10 @@ macOS Keychain 访问显式禁止认证 UI；无法无交互读取的旧 ad-hoc 
 Web 与 Flutter 的会话列表只在会话存在 active run、正在生成时显示状态点；空闲、
 离线或仅已加载的会话不显示状态点。
 
+向 GitHub 推送 `v**` tag 会发布内嵌 Web 客户端的 daemon ZIP，覆盖 macOS ARM64、
+Windows x86_64、Linux x86_64 和 Linux ARM64；普通 branch push 不触发发布 workflow。
+macOS daemon Release 产物要求 Developer ID 签名和 Apple notarization。
+
 定时任务的 Telegram 通知使用 Rich Markdown，可原生展示标题、加粗、列表和表格；格式被
 Telegram 拒绝时会回退为纯文本，避免通知因模型生成的 Markdown 不完整而丢失。
 

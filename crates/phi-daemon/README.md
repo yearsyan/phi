@@ -333,6 +333,26 @@ cargo build --release -p phi-daemon
 release 构建把 `web/dist` 嵌入二进制；debug 构建从磁盘读取。没有 `web/dist` 时
 `build.rs` 会生成占位页面，因此仍可编译 daemon。
 
+## 发布产物
+
+向 GitHub 推送匹配 `v**` 的 tag 会构建并把以下 daemon ZIP 上传到同名 Release；普通
+branch push 不触发该 workflow：
+
+- `phi-daemon-macos-arm64.zip`
+- `phi-daemon-windows-x86_64.zip`
+- `phi-daemon-linux-x86_64.zip`
+- `phi-daemon-linux-arm64.zip`
+
+四个平台都先构建 `web/dist`，因此 ZIP 中的 daemon 已内嵌 Web 客户端。Linux ARM64
+使用 GitHub 原生 ARM64 runner 构建，不是交叉编译。daemon 与客户端的 Release 发布 job
+使用同一个 concurrency group，避免两个 workflow 同时创建同名 Release。
+
+macOS 正式 Release 产物必须使用 Developer ID Application 签名并通过 Apple notarization；
+缺少任一签名配置时 workflow 会失败，不发布 ad-hoc 版本。仓库需要配置
+`MACOS_CERTIFICATE_P12_BASE64`、`MACOS_CERTIFICATE_PASSWORD`、
+`APPLE_API_KEY_P8_BASE64`、`APPLE_API_KEY_ID` 和 `APPLE_API_ISSUER_ID` 五个 Actions
+secret。
+
 ## 当前边界
 
 - 单进程 actor registry，没有跨实例 live session、分布式锁或事件总线。
