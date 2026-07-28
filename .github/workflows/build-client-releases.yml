@@ -171,6 +171,12 @@ jobs:
           : "${APPLE_API_KEY_ID:?missing App Store Connect API key ID}"
           : "${APPLE_API_ISSUER_ID:?missing App Store Connect API issuer ID}"
 
+      - name: Import Developer ID certificate
+        uses: Apple-Actions/import-codesign-certs@v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -188,23 +194,15 @@ jobs:
 
       - name: Sign app and create DMG
         shell: bash
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           app_path="flutter/build/macos/Build/Products/Release/phi_client.app"
           app_executable="$app_path/Contents/MacOS/phi_client"
           entitlements_path="flutter/macos/Runner/Release.entitlements"
           dmg_path="$GITHUB_WORKSPACE/phi-client-macos.dmg"
-          certificate_path="$RUNNER_TEMP/phi-developer-id.p12"
-          keychain_path="$RUNNER_TEMP/phi-signing.keychain-db"
-          keychain_password="$(uuidgen)-$(uuidgen)"
           staging_path="$RUNNER_TEMP/phi-client-dmg"
 
           cleanup() {
-            security delete-keychain "$keychain_path" >/dev/null 2>&1 || true
-            rm -f "$certificate_path"
             rm -rf "$staging_path"
           }
           trap cleanup EXIT
@@ -220,25 +218,8 @@ jobs:
             fi
           done
 
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
-          chmod 600 "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security import "$certificate_path" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" \
-            -t cert \
-            -f pkcs12 \
-            -T /usr/bin/codesign \
-            -k "$keychain_path"
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$keychain_password" \
-            "$keychain_path"
-
           signing_identity="$(
-            security find-identity -v -p codesigning "$keychain_path" \
+            security find-identity -v -p codesigning \
               | awk '/Developer ID Application/ { print $2; exit }'
           )"
           if [[ -z "$signing_identity" ]]; then
@@ -251,7 +232,6 @@ jobs:
               --force \
               --options runtime \
               --timestamp \
-              --keychain "$keychain_path" \
               --sign "$signing_identity" \
               "$nested_code"
           done < <(
@@ -275,7 +255,6 @@ jobs:
             --options runtime \
             --timestamp \
             --entitlements "$entitlements_path" \
-            --keychain "$keychain_path" \
             --sign "$signing_identity" \
             "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
@@ -292,7 +271,6 @@ jobs:
           codesign \
             --force \
             --timestamp \
-            --keychain "$keychain_path" \
             --sign "$signing_identity" \
             "$dmg_path"
           codesign --verify --strict --verbose=2 "$dmg_path"
