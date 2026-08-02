@@ -37,5 +37,10 @@ Telegram 拒绝时会回退为纯文本，避免通知因模型生成的 Markdow
 daemon 默认从 `~/.phi/skills` 发现全局 skills；可通过
 `PHI_DAEMON_GLOBAL_SKILLS_DIRS` 覆盖为操作系统原生 path-list。
 
+Provider 层的瞬时失败有界恢复：响应头超时按独立预算默认重试 1 次（只可能重复计费，
+不会重复工具副作用）；模型返回协议完整但 tool arguments 非法 JSON 的响应时，agent 会
+把该调用与一条合成 error tool result 配对持久化并喂回模型自修复，每个 turn 最多 2 次，
+超过上限才失败 run。
+
 Provider 配置、HTTP/WS 协议和停止语义见
 [`crates/phi-daemon/README.md`](crates/phi-daemon/README.md)。

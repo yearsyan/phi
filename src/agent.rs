@@ -13,7 +13,10 @@ use crate::{
         ContextCompactionOutcome, ContextCompactionRequest, ContextCompactionRunOutcome,
         ContextCompactionTrigger, ContextCompactor, estimate_messages_tokens,
     },
-    error::{AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError},
+    error::{
+        AgentError, ContextCompactionError, HookError, InvalidToolCallDetails, McpError,
+        ProviderError, ToolError,
+    },
     hook::{Hook, HookRegistry, LlmResponseContext, TurnEndContext, TurnStartContext},
     mcp::{McpClient, McpHttpConfig, McpStdioConfig},
     permission::{
@@ -41,6 +44,22 @@ const CANCELLED_TOOL_RESULT: &str = "tool execution cancelled before it started"
 const INTERRUPTED_TOOL_RESULT: &str =
     "tool execution was interrupted before its result was persisted";
 const UNKNOWN_TOOL_RESULT: &str = "tool execution outcome is unknown; it may have produced side effects and will not be retried automatically";
+/// How many consecutive malformed tool-call responses one turn feeds back to
+/// the model before the run fails with the original provider error. Each
+/// repair is a billable request, so sustained provider degradation must not
+/// loop indefinitely.
+const MAX_INVALID_TOOL_ARGUMENT_REPAIRS: usize = 2;
+
+/// Model-facing feedback for a rejected malformed tool call. The placeholder
+/// assistant call pairs with this synthetic error result so the transcript
+/// stays protocol-complete and the model can re-emit valid arguments.
+fn invalid_tool_arguments_feedback(name: &str, parse_error: &str, raw_arguments: &str) -> String {
+    format!(
+        "tool `{name}` was not executed because its arguments were not valid JSON \
+         ({parse_error}). Re-emit the `{name}` tool call with a valid JSON object. \
+         Malformed arguments: {raw_arguments}"
+    )
+}
 pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 10;
 pub const DEFAULT_AGENT_MAILBOX_CAPACITY: usize = 32;
@@ -1251,6 +1270,7 @@ impl Agent {
             self.emit(AgentEvent::TurnStart { turn });
 
             let mut context_overflow_recovery_attempted = false;
+            let mut invalid_tool_argument_repairs = 0usize;
             let (response, request_capability_mode, message_started) = loop {
                 if let Some(trigger) = self.automatic_compaction_trigger() {
                     match self
@@ -1344,6 +1364,60 @@ impl Agent {
                 match response {
                     Ok(response) => {
                         break (response, request_capability_mode, message_started);
+                    }
+                    Err(error)
+                        if matches!(error, ProviderError::InvalidToolArguments { .. })
+                            && invalid_tool_argument_repairs
+                                < MAX_INVALID_TOOL_ARGUMENT_REPAIRS =>
+                    {
+                        // The provider completed a protocol-complete response
+                        // whose tool arguments are not valid JSON. No tool ran
+                        // and nothing about this draft entered the durable
+                        // transcript, so pair the rejected call with a
+                        // synthetic error result and let the model re-emit it.
+                        invalid_tool_argument_repairs =
+                            invalid_tool_argument_repairs.saturating_add(1);
+                        if message_started {
+                            self.emit(AgentEvent::MessageAborted);
+                        }
+                        let ProviderError::InvalidToolArguments(details) = error else {
+                            unreachable!("the guard only matches InvalidToolArguments");
+                        };
+                        let InvalidToolCallDetails {
+                            id,
+                            name,
+                            parse_error,
+                            raw_arguments,
+                            provider_state,
+                        } = *details;
+                        let mut assistant_message = Message::assistant(
+                            None,
+                            vec![ToolCall::new(
+                                id.clone(),
+                                name.clone(),
+                                serde_json::json!({}),
+                            )],
+                        );
+                        assistant_message.provider_state = provider_state;
+                        let result_message = Message::tool_result(
+                            id,
+                            invalid_tool_arguments_feedback(&name, &parse_error, &raw_arguments),
+                            true,
+                        );
+                        let repair_messages = [assistant_message, result_message];
+                        self.messages.extend(repair_messages.iter().cloned());
+                        self.session_history.append_active(&repair_messages);
+                        self.commit_or_rollback(&checkpoint).await?;
+                        checkpoint = AgentCheckpoint::capture(self);
+                        run_messages.extend(repair_messages.iter().cloned());
+                        for message in repair_messages {
+                            let message = Arc::new(message);
+                            self.emit(AgentEvent::MessageStart {
+                                message: Arc::clone(&message),
+                            });
+                            self.emit(AgentEvent::MessageEnd { message });
+                        }
+                        continue;
                     }
                     Err(error)
                         if !received_model_output
@@ -2701,7 +2775,7 @@ mod tests {
         tool::{Tool, ToolEffect},
         types::{
             AssistantDelta, AssistantMessage, ProviderResponse, ProviderRetryEvent,
-            ProviderRetryReason, Role, TokenUsage, ToolCall, ToolDefinition,
+            ProviderRetryReason, ProviderState, Role, TokenUsage, ToolCall, ToolDefinition,
         },
     };
 
@@ -5749,5 +5823,234 @@ mod tests {
         );
         assert_eq!(sender.pending_len(), 0);
         assert!(!sender.is_running());
+    }
+
+    fn malformed_tool_call(id: &str) -> ProviderError {
+        ProviderError::invalid_tool_arguments(
+            id,
+            "echo",
+            "{\"text\": hi}",
+            "expected value at line 1 column 10",
+            Some(ProviderState::AnthropicMessages {
+                content: vec![
+                    json!({ "type": "thinking", "thinking": "", "signature": "sig-1" }),
+                    json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": "echo",
+                        "input": {}
+                    }),
+                ],
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn feeds_invalid_tool_arguments_back_to_the_model() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Err(malformed_tool_call("call-1")),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-2",
+                        "echo",
+                        json!({"text": "fixed"}),
+                    )]),
+                    usage: Some(TokenUsage::new(10, 5, 0)),
+                }),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: Some(TokenUsage::new(20, 5, 0)),
+                }),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut agent = Agent::builder(provider)
+            .model("test-model")
+            .tool(EchoTool)
+            .build();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
+
+        let run = agent.prompt("say hi").await.unwrap();
+
+        assert_eq!(run.text(), Some("done"));
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 6);
+        // The rejected call is persisted as a protocol-complete pair: a
+        // placeholder assistant call with the replay state intact, and a
+        // synthetic error result carrying the model-facing feedback.
+        let repair_call = &messages[1];
+        assert_eq!(repair_call.role, Role::Assistant);
+        assert_eq!(repair_call.tool_calls.len(), 1);
+        assert_eq!(repair_call.tool_calls[0].id, "call-1");
+        assert_eq!(repair_call.tool_calls[0].name, "echo");
+        assert_eq!(repair_call.tool_calls[0].arguments, json!({}));
+        assert!(repair_call.provider_state.is_some());
+        let repair_result = &messages[2];
+        assert_eq!(repair_result.role, Role::Tool);
+        assert_eq!(repair_result.tool_call_id.as_deref(), Some("call-1"));
+        assert!(repair_result.tool_result_is_error);
+        let feedback = repair_result.text_content().unwrap();
+        assert!(feedback.contains("not valid JSON"));
+        assert!(feedback.contains("echo"));
+        assert_eq!(messages[3].tool_calls[0].id, "call-2");
+        assert_eq!(messages[4].text_content(), Some("fixed"));
+        assert!(!messages[4].tool_result_is_error);
+        assert_eq!(messages[5].text_content(), Some("done"));
+        // The second provider request replays the repair pair.
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let replayed = &requests[1].messages;
+        assert_eq!(replayed[2].tool_calls[0].id, "call-1");
+        assert_eq!(replayed[3].tool_call_id.as_deref(), Some("call-1"));
+        drop(requests);
+        // The mock stream emitted no deltas before the error, so no draft had
+        // to be aborted.
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::MessageAborted))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_argument_repairs_fail_after_the_turn_budget() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Err(malformed_tool_call("call-1")),
+                Err(malformed_tool_call("call-2")),
+                Err(malformed_tool_call("call-3")),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .model("test-model")
+            .tool(EchoTool)
+            .build();
+
+        let error = agent.prompt("say hi").await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid tool arguments for `echo`: expected value at line 1 column 10"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        // Two repair pairs were persisted before the run failed; no partial
+        // third pair is left behind.
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].tool_calls[0].id, "call-1");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[3].tool_calls[0].id, "call-2");
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("call-2"));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_argument_repair_budget_resets_each_turn() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            results: Mutex::new(VecDeque::from([
+                Err(malformed_tool_call("call-1")),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::tool_calls(vec![ToolCall::new(
+                        "call-2",
+                        "echo",
+                        json!({"text": "first turn"}),
+                    )]),
+                    usage: None,
+                }),
+                Err(malformed_tool_call("call-3")),
+                Ok(ProviderResponse {
+                    message: AssistantMessage::text("done"),
+                    usage: None,
+                }),
+            ])),
+            requests: Arc::clone(&requests),
+        };
+        let mut agent = Agent::builder(provider)
+            .model("test-model")
+            .tool(EchoTool)
+            .build();
+
+        let run = agent.prompt("say hi").await.unwrap();
+
+        assert_eq!(run.text(), Some("done"));
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        let messages = agent.messages();
+        assert_eq!(messages[1].tool_calls[0].id, "call-1");
+        assert_eq!(messages[3].tool_calls[0].id, "call-2");
+        assert_eq!(messages[5].tool_calls[0].id, "call-3");
+        assert_eq!(messages[7].text_content(), Some("done"));
+    }
+
+    struct DeltaThenErrorProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    impl LlmProvider for DeltaThenErrorProvider {
+        fn stream(&self, request: ProviderRequest) -> ProviderEventStream {
+            self.requests.lock().unwrap().push(request);
+            if self.requests.lock().unwrap().len() == 1 {
+                Box::pin(futures_util::stream::iter([
+                    Ok(ProviderEvent::Delta(AssistantDelta::ToolCall {
+                        index: 0,
+                        id: Some("call-1".to_owned()),
+                        name: Some("echo".to_owned()),
+                        arguments_delta: "{\"text\": hi}".to_owned(),
+                    })),
+                    Err(malformed_tool_call("call-1")),
+                ]))
+            } else {
+                Box::pin(futures_util::stream::iter([Ok(ProviderEvent::Done(
+                    ProviderResponse {
+                        message: AssistantMessage::text("recovered"),
+                        usage: None,
+                    },
+                ))]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_aborts_the_streamed_draft_before_repairing() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = DeltaThenErrorProvider {
+            requests: Arc::clone(&requests),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut agent = Agent::builder(provider)
+            .model("test-model")
+            .tool(EchoTool)
+            .build();
+        agent.subscribe(move |event| observed_events.lock().unwrap().push(event.clone()));
+
+        let run = agent.prompt("say hi").await.unwrap();
+
+        assert_eq!(run.text(), Some("recovered"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let events = events.lock().unwrap();
+        let aborted = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::MessageAborted))
+            .expect("the streamed malformed draft must be aborted");
+        // The persisted placeholder assistant message is announced after the
+        // aborted draft, never before it.
+        let repair_announced = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message }
+                        if message.tool_calls.iter().any(|call| call.id == "call-1")
+                )
+            })
+            .expect("the placeholder repair call must be announced");
+        assert!(aborted < repair_announced);
     }
 }

@@ -353,22 +353,30 @@ impl ChatStreamState {
         display_fragment
     }
 
-    fn finish(self) -> Result<ProviderResponse, ProviderError> {
+    fn finish(mut self) -> Result<ProviderResponse, ProviderError> {
+        let provider_state = self.reasoning_provider_state();
         let content = (!self.text.is_empty()).then(|| Content::text(self.text));
-        let tool_calls = self
-            .tools
-            .into_values()
-            .map(|tool| {
-                let arguments = if tool.arguments.trim().is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&tool.arguments).map_err(|error| {
-                        ProviderError::InvalidResponse(format!("invalid tool arguments: {error}"))
-                    })?
-                };
-                Ok(ToolCall::new(tool.id, tool.name, arguments))
-            })
-            .collect::<Result<Vec<_>, ProviderError>>()?;
+        let mut tool_calls = Vec::with_capacity(self.tools.len());
+        for tool in std::mem::take(&mut self.tools).into_values() {
+            let trimmed = tool.arguments.trim();
+            let arguments = if trimmed.is_empty() {
+                json!({})
+            } else {
+                match serde_json::from_str(trimmed) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        return Err(ProviderError::invalid_tool_arguments(
+                            tool.id,
+                            tool.name,
+                            trimmed,
+                            error.to_string(),
+                            provider_state,
+                        ));
+                    }
+                }
+            };
+            tool_calls.push(ToolCall::new(tool.id, tool.name, arguments));
+        }
         if content.is_none() && tool_calls.is_empty() {
             return Err(ProviderError::InvalidResponse(
                 "chat stream contains neither content nor tool calls".to_owned(),
@@ -379,13 +387,18 @@ impl ChatStreamState {
                 content,
                 reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 tool_calls,
-                provider_state: (!self.reasoning_fields.is_empty()).then_some(
-                    ProviderState::OpenAiChat {
-                        fields: self.reasoning_fields,
-                    },
-                ),
+                provider_state,
             },
             usage: self.usage,
+        })
+    }
+
+    /// Reasoning fields suitable for multi-turn replay, or `None` when the
+    /// stream contained no reasoning content. Used both for successful
+    /// responses and for malformed tool-call errors that the agent repairs.
+    fn reasoning_provider_state(&self) -> Option<ProviderState> {
+        (!self.reasoning_fields.is_empty()).then(|| ProviderState::OpenAiChat {
+            fields: self.reasoning_fields.clone(),
         })
     }
 }
@@ -641,16 +654,24 @@ fn parse_response(response: ChatResponse) -> Result<ProviderResponse, ProviderEr
         }
     }
     let content = message.content.map(parse_content).transpose()?;
-    let tool_calls = message
-        .tool_calls
-        .into_iter()
-        .map(|call| {
-            let arguments = serde_json::from_str(&call.function.arguments).map_err(|error| {
-                ProviderError::InvalidResponse(format!("invalid tool arguments: {error}"))
-            })?;
-            Ok(ToolCall::new(call.id, call.function.name, arguments))
-        })
-        .collect::<Result<Vec<_>, ProviderError>>()?;
+    let mut tool_calls = Vec::with_capacity(message.tool_calls.len());
+    for call in message.tool_calls {
+        let arguments = match serde_json::from_str(&call.function.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return Err(ProviderError::invalid_tool_arguments(
+                    call.id,
+                    call.function.name,
+                    &call.function.arguments,
+                    error.to_string(),
+                    (!reasoning_fields.is_empty()).then_some(ProviderState::OpenAiChat {
+                        fields: reasoning_fields,
+                    }),
+                ));
+            }
+        };
+        tool_calls.push(ToolCall::new(call.id, call.function.name, arguments));
+    }
 
     if content.is_none() && tool_calls.is_empty() {
         return Err(ProviderError::InvalidResponse(
@@ -1140,5 +1161,43 @@ mod tests {
         assert_eq!(fields["reasoning_content"], "think before tool");
         assert_eq!(fields["reasoning_details"].as_array().unwrap().len(), 2);
         assert_eq!(response.usage.unwrap().total_tokens, 15);
+    }
+
+    #[test]
+    fn malformed_tool_arguments_surface_repair_context() {
+        let mut state = ChatStreamState::default();
+        state
+            .apply(&json!({
+                "choices": [{ "delta": {
+                    "reasoning_content": "think",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "function": { "name": "navigate_page", "arguments": "{\"type\":" }
+                    }]
+                } }]
+            }))
+            .unwrap();
+        state
+            .apply(&json!({
+                "choices": [{ "delta": { "tool_calls": [{
+                    "index": 0,
+                    "function": { "arguments": " url}" }
+                }] } }]
+            }))
+            .unwrap();
+
+        let error = state.finish().unwrap_err();
+        let ProviderError::InvalidToolArguments(details) = error else {
+            panic!("expected InvalidToolArguments, got {error:?}");
+        };
+        assert_eq!(details.id, "call-1");
+        assert_eq!(details.name, "navigate_page");
+        assert!(details.parse_error.contains("expected value"));
+        assert_eq!(details.raw_arguments, "{\"type\": url}");
+        let Some(ProviderState::OpenAiChat { fields }) = details.provider_state else {
+            panic!("missing chat reasoning state");
+        };
+        assert_eq!(fields["reasoning_content"], "think");
     }
 }

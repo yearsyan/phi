@@ -11,6 +11,11 @@ use crate::{
 
 /// Default number of retries after a safely retryable HTTP request fails.
 pub const DEFAULT_MAX_RETRIES: usize = 10;
+/// Default number of retries after a response-header timeout. An LLM
+/// completion request has no server-side side effects beyond billing, so a
+/// single bounded retry is acceptable even though receipt by the server is
+/// ambiguous.
+pub const DEFAULT_TIMEOUT_RETRIES: usize = 1;
 /// Default deadline for connecting and receiving HTTP response headers.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum idle time between complete events on an established stream.
@@ -23,11 +28,15 @@ const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// `max_retries` counts retries after the initial request, so a value of `10`
 /// permits at most eleven HTTP attempts for failures that are safe to retry.
-/// Response-header timeouts are never retried because the server may already
-/// have accepted the request. Set this value to zero to disable all retries.
+/// Response-header timeouts retry at most `timeout_retries` times (default
+/// [`DEFAULT_TIMEOUT_RETRIES`]), independently of `max_retries`: receipt by
+/// the server is ambiguous, but a replayed completion only duplicates a
+/// billable generation, never a tool side effect. Set both values to zero to
+/// disable all retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryConfig {
     max_retries: usize,
+    timeout_retries: usize,
     request_timeout: Duration,
     stream_idle_timeout: Option<Duration>,
     initial_backoff: Duration,
@@ -39,6 +48,7 @@ impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             max_retries: DEFAULT_MAX_RETRIES,
+            timeout_retries: DEFAULT_TIMEOUT_RETRIES,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             stream_idle_timeout: Some(DEFAULT_STREAM_IDLE_TIMEOUT),
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -51,6 +61,17 @@ impl Default for RetryConfig {
 impl RetryConfig {
     pub fn max_retries(&self) -> usize {
         self.max_retries
+    }
+
+    /// Returns the retry budget dedicated to response-header timeouts.
+    pub fn timeout_retries(&self) -> usize {
+        self.timeout_retries
+    }
+
+    /// Total retry budget reported to observers: transport/status retries
+    /// plus the dedicated timeout retries.
+    pub fn total_max_retries(&self) -> usize {
+        self.max_retries.saturating_add(self.timeout_retries)
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -80,12 +101,20 @@ impl RetryConfig {
         self
     }
 
+    /// Sets the retry budget dedicated to response-header timeouts.
+    pub fn with_timeout_retries(mut self, timeout_retries: usize) -> Self {
+        self.timeout_retries = timeout_retries;
+        self
+    }
+
     /// Sets the deadline for connecting and receiving HTTP response headers.
     ///
-    /// A timeout is returned immediately and is never retried because receipt
-    /// of the request by the server is ambiguous. The deadline intentionally
-    /// does not cover an established event stream, because replaying a
-    /// partially consumed stream can duplicate output and tool calls.
+    /// A timeout is retried at most `timeout_retries` times (default
+    /// [`DEFAULT_TIMEOUT_RETRIES`]): the server may already have accepted the
+    /// request, but replaying a completion only duplicates a billable
+    /// generation, never a tool side effect. The deadline intentionally does
+    /// not cover an established event stream, because replaying a partially
+    /// consumed stream can duplicate output and tool calls.
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
         self
@@ -181,10 +210,25 @@ where
 {
     try_stream! {
         let mut retries_used = 0;
+        let mut timeout_retries_used = 0;
 
         loop {
             let attempt = tokio::time::timeout(config.request_timeout, make_request().send()).await;
             let response = match attempt {
+                Err(_) if timeout_retries_used < config.timeout_retries => {
+                    let delay = config.exponential_delay(retries_used + timeout_retries_used);
+                    yield HttpRequestEvent::Retry(ProviderRetryEvent {
+                        retry_number: retries_used + timeout_retries_used + 1,
+                        max_retries: config.total_max_retries(),
+                        delay,
+                        reason: ProviderRetryReason::RequestTimeout {
+                            timeout: config.request_timeout,
+                        },
+                    });
+                    wait(delay).await;
+                    timeout_retries_used += 1;
+                    continue;
+                }
                 Err(_) => {
                     Err(ProviderError::RequestTimeout {
                         timeout: config.request_timeout,
@@ -197,8 +241,8 @@ where
                 {
                     let delay = config.exponential_delay(retries_used);
                     yield HttpRequestEvent::Retry(ProviderRetryEvent {
-                        retry_number: retries_used + 1,
-                        max_retries: config.max_retries,
+                        retry_number: retries_used + timeout_retries_used + 1,
+                        max_retries: config.total_max_retries(),
                         delay,
                         reason: ProviderRetryReason::Transport {
                             message: error.to_string(),
@@ -236,8 +280,8 @@ where
                 RetryKind::Never => unreachable!("non-retryable statuses return above"),
             };
             yield HttpRequestEvent::Retry(ProviderRetryEvent {
-                retry_number: retries_used + 1,
-                max_retries: config.max_retries,
+                retry_number: retries_used + timeout_retries_used + 1,
+                max_retries: config.total_max_retries(),
                 delay,
                 reason: ProviderRetryReason::HttpStatus {
                     status: status.as_u16(),
@@ -421,12 +465,18 @@ mod tests {
     fn defaults_to_a_configurable_ten_retries() {
         let config = RetryConfig::default();
         assert_eq!(config.max_retries(), DEFAULT_MAX_RETRIES);
+        assert_eq!(config.timeout_retries(), DEFAULT_TIMEOUT_RETRIES);
+        assert_eq!(
+            config.total_max_retries(),
+            DEFAULT_MAX_RETRIES + DEFAULT_TIMEOUT_RETRIES
+        );
         assert_eq!(config.request_timeout(), DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(
             config.stream_idle_timeout(),
             Some(DEFAULT_STREAM_IDLE_TIMEOUT)
         );
         assert_eq!(config.with_max_retries(3).max_retries(), 3);
+        assert_eq!(config.with_timeout_retries(0).timeout_retries(), 0);
         assert_eq!(
             config.without_stream_idle_timeout().stream_idle_timeout(),
             None
@@ -580,14 +630,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_retry_response_header_timeouts() {
+    async fn retries_response_header_timeout_once_within_budget() {
+        let (url, request_count, server) = serve(vec![
+            TestResponse {
+                delay: Duration::from_millis(100),
+                ..TestResponse::immediate(StatusCode::OK)
+            },
+            TestResponse::immediate(StatusCode::OK),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let config = no_wait_config(1).with_request_timeout(Duration::from_millis(25));
+        let (response, retries) = run_request(config, || client.post(&url)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            retries.as_slice(),
+            [ProviderRetryEvent {
+                retry_number: 1,
+                reason: ProviderRetryReason::RequestTimeout { timeout },
+                ..
+            }] if *timeout == Duration::from_millis(25)
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stops_after_the_timeout_retry_budget() {
+        let (url, request_count, server) = serve(vec![
+            TestResponse {
+                delay: Duration::from_millis(100),
+                ..TestResponse::immediate(StatusCode::OK)
+            },
+            TestResponse {
+                delay: Duration::from_millis(100),
+                ..TestResponse::immediate(StatusCode::OK)
+            },
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let config = no_wait_config(1).with_request_timeout(Duration::from_millis(25));
+        let error = run_request(config, || client.post(&url)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::RequestTimeout { timeout }
+                if timeout == Duration::from_millis(25)
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_response_header_timeouts_when_disabled() {
         let (url, request_count, server) = serve(vec![TestResponse {
             delay: Duration::from_millis(100),
             ..TestResponse::immediate(StatusCode::OK)
         }])
         .await;
         let client = reqwest::Client::new();
-        let config = no_wait_config(1).with_request_timeout(Duration::from_millis(25));
+        let config = no_wait_config(1)
+            .with_request_timeout(Duration::from_millis(25))
+            .with_timeout_retries(0);
         let error = run_request(config, || client.post(&url)).await.unwrap_err();
 
         assert!(matches!(

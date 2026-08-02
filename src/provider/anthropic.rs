@@ -509,28 +509,29 @@ impl AnthropicStreamState {
     }
 
     fn finish(mut self) -> Result<ProviderResponse, ProviderError> {
-        let content = (!self.text.is_empty()).then(|| Content::text(self.text));
-        let tool_calls = self
-            .tools
-            .into_iter()
-            .map(|(index, tool)| {
-                let arguments = if tool.arguments.trim().is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(&tool.arguments).map_err(|error| {
-                        ProviderError::InvalidResponse(format!("invalid tool arguments: {error}"))
-                    })?
-                };
-                if let Some(block) = self.raw_content.get_mut(&index) {
-                    block["input"] = arguments.clone();
+        let mut tool_calls = Vec::with_capacity(self.tools.len());
+        for (index, tool) in std::mem::take(&mut self.tools) {
+            let trimmed = tool.arguments.trim();
+            let arguments = if trimmed.is_empty() {
+                json!({})
+            } else {
+                match serde_json::from_str(trimmed) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        return Err(ProviderError::invalid_tool_arguments(
+                            tool.id,
+                            tool.name,
+                            trimmed,
+                            error.to_string(),
+                            self.reasoning_provider_state(),
+                        ));
+                    }
                 }
-                Ok(ToolCall::new(tool.id, tool.name, arguments))
-            })
-            .collect::<Result<Vec<_>, ProviderError>>()?;
-        if content.is_none() && tool_calls.is_empty() {
-            return Err(ProviderError::InvalidResponse(
-                "Claude stream contains neither text nor tool use".to_owned(),
-            ));
+            };
+            if let Some(block) = self.raw_content.get_mut(&index) {
+                block["input"] = arguments.clone();
+            }
+            tool_calls.push(ToolCall::new(tool.id, tool.name, arguments));
         }
         let usage = self.has_usage.then(|| {
             let input = self
@@ -544,22 +545,37 @@ impl AnthropicStreamState {
                     .saturating_add(self.cache_creation_tokens),
             )
         });
+        let provider_state = self.reasoning_provider_state();
+        let content = (!self.text.is_empty()).then(|| Content::text(self.text));
+        if content.is_none() && tool_calls.is_empty() {
+            return Err(ProviderError::InvalidResponse(
+                "Claude stream contains neither text nor tool use".to_owned(),
+            ));
+        }
+        let reasoning = std::mem::take(&mut self.reasoning);
+        Ok(ProviderResponse {
+            message: AssistantMessage {
+                content,
+                reasoning: (!reasoning.is_empty()).then_some(reasoning),
+                tool_calls,
+                provider_state,
+            },
+            usage,
+        })
+    }
+
+    /// Reasoning blocks suitable for multi-turn replay, or `None` when the
+    /// stream contained no thinking content. Used both for successful
+    /// responses and for malformed tool-call errors that the agent repairs.
+    fn reasoning_provider_state(&self) -> Option<ProviderState> {
         let has_reasoning = self.raw_content.values().any(|block| {
             matches!(
                 block["type"].as_str(),
                 Some("thinking" | "redacted_thinking")
             )
         });
-        Ok(ProviderResponse {
-            message: AssistantMessage {
-                content,
-                reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
-                tool_calls,
-                provider_state: has_reasoning.then_some(ProviderState::AnthropicMessages {
-                    content: self.raw_content.into_values().collect(),
-                }),
-            },
-            usage,
+        has_reasoning.then(|| ProviderState::AnthropicMessages {
+            content: self.raw_content.values().cloned().collect(),
         })
     }
 }
@@ -1284,5 +1300,54 @@ mod tests {
         assert_eq!(content[0]["signature"], "signature-1");
         assert_eq!(content[1]["input"], json!({"text": "hi"}));
         assert_eq!(response.usage, Some(TokenUsage::new(30, 5, 20)));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_surface_repair_context() {
+        let mut state = AnthropicStreamState::default();
+        state.apply(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "thinking": "",
+                "signature": ""
+            }
+        }));
+        state.apply(&json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "signature_delta", "signature": "signature-1" }
+        }));
+        state.apply(&json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu-1",
+                "name": "navigate_page",
+                "input": {}
+            }
+        }));
+        state.apply(&json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"type\": url}" }
+        }));
+
+        let error = state.finish().unwrap_err();
+        let ProviderError::InvalidToolArguments(details) = error else {
+            panic!("expected InvalidToolArguments, got {error:?}");
+        };
+        assert_eq!(details.id, "toolu-1");
+        assert_eq!(details.name, "navigate_page");
+        assert!(details.parse_error.contains("expected value"));
+        assert_eq!(details.raw_arguments, "{\"type\": url}");
+        // Thinking replay state survives so the agent can pair the rejected
+        // call with an error result without breaking thinking-mode replay.
+        let Some(ProviderState::AnthropicMessages { content }) = details.provider_state else {
+            panic!("missing Messages reasoning state");
+        };
+        assert_eq!(content[0]["signature"], "signature-1");
     }
 }

@@ -27,7 +27,8 @@ pub use context::{
     DefaultContextCompactor, default_context_compaction_threshold,
 };
 pub use error::{
-    AgentError, ContextCompactionError, HookError, McpError, ProviderError, ToolError,
+    AgentError, ContextCompactionError, HookError, InvalidToolCallDetails, McpError, ProviderError,
+    ToolError,
 };
 pub use hook::{
     BeforeRequestContext, Hook, HookRegistry, LlmResponseContext, ProviderApi, TurnEndContext,
@@ -45,8 +46,8 @@ pub use permission::{
 };
 pub use provider::{
     AnthropicMessagesProvider, DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_STREAM_IDLE_TIMEOUT, LlmProvider, OpenAiChatProvider, OpenAiResponsesProvider,
-    ProviderEventStream, RetryConfig,
+    DEFAULT_STREAM_IDLE_TIMEOUT, DEFAULT_TIMEOUT_RETRIES, LlmProvider, OpenAiChatProvider,
+    OpenAiResponsesProvider, ProviderEventStream, RetryConfig,
 };
 pub use skills::{
     DEFAULT_MAX_SKILL_BYTES, DEFAULT_MAX_SKILLS, DEFAULT_SKILL_LISTING_BUDGET, DiagnosticLevel,

@@ -80,6 +80,7 @@ daemon crate 使用 `#![forbid(unsafe_code)]`；不得删除或弱化这个约�
 - transcript 必须始终能被所选 Provider 继续回放。assistant tool-call batch 与对应 tool result 必须完整配对，压缩、停止、hook、mailbox 和持久化恢复都不得切断协议组。
 - 在执行任何可能产生副作用的工具前，先持久化 assistant tool call 和一一对应的 `unknown` journal result。journal 保存失败时不得执行工具。
 - 工具成功后以真实结果替换 journal tail；未启动、取消、超时、panic 或结果不可确认的调用必须保留明确的 cancelled/unknown 结果，恢复后不得自动重放。
+- provider 返回协议完整但 tool arguments 非法 JSON 的响应时，agent 不失败 run：以 placeholder assistant call（保留 `provider_state`）加一一对应的合成 error tool result 配对持久化，把解析错误喂回模型自修复，每个 turn 最多 2 次，超过上限按原错误失败。该配对不执行任何工具，不产生副作用。
 - assistant streaming draft 在完整响应前不进入 transcript。停止时可以丢弃 draft，但必须保留最近的协议完整、已持久化 checkpoint。
 - 内存 transcript、持久 transcript 和已发布事件必须保持一致。持久化失败时恢复到最近 durable checkpoint，不能让客户端看到一个未落盘的最终状态。
 - 工具、hooks 或 Provider future 被取消不代表外部副作用回滚。不要宣称 exactly-once；非幂等工具应使用 `tool_call.id` 作为业务幂等键。
@@ -89,7 +90,7 @@ daemon crate 使用 `#![forbid(unsafe_code)]`；不得删除或弱化这个约�
 - Agent core 只使用 `ProviderRequest`、`ProviderEvent`、`ProviderResponse` 和 normalized `Message`；协议字段映射留在对应 adapter。
 - assistant message 的 opaque `provider_state` 必须持久化并在同 adapter 中回放，但不得通过 daemon public history、日志或普通 Debug 输出泄露。
 - normalized 字段是当前语义来源，不允许旧的 opaque replay state 覆盖新的文本、工具调用或 reasoning 设置。
-- 请求超时、stream idle timeout、重试和上下文超限分类集中复用 `provider/retry.rs` 的语义。不要自动重试可能已经被服务端接收的非幂等 POST。
+- 请求超时、stream idle timeout、重试和上下文超限分类集中复用 `provider/retry.rs` 的语义。LLM completion 请求自身不产生工具副作用：响应头超时按独立的 `timeout_retries` 预算（默认 1 次）有限重试，最坏代价是重复计费一次；已经进入流式响应后的错误绝不自动重发同一请求。除此外不要自动重试可能已经被服务端接收的非幂等 POST。
 - API key、长期 daemon key、短期 WS token 和认证 header 必须在 Debug、错误、事件和日志中脱敏。
 
 ### ContextCompactor

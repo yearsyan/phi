@@ -7,7 +7,7 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 
 use crate::{
-    error::ProviderError,
+    error::{InvalidToolCallDetails, ProviderError},
     hook::{BeforeRequestContext, Hook, HookRegistry, ProviderApi},
     provider::{
         ExtraBody, HttpRequestEvent, LlmProvider, ProviderEventStream, RetryConfig, header_value,
@@ -414,13 +414,23 @@ fn normalized_responses_output(
                 let name = item["name"].as_str().ok_or_else(|| {
                     ProviderError::InvalidResponse("missing tool name".to_owned())
                 })?;
-                let arguments =
-                    serde_json::from_str(item["arguments"].as_str().ok_or_else(|| {
-                        ProviderError::InvalidResponse("missing tool arguments".to_owned())
-                    })?)
-                    .map_err(|error| {
-                        ProviderError::InvalidResponse(format!("invalid tool arguments: {error}"))
-                    })?;
+                let raw_arguments = item["arguments"].as_str().ok_or_else(|| {
+                    ProviderError::InvalidResponse("missing tool arguments".to_owned())
+                })?;
+                let arguments = match serde_json::from_str(raw_arguments) {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        // The replay state lives one level up and is attached
+                        // by `parse_response`.
+                        return Err(ProviderError::invalid_tool_arguments(
+                            id,
+                            name,
+                            raw_arguments,
+                            error.to_string(),
+                            None,
+                        ));
+                    }
+                };
                 tool_calls.push(ToolCall::new(id, name, arguments));
             }
             _ => {}
@@ -460,7 +470,18 @@ fn parse_response(response: Value) -> Result<ProviderResponse, ProviderError> {
         .as_array()
         .ok_or_else(|| ProviderError::InvalidResponse("output is not an array".to_owned()))?;
     let raw_output = output.clone();
-    let (content, tool_calls) = normalized_responses_output(output)?;
+    let (content, tool_calls) =
+        normalized_responses_output(output).map_err(|error| match error {
+            ProviderError::InvalidToolArguments(details) => {
+                ProviderError::InvalidToolArguments(Box::new(InvalidToolCallDetails {
+                    provider_state: Some(ProviderState::OpenAiResponses {
+                        output: raw_output.clone(),
+                    }),
+                    ..*details
+                }))
+            }
+            error => error,
+        })?;
     let provider_state = ProviderState::OpenAiResponses { output: raw_output };
     let reasoning = provider_state.reasoning_text();
     if content.is_none() && tool_calls.is_empty() {
@@ -763,6 +784,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.usage, Some(TokenUsage::with_total(90, 10, 100, 40)));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_surface_repair_context() {
+        let error = parse_response(json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "navigate_page",
+                "arguments": "{\"type\": url}"
+            }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        }))
+        .unwrap_err();
+
+        let ProviderError::InvalidToolArguments(details) = error else {
+            panic!("expected InvalidToolArguments, got {error:?}");
+        };
+        assert_eq!(details.id, "call-1");
+        assert_eq!(details.name, "navigate_page");
+        assert!(details.parse_error.contains("expected value"));
+        assert_eq!(details.raw_arguments, "{\"type\": url}");
+        let Some(ProviderState::OpenAiResponses { output }) = details.provider_state else {
+            panic!("missing Responses replay state");
+        };
+        assert_eq!(output[0]["type"], "function_call");
     }
 
     #[test]

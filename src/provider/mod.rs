@@ -20,7 +20,8 @@ pub use anthropic::AnthropicMessagesProvider;
 pub use openai_chat::OpenAiChatProvider;
 pub use openai_responses::OpenAiResponsesProvider;
 pub use retry::{
-    DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT, RetryConfig,
+    DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STREAM_IDLE_TIMEOUT,
+    DEFAULT_TIMEOUT_RETRIES, RetryConfig,
 };
 pub(crate) use retry::{HttpRequestEvent, next_stream_item, send_with_retry};
 

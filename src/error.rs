@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use thiserror::Error;
 
-use crate::storage::StorageError;
+use crate::{storage::StorageError, types::ProviderState};
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -104,8 +104,35 @@ pub enum ProviderError {
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
 
+    /// The provider completed a protocol-complete response whose tool-call
+    /// arguments are not valid JSON. The call identifiers and replay state
+    /// are preserved so the agent can pair the rejected call with a
+    /// synthetic error result and ask the model to re-emit it instead of
+    /// failing the run.
+    #[error(
+        "invalid tool arguments for `{name}`: {parse_error}",
+        name = .0.name,
+        parse_error = .0.parse_error
+    )]
+    InvalidToolArguments(Box<InvalidToolCallDetails>),
+
     #[error("provider hook failed: {0}")]
     Hook(#[from] HookError),
+}
+
+/// A tool call whose streamed arguments could not be parsed as JSON. The
+/// provider's response was protocol-complete, so no tool ran and nothing
+/// about the call entered the durable transcript yet.
+#[derive(Debug)]
+pub struct InvalidToolCallDetails {
+    /// Provider-issued tool call id needed for tool-result pairing.
+    pub id: String,
+    pub name: String,
+    pub parse_error: String,
+    /// Truncated malformed payload kept for diagnostics and model feedback.
+    /// Never contains more than a few hundred characters.
+    pub raw_arguments: String,
+    pub provider_state: Option<ProviderState>,
 }
 
 impl ProviderError {
@@ -130,6 +157,7 @@ impl ProviderError {
             | Self::Http(_)
             | Self::RequestTimeout { .. }
             | Self::StreamIdleTimeout { .. }
+            | Self::InvalidToolArguments { .. }
             | Self::Hook(_) => false,
         }
     }
@@ -149,6 +177,38 @@ impl ProviderError {
             Self::InvalidResponse(message)
         }
     }
+
+    /// Builds an [`ProviderError::InvalidToolArguments`] with the malformed
+    /// payload truncated to a bounded, UTF-8-safe diagnostic snippet.
+    pub(crate) fn invalid_tool_arguments(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        raw_arguments: &str,
+        parse_error: impl Into<String>,
+        provider_state: Option<ProviderState>,
+    ) -> Self {
+        Self::InvalidToolArguments(Box::new(InvalidToolCallDetails {
+            id: id.into(),
+            name: name.into(),
+            parse_error: parse_error.into(),
+            raw_arguments: truncate_raw_arguments(raw_arguments),
+            provider_state,
+        }))
+    }
+}
+
+const MAX_RAW_ARGUMENT_SNIPPET_CHARS: usize = 500;
+
+fn truncate_raw_arguments(raw_arguments: &str) -> String {
+    if raw_arguments.chars().count() <= MAX_RAW_ARGUMENT_SNIPPET_CHARS {
+        return raw_arguments.to_owned();
+    }
+    let mut truncated: String = raw_arguments
+        .chars()
+        .take(MAX_RAW_ARGUMENT_SNIPPET_CHARS.saturating_sub(1))
+        .collect();
+    truncated.push('…');
+    truncated
 }
 
 fn looks_like_context_length_error(message: &str) -> bool {
@@ -199,4 +259,43 @@ pub enum AgentError {
 
     #[error("context compaction failed: {0}")]
     ContextCompaction(#[from] ContextCompactionError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_tool_arguments_truncates_long_raw_payloads() {
+        let raw = "x".repeat(1_000);
+        let error =
+            ProviderError::invalid_tool_arguments("id-1", "tool", &raw, "parse error", None);
+        let ProviderError::InvalidToolArguments(details) = &error else {
+            panic!("expected InvalidToolArguments");
+        };
+        assert_eq!(
+            details.raw_arguments.chars().count(),
+            MAX_RAW_ARGUMENT_SNIPPET_CHARS
+        );
+        assert!(details.raw_arguments.ends_with('…'));
+        // The Display used for logs and run-failure events never includes the
+        // malformed payload itself.
+        assert!(!error.to_string().contains("xxxx"));
+        assert_eq!(
+            error.to_string(),
+            "invalid tool arguments for `tool`: parse error"
+        );
+    }
+
+    #[test]
+    fn invalid_tool_arguments_is_never_a_context_length_error() {
+        let error = ProviderError::invalid_tool_arguments(
+            "id-1",
+            "tool",
+            "{}",
+            "unexpected token: maximum context length reached",
+            None,
+        );
+        assert!(!error.is_context_length_exceeded());
+    }
 }
