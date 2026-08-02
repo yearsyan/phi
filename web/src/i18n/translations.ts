@@ -328,7 +328,7 @@ const en = {
   'settings.authKeyPlaceholder':
     'The long-lived bearer key (PHI_DAEMON_AUTH_KEY_FILE)',
   'settings.authKeyHint':
-    'Stored locally in your browser and sent as `Authorization: Bearer …` to the daemon.',
+    'Persisted in browser localStorage and sent as `Authorization: Bearer …` to the daemon.',
   'settings.providerProfile': 'Provider profile',
   'settings.providerCopy':
     'Choose an existing profile or type a new profile id to create one.',
@@ -883,7 +883,7 @@ const zh: Record<TranslationKey, string> = {
   'settings.authKey': '鉴权密钥',
   'settings.authKeyPlaceholder': '长期 bearer key(PHI_DAEMON_AUTH_KEY_FILE)',
   'settings.authKeyHint':
-    '保存在浏览器本地,并以 `Authorization: Bearer …` 发送给 daemon。',
+    '持久保存在浏览器 localStorage，并以 `Authorization: Bearer …` 发送给 daemon。',
   'settings.providerProfile': 'Provider profile',
   'settings.providerCopy': '选择已有 profile，或输入新的 profile id 创建配置。',
   'settings.providers': 'Provider 列表',

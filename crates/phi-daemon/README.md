@@ -320,6 +320,14 @@ stop 是 cooperative cancellation，不是副作用事务回滚：
 daemon 在同一地址提供 Web 客户端和 API。`/v1` 保持纯 API 语义；其他 GET/HEAD 路径
 提供静态资源，未知前端路由回退到 `index.html`。
 
+Web 客户端页面使用可复制、可刷新的 history 路由：新会话为 `/sessions/new`，已激活
+会话为 `/sessions/{session_id}`，定时任务为 `/scheduled-tasks`。浏览器前进与后退会在
+这些页面间导航；prepared 新会话取得持久 session id 后会原位更新为具体会话 URL。
+
+本地调试 Web 客户端时可通过 `PHI_WEB_DAEMON_PROXY_TARGET=https://phi.example.com pnpm dev`
+把 `/v1` HTTP/WS 请求代理到已部署 daemon。长期 daemon key 仍在 Web 设置页输入并只保存
+到当前 origin 的 `localStorage`，可跨 tab 和浏览器重启保留；不要放入 Vite 环境变量。
+
 发布前先构建 Web，再构建 daemon：
 
 ```bash

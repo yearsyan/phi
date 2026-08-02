@@ -18,11 +18,16 @@ daemon 在交互式终端中默认显示包含连接地址和长期 key 的 App 
 时选择一个非 loopback 的本机 IPv4，仍不可用才回退 `127.0.0.1`。这会扩大网络暴露面。
 可用 `--no-qr` 关闭二维码，非终端 stderr 会自动跳过。
 
-Web 客户端把长期 key 存于 `sessionStorage`（关闭 tab 即清除），Flutter 客户端通过平台
-secure storage（Android EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI /
+Web 客户端把长期 key 存于同源 `localStorage`，可跨 tab 和浏览器重启保留；页面中的
+JavaScript 能读取它，因此仍应视为高权限凭据。Flutter 客户端通过平台 secure storage
+（Android EncryptedSharedPreferences / iOS·macOS Keychain / Windows DPAPI /
 OpenHarmony AES）保存，不再写入明文 SharedPreferences。
 macOS Keychain 访问显式禁止认证 UI；无法无交互读取的旧 ad-hoc 签名条目会被视为缺失，
 避免应用启动时弹出系统密码框。
+
+Web 客户端为页面提供可深链接路由：新会话使用 `/sessions/new`，具体会话使用
+`/sessions/{session_id}`，定时任务使用 `/scheduled-tasks`；刷新以及浏览器前进、后退都会
+恢复对应页面。
 
 Web 与 Flutter 的会话列表只在会话存在 active run、正在生成时显示状态点；空闲、
 离线或仅已加载的会话不显示状态点。

@@ -22,6 +22,12 @@ import { initialTheme, useTheme } from './hooks/useTheme.ts';
 import { I18nProvider, useI18n } from './i18n/I18nProvider.tsx';
 import { LOCALES, type Locale } from './i18n/translations.ts';
 import { readLocale, type Theme, writeLocale } from './prefs.ts';
+import {
+  type AppRoute,
+  appRoutePath,
+  parseAppRoute,
+  writeAppRoute,
+} from './routing.ts';
 import type {
   CapabilityMode,
   ForkPosition,
@@ -30,7 +36,6 @@ import type {
 } from './types/wire.ts';
 
 type Selection =
-  | { kind: 'none' }
   | { kind: 'new'; instanceId: number; workspace?: string }
   | { kind: 'scheduled_tasks' }
   | { kind: 'session'; sessionId: string };
@@ -41,7 +46,6 @@ function selectionToTarget(
   agentProfileId: string,
   capabilityMode: CapabilityMode | null,
 ): SessionTarget | null {
-  if (selection.kind === 'none') return null;
   if (selection.kind === 'scheduled_tasks') return null;
   if (selection.kind === 'new') {
     return {
@@ -54,6 +58,20 @@ function selectionToTarget(
     };
   }
   return { kind: 'attach', sessionId: selection.sessionId };
+}
+
+function routeToSelection(
+  route: AppRoute,
+  newSessionInstance: number,
+): Selection {
+  switch (route.kind) {
+    case 'new_session':
+      return { kind: 'new', instanceId: newSessionInstance };
+    case 'scheduled_tasks':
+      return { kind: 'scheduled_tasks' };
+    case 'session':
+      return { kind: 'session', sessionId: route.sessionId };
+  }
 }
 
 function App() {
@@ -76,9 +94,14 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
   const nextSessionInstance = useRef(1);
 
   const [config, setConfig] = useState(() => readDaemonConfig());
-  const [selection, setSelection] = useState<Selection>(() =>
-    isConfigured(config) ? { kind: 'new', instanceId: 1 } : { kind: 'none' },
-  );
+  const [selection, setSelection] = useState<Selection>(() => {
+    const initialRoute = parseAppRoute(window.location.pathname) ?? {
+      kind: 'new_session' as const,
+    };
+    return routeToSelection(initialRoute, 1);
+  });
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [providerProfiles, setProviderProfiles] = useState<
@@ -90,6 +113,29 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
   useEffect(() => {
     if (!isConfigured(config)) setSettingsOpen(true);
   }, [config]);
+
+  useEffect(() => {
+    const initialRoute = parseAppRoute(window.location.pathname) ?? {
+      kind: 'new_session' as const,
+    };
+    if (window.location.pathname !== appRoutePath(initialRoute)) {
+      writeAppRoute(initialRoute, { replace: true });
+    }
+
+    const handlePopState = () => {
+      const route = parseAppRoute(window.location.pathname) ?? {
+        kind: 'new_session' as const,
+      };
+      if (window.location.pathname !== appRoutePath(route)) {
+        writeAppRoute(route, { replace: true });
+      }
+      nextSessionInstance.current += 1;
+      setSelection(routeToSelection(route, nextSessionInstance.current));
+      setSidebarOpen(false);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -130,13 +176,15 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
 
   const target = useMemo(
     () =>
-      selectionToTarget(
-        selection,
-        config.profileId,
-        config.agentProfileId,
-        config.capabilityMode,
-      ),
-    [selection, config.profileId, config.agentProfileId, config.capabilityMode],
+      isConfigured(config)
+        ? selectionToTarget(
+            selection,
+            config.profileId,
+            config.agentProfileId,
+            config.capabilityMode,
+          )
+        : null,
+    [selection, config],
   );
   const controls = useDaemonSession(config.authKey, target);
   const {
@@ -154,6 +202,14 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
   }, [sessionListRevision, refreshSessions]);
 
   const liveSessionId = controls.state.sessionId;
+  useEffect(() => {
+    if (selectionRef.current.kind !== 'new' || liveSessionId === null) return;
+    writeAppRoute(
+      { kind: 'session', sessionId: liveSessionId },
+      { replace: true },
+    );
+  }, [liveSessionId]);
+
   const visibleWorkspaces = useMemo(
     () =>
       workspaces.map((workspace) => ({
@@ -177,11 +233,13 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
 
   const startNewSession = useCallback(() => {
     nextSessionInstance.current += 1;
-    setSelection({
+    const nextSelection: Selection = {
       kind: 'new',
       instanceId: nextSessionInstance.current,
       workspace: controls.state.workspace ?? undefined,
-    });
+    };
+    setSelection(nextSelection);
+    writeAppRoute({ kind: 'new_session' });
     setSidebarOpen(false);
   }, [controls.state.workspace]);
 
@@ -205,16 +263,19 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
         liveSessionId === sessionId;
       setSidebarOpen(false);
       if (alreadySelected) {
+        writeAppRoute({ kind: 'session', sessionId });
         if (controls.connectionPhase === 'error') controls.retry();
         return;
       }
       setSelection({ kind: 'session', sessionId });
+      writeAppRoute({ kind: 'session', sessionId });
     },
     [controls.connectionPhase, controls.retry, liveSessionId, selection],
   );
 
   const openScheduledTasks = useCallback(() => {
     setSelection({ kind: 'scheduled_tasks' });
+    writeAppRoute({ kind: 'scheduled_tasks' });
     setSidebarOpen(false);
   }, []);
 
@@ -248,6 +309,7 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
       );
       await refreshSessions();
       setSelection({ kind: 'session', sessionId: forked.session_id });
+      writeAppRoute({ kind: 'session', sessionId: forked.session_id });
       setSidebarOpen(false);
     },
     [config.authKey, controls.state.sessionId, refreshSessions],
@@ -287,6 +349,7 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
         instanceId: nextSessionInstance.current,
         workspace: controls.state.workspace ?? undefined,
       });
+      writeAppRoute({ kind: 'new_session' });
       setSidebarOpen(false);
     },
     [controls.state.workspace],
@@ -306,16 +369,7 @@ function AppShell({ initialTheme }: { initialTheme: Theme }) {
     [],
   );
 
-  const handleConfigured = useCallback(() => {
-    setSelection((current) => {
-      if (current.kind !== 'none') return current;
-      nextSessionInstance.current += 1;
-      return {
-        kind: 'new',
-        instanceId: nextSessionInstance.current,
-      };
-    });
-  }, []);
+  const handleConfigured = useCallback(() => undefined, []);
 
   const cycleLocale = useCallback(() => {
     const currentIndex = LOCALES.indexOf(locale);

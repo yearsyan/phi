@@ -6,13 +6,12 @@
  * profile ids and capability mode choose the defaults for new sessions.
  *
  * Storage split:
- * - The auth key lives in `sessionStorage`. It is scoped to this tab and is
- *   dropped when the tab closes, so the long-lived credential is never
- *   persisted to disk beyond the browsing session. (Browser architecture
- *   means any in-page JS can still read it during the session — this is a
- *   reduction of exposure window, not a sandbox.)
- * - Non-sensitive UI prefs (profile ids, capability mode) stay in
- *   `localStorage` so they persist across sessions.
+ * - The auth key lives in `localStorage`, so it persists across tabs and
+ *   browser restarts for the same origin. Browser architecture means any
+ *   in-page JS can read it, so it must still be treated as a high-privilege
+ *   credential rather than a sandboxed secret.
+ * - Non-sensitive UI prefs (profile ids, capability mode) also stay in
+ *   `localStorage`.
  */
 
 import type { CapabilityMode } from '../types/wire.ts';
@@ -30,34 +29,29 @@ export interface DaemonConfig {
 }
 
 /**
- * One-time migration from the legacy `localStorage` auth-key slot to
- * `sessionStorage`. If a key is present in `localStorage` and absent from
- * `sessionStorage`, it is moved across and removed from `localStorage`. Safe
- * to call on every load; a no-op once migration has run.
+ * One-time migration from the previous `sessionStorage` auth-key slot to
+ * `localStorage`. An existing local key wins over a stale tab-scoped copy, and
+ * the session copy is always removed after migration.
  */
-function migrateAuthKeyToSessionStorage(): void {
+function migrateAuthKeyToLocalStorage(): void {
   if (
     typeof localStorage === 'undefined' ||
     typeof sessionStorage === 'undefined'
   ) {
     return;
   }
-  const legacy = localStorage.getItem(KEY_DAEMON_AUTH);
-  if (legacy && !sessionStorage.getItem(KEY_DAEMON_AUTH)) {
-    sessionStorage.setItem(KEY_DAEMON_AUTH, legacy);
-    localStorage.removeItem(KEY_DAEMON_AUTH);
-  } else if (legacy) {
-    // Already migrated (sessionStorage has a value); drop the stale legacy
-    // copy so it can no longer be read from `localStorage`.
-    localStorage.removeItem(KEY_DAEMON_AUTH);
+  const sessionKey = sessionStorage.getItem(KEY_DAEMON_AUTH);
+  if (sessionKey && !localStorage.getItem(KEY_DAEMON_AUTH)) {
+    localStorage.setItem(KEY_DAEMON_AUTH, sessionKey);
   }
+  sessionStorage.removeItem(KEY_DAEMON_AUTH);
 }
 
 export function readDaemonConfig(): DaemonConfig {
-  migrateAuthKeyToSessionStorage();
+  migrateAuthKeyToLocalStorage();
   const authKey =
-    typeof sessionStorage !== 'undefined'
-      ? (sessionStorage.getItem(KEY_DAEMON_AUTH) ?? '')
+    typeof localStorage !== 'undefined'
+      ? (localStorage.getItem(KEY_DAEMON_AUTH) ?? '')
       : '';
   const profileId =
     typeof localStorage !== 'undefined'
@@ -78,10 +72,13 @@ export function readDaemonConfig(): DaemonConfig {
 }
 
 export function writeAuthKey(value: string): void {
-  if (typeof sessionStorage === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   if (value) {
-    sessionStorage.setItem(KEY_DAEMON_AUTH, value);
+    localStorage.setItem(KEY_DAEMON_AUTH, value);
   } else {
+    localStorage.removeItem(KEY_DAEMON_AUTH);
+  }
+  if (typeof sessionStorage !== 'undefined') {
     sessionStorage.removeItem(KEY_DAEMON_AUTH);
   }
 }
