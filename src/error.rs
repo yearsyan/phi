@@ -67,6 +67,18 @@ pub enum McpError {
 
     #[error("failed to close MCP connection: {0}")]
     Close(String),
+
+    #[error("MCP client has no captured configuration and cannot be reconnected")]
+    NoReconnectSpec,
+
+    #[error(
+        "MCP server `{server}` changed its tool set after reconnect (was {previous}, now {current})"
+    )]
+    ToolSetChanged {
+        server: String,
+        previous: usize,
+        current: usize,
+    },
 }
 
 #[derive(Debug, Error)]

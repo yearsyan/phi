@@ -1187,6 +1187,18 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     continue;
                 }
 
+                // MCP connections are released after the previous run drained
+                // its queue; rebuild them (terminating stale stdio children and
+                // browser locks) before starting the next run.
+                if let Err(error) = agent.ensure_mcp().await {
+                    hub.run_failed(
+                        run_id,
+                        format!("could not reconnect MCP tools: {error}"),
+                        AgentStatus::Idle,
+                    );
+                    continue;
+                }
+
                 let control = AgentRunControl::new();
                 {
                     let mut active = active_run.lock().expect("active run lock poisoned");
@@ -1449,6 +1461,16 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         Err(error) => hub.run_failed(run_id, error.to_string(), terminal_status),
                     }
                     *active = None;
+                }
+                // Release stdio MCP children as soon as no prompt is queued.
+                // Each spawned browser automation server holds a browser and
+                // profile locks; leaving them alive accumulates processes that
+                // eventually block the next connection. The next Prompt
+                // command reconnects before running.
+                if backlog.is_empty()
+                    && let Err(error) = agent.release_mcp().await
+                {
+                    error!(error = %error, "failed to release MCP clients after run");
                 }
                 if closing {
                     break;

@@ -438,6 +438,7 @@ pub struct AgentBuilder {
     provider: Box<dyn LlmProvider>,
     system_prompt: String,
     tools: Vec<Arc<dyn Tool>>,
+    mcp_clients: Vec<McpClient>,
     builtin_tools: Vec<BuiltinTools>,
     tool_execution: ToolExecutionMode,
     tool_call_timeout: Option<Duration>,
@@ -460,6 +461,7 @@ impl AgentBuilder {
             provider: Box::new(provider),
             system_prompt: "You are a helpful assistant.".to_owned(),
             tools: Vec::new(),
+            mcp_clients: Vec::new(),
             builtin_tools: Vec::new(),
             tool_execution: ToolExecutionMode::Parallel,
             tool_call_timeout: Some(DEFAULT_TOOL_CALL_TIMEOUT),
@@ -507,8 +509,12 @@ impl AgentBuilder {
         self.builtin_tools(BuiltinTools::all(cwd))
     }
 
-    /// Installs the tools discovered by an already connected MCP client.
+    /// Installs the tools discovered by an already connected MCP client. The
+    /// client's connection is owned by the agent: it can be released after a
+    /// run and reconnected before the next one via [`Agent::release_mcp`] and
+    /// [`Agent::ensure_mcp`].
     pub fn mcp_client(mut self, client: McpClient) -> Self {
+        self.mcp_clients.push(client.clone());
         self.tools.extend(client.into_tools());
         self
     }
@@ -704,6 +710,7 @@ impl AgentBuilder {
             provider: Arc::from(self.provider),
             system_prompt: self.system_prompt,
             tools,
+            mcp_clients: self.mcp_clients,
             messages: Vec::new(),
             session_history: SessionHistory::default(),
             listeners: Vec::new(),
@@ -736,6 +743,7 @@ pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     system_prompt: String,
     tools: HashMap<String, Arc<dyn Tool>>,
+    mcp_clients: Vec<McpClient>,
     messages: Vec<Message>,
     session_history: SessionHistory,
     listeners: Vec<EventListener>,
@@ -810,6 +818,34 @@ impl Agent {
 
     pub fn workspace(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
+    }
+
+    /// Closes every MCP connection owned by this agent, terminating stdio
+    /// child processes and releasing the server's browser or profile locks.
+    /// Registered tools stay in place; [`Agent::ensure_mcp`] reconnects the
+    /// connections before the next run. Agents without MCP clients are
+    /// unaffected.
+    ///
+    /// Callers own the release policy: the agent serializes runs, so releasing
+    /// only when the run queue is empty keeps reconnect churn minimal.
+    pub async fn release_mcp(&self) -> Result<(), crate::error::McpError> {
+        for client in &self.mcp_clients {
+            client.close().await?;
+        }
+        Ok(())
+    }
+
+    /// Reconnects MCP connections previously released by [`Agent::release_mcp`].
+    /// Already-connected clients are left untouched. Returns the first
+    /// reconnect error so the caller can fail the next run with a readable
+    /// message instead of surfacing stale tool-call failures mid-run.
+    pub async fn ensure_mcp(&self) -> Result<(), crate::error::McpError> {
+        for client in &self.mcp_clients {
+            if client.is_released().await {
+                client.reconnect().await?;
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_messages(&mut self) {

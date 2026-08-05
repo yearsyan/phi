@@ -132,6 +132,10 @@ profiles     AgentRegistry
 | Provider Profile | adapter、credential、base URL、模型、生成参数、上下文预算 | 只影响之后创建或重启恢复的 Agent，不热替换 live/prepared Agent |
 | Agent Profile | prompt、工具/skill policy、MCP ID、初始 capability、model/reasoning override | prepared 时解析，首 prompt 激活时把完整 resolved profile 和 revision pin 到 session |
 | MCP Profile | stdio 或 Streamable HTTP 连接、credential、工具前缀和输出限制 | Agent Profile 只 pin ID；新 Agent、重启恢复和定时任务下次执行读取最新连接配置 |
+
+MCP stdio 子进程由 session actor 持有；run 队列清空后 daemon 会关闭连接并终止子进程
+（释放浏览器/profile 锁等服务器资源），下一条 prompt 开始前自动重连。工具列表在重连
+前后必须一致，否则该次 run 以可读错误失败。
 | Bot Account | Telegram token | 可被多个收件目标复用，公开响应只显示 token 是否已配置 |
 | Output Channel | Bot Account ID 与 chat ID | 可被定时任务引用，通知失败不改变 Agent run 结果 |
 

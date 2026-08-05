@@ -264,75 +264,53 @@ pub struct McpServerInfo {
     pub instructions: Option<String>,
 }
 
+/// Reconnect specification retained by an MCP client so a released
+/// connection (and its stdio child process) can be rebuilt on demand.
+#[derive(Clone)]
+enum McpReconnectSpec {
+    Stdio(McpStdioConfig),
+    Http(McpHttpConfig),
+}
+
+/// Holds the live [`McpSession`] of a connection. [`McpClient::close`] empties
+/// the slot (terminating any stdio child process) and [`McpClient::reconnect`]
+/// refills it, so tools discovered at connect time keep working across
+/// release/reconnect cycles without re-registering agent tools.
+struct SessionSlot(Mutex<Option<Arc<McpSession>>>);
+
 /// A connected MCP server and the snapshot of tools discovered at connect time.
+///
+/// The connection can be released (closing the transport and terminating stdio
+/// children) and reconnected later from the captured configuration; see
+/// [`McpClient::close`] and [`McpClient::reconnect`].
 #[derive(Clone)]
 pub struct McpClient {
-    session: Arc<McpSession>,
+    session_slot: Arc<SessionSlot>,
     tools: Vec<Arc<dyn Tool>>,
     server_info: McpServerInfo,
+    reconnect: Option<McpReconnectSpec>,
 }
 
 impl McpClient {
     pub async fn connect_stdio(config: McpStdioConfig) -> Result<Self, McpError> {
-        let McpStdioConfig {
-            command,
-            args,
-            current_dir,
-            env,
-            clear_env,
-            options,
-        } = config;
-
-        let mut command = tokio::process::Command::new(command);
-        command.args(args);
-        if let Some(current_dir) = current_dir {
-            command.current_dir(current_dir);
-        }
-        if clear_env {
-            command.env_clear();
-        }
-        command.envs(env);
-
-        let transport = TokioChildProcess::new(command).map_err(McpError::Spawn)?;
-        let running = connect_transport(transport, options.connect_timeout).await?;
-        Self::from_running(running, options).await
+        Self::connect(McpReconnectSpec::Stdio(config)).await
     }
 
     pub async fn connect_http(config: McpHttpConfig) -> Result<Self, McpError> {
-        let McpHttpConfig {
-            uri,
-            bearer_token,
-            headers,
-            allow_stateless,
-            reinitialize_on_expired_session,
-            options,
-        } = config;
+        Self::connect(McpReconnectSpec::Http(config)).await
+    }
 
-        let mut custom_headers = HashMap::with_capacity(headers.len());
-        for (name, value) in headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                McpError::InvalidHttpHeader {
-                    name: name.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            let header_value =
-                HeaderValue::from_str(&value).map_err(|error| McpError::InvalidHttpHeader {
-                    name: name.clone(),
-                    message: error.to_string(),
-                })?;
-            custom_headers.insert(header_name, header_value);
-        }
-
-        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(uri);
-        transport_config.auth_header = bearer_token;
-        transport_config.custom_headers = custom_headers;
-        transport_config.allow_stateless = allow_stateless;
-        transport_config.reinit_on_expired_session = reinitialize_on_expired_session;
-
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
-        let running = connect_transport(transport, options.connect_timeout).await?;
-        Self::from_running(running, options).await
+    async fn connect(reconnect: McpReconnectSpec) -> Result<Self, McpError> {
+        let session_slot = Arc::new(SessionSlot(Mutex::new(None)));
+        let (session, tools, server_info) =
+            connect_reconnect_spec(&reconnect, Arc::clone(&session_slot)).await?;
+        *session_slot.0.lock().await = Some(session);
+        Ok(Self {
+            session_slot,
+            tools,
+            server_info,
+            reconnect: Some(reconnect),
+        })
     }
 
     pub fn server_info(&self) -> &McpServerInfo {
@@ -348,65 +326,201 @@ impl McpClient {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.session.peer.is_transport_closed()
+        self.session()
+            .is_some_and(|session| session.peer.is_transport_closed())
     }
 
-    /// Gracefully closes the shared connection. Calls through cloned clients or agents fail after
-    /// this returns.
+    /// Returns true when the connection has been released by [`McpClient::close`]
+    /// and must be rebuilt with [`McpClient::reconnect`] before the next call.
+    pub async fn is_released(&self) -> bool {
+        self.session_slot.0.lock().await.is_none()
+    }
+
+    /// Gracefully closes the shared connection and terminates any stdio child
+    /// process. Registered tools stay in place; the next [`McpClient::reconnect`]
+    /// (or an agent's `ensure_mcp`) rebuilds the connection before the next run.
     pub async fn close(&self) -> Result<(), McpError> {
-        self.session.close().await
+        let session = self.session_slot.0.lock().await.take();
+        if let Some(session) = session {
+            session.close().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Rebuilds a connection that was released by [`McpClient::close`], using the
+    /// configuration captured at connect time. Reconnecting an already-connected
+    /// client is a no-op. The reconnected server must expose the same tool set;
+    /// a changed set is rejected so agent tool registrations never silently
+    /// diverge from the live connection.
+    pub async fn reconnect(&self) -> Result<(), McpError> {
+        {
+            let slot = self.session_slot.0.lock().await;
+            if slot.is_some() {
+                return Ok(());
+            }
+        }
+        let spec = self.reconnect.as_ref().ok_or(McpError::NoReconnectSpec)?;
+        let (session, discovered, _) =
+            connect_reconnect_spec(spec, Arc::clone(&self.session_slot)).await?;
+        let previous = self.tools.len();
+        let current = discovered.len();
+        if previous != current {
+            return Err(McpError::ToolSetChanged {
+                server: self.server_info.name.clone(),
+                previous,
+                current,
+            });
+        }
+        *self.session_slot.0.lock().await = Some(session);
+        Ok(())
+    }
+
+    fn session(&self) -> Option<Arc<McpSession>> {
+        // The slot is only emptied while no tool execution is in flight (the
+        // agent serializes release/reconnect between runs), so a synchronous
+        // peek is sufficient for connection-state checks.
+        self.session_slot.0.try_lock().ok()?.as_ref().cloned()
     }
 
     pub(crate) fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         self.tools
     }
 
+    #[cfg(test)]
     async fn from_running(
         running: RunningService<RoleClient, ClientInfo>,
         options: McpClientOptions,
     ) -> Result<Self, McpError> {
-        let raw_server_info = running.peer_info().ok_or(McpError::MissingServerInfo)?;
-        let server_info = McpServerInfo::from(raw_server_info.as_ref());
-
-        let remote_tools = if raw_server_info.capabilities.tools.is_some() {
-            request_with_timeout(
-                "tools/list",
-                options.request_timeout,
-                running.list_all_tools(),
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        let session = Arc::new(McpSession {
-            peer: running.peer().clone(),
-            running: Mutex::new(Some(running)),
-            request_timeout: options.request_timeout,
-        });
-        let mut names = HashSet::with_capacity(remote_tools.len());
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(remote_tools.len());
-        for remote_tool in remote_tools {
-            let (remote_name, definition) =
-                tool_definition(&remote_tool, options.tool_name_prefix.as_deref());
-            if !names.insert(definition.name.clone()) {
-                return Err(McpError::DuplicateToolName(definition.name));
-            }
-            tools.push(Arc::new(McpTool {
-                remote_name,
-                definition,
-                session: Arc::clone(&session),
-                max_output_lines: options.max_output_lines,
-                max_output_bytes: options.max_output_bytes,
-            }));
-        }
-
+        let session_slot = Arc::new(SessionSlot(Mutex::new(None)));
+        let (session, tools, server_info) =
+            discover_tools(running, options, Arc::clone(&session_slot)).await?;
+        *session_slot.0.lock().await = Some(session);
         Ok(Self {
-            session,
+            session_slot,
             tools,
             server_info,
+            reconnect: None,
         })
     }
+}
+
+/// Discovers the server's tool set and wraps the running transport in a
+/// [`McpSession`]. Tool instances borrow the shared [`SessionSlot`] so they
+/// keep working after the connection is released and reconnected.
+async fn discover_tools(
+    running: RunningService<RoleClient, ClientInfo>,
+    options: McpClientOptions,
+    session_slot: Arc<SessionSlot>,
+) -> Result<(Arc<McpSession>, Vec<Arc<dyn Tool>>, McpServerInfo), McpError> {
+    let raw_server_info = running.peer_info().ok_or(McpError::MissingServerInfo)?;
+    let server_info = McpServerInfo::from(raw_server_info.as_ref());
+
+    let remote_tools = if raw_server_info.capabilities.tools.is_some() {
+        request_with_timeout(
+            "tools/list",
+            options.request_timeout,
+            running.list_all_tools(),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    let session = Arc::new(McpSession {
+        peer: running.peer().clone(),
+        running: Mutex::new(Some(running)),
+        request_timeout: options.request_timeout,
+    });
+    let mut names = HashSet::with_capacity(remote_tools.len());
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(remote_tools.len());
+    for remote_tool in remote_tools {
+        let (remote_name, definition) =
+            tool_definition(&remote_tool, options.tool_name_prefix.as_deref());
+        if !names.insert(definition.name.clone()) {
+            return Err(McpError::DuplicateToolName(definition.name));
+        }
+        tools.push(Arc::new(McpTool {
+            remote_name,
+            definition,
+            session_slot: Arc::clone(&session_slot),
+            max_output_lines: options.max_output_lines,
+            max_output_bytes: options.max_output_bytes,
+        }));
+    }
+
+    Ok((session, tools, server_info))
+}
+
+/// Establishes a transport from a captured reconnect specification and
+/// discovers its tools. Shared by the initial connect and by
+/// [`McpClient::reconnect`].
+async fn connect_reconnect_spec(
+    spec: &McpReconnectSpec,
+    session_slot: Arc<SessionSlot>,
+) -> Result<(Arc<McpSession>, Vec<Arc<dyn Tool>>, McpServerInfo), McpError> {
+    let (running, options) = match spec {
+        McpReconnectSpec::Stdio(config) => {
+            let McpStdioConfig {
+                command,
+                args,
+                current_dir,
+                env,
+                clear_env,
+                options,
+            } = config;
+            let mut command = tokio::process::Command::new(command);
+            command.args(args);
+            if let Some(current_dir) = current_dir {
+                command.current_dir(current_dir);
+            }
+            if *clear_env {
+                command.env_clear();
+            }
+            command.envs(env.iter().cloned());
+            let transport = TokioChildProcess::new(command).map_err(McpError::Spawn)?;
+            (
+                connect_transport(transport, options.connect_timeout).await?,
+                options,
+            )
+        }
+        McpReconnectSpec::Http(config) => {
+            let McpHttpConfig {
+                uri,
+                bearer_token,
+                headers,
+                allow_stateless,
+                reinitialize_on_expired_session,
+                options,
+            } = config;
+            let mut custom_headers = HashMap::with_capacity(headers.len());
+            for (name, value) in headers {
+                let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    McpError::InvalidHttpHeader {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let header_value =
+                    HeaderValue::from_str(value).map_err(|error| McpError::InvalidHttpHeader {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
+                custom_headers.insert(header_name, header_value);
+            }
+            let mut transport_config = StreamableHttpClientTransportConfig::with_uri(uri.clone());
+            transport_config.auth_header = bearer_token.clone();
+            transport_config.custom_headers = custom_headers;
+            transport_config.allow_stateless = *allow_stateless;
+            transport_config.reinit_on_expired_session = *reinitialize_on_expired_session;
+            let transport = StreamableHttpClientTransport::from_config(transport_config);
+            (
+                connect_transport(transport, options.connect_timeout).await?,
+                options,
+            )
+        }
+    };
+    discover_tools(running, options.clone(), session_slot).await
 }
 
 impl From<&ServerInfo> for McpServerInfo {
@@ -458,7 +572,7 @@ impl McpSession {
 struct McpTool {
     remote_name: String,
     definition: ToolDefinition,
-    session: Arc<McpSession>,
+    session_slot: Arc<SessionSlot>,
     max_output_lines: usize,
     max_output_bytes: usize,
 }
@@ -485,7 +599,15 @@ impl Tool for McpTool {
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        let result = self.session.call_tool(params).await?;
+        let session = {
+            let slot = self.session_slot.0.lock().await;
+            slot.as_ref().cloned().ok_or_else(|| {
+                ToolError::new(
+                    "MCP connection is not connected; the agent reconnects it before the next run",
+                )
+            })?
+        };
+        let result = session.call_tool(params).await?;
         Ok(format_tool_result(
             result,
             self.max_output_lines,
@@ -887,8 +1009,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let server = server_task.await.unwrap();
-
+        let _server = server_task.await.unwrap();
         assert_eq!(client.server_info().name, "test-mcp");
         assert_eq!(client.tool_definitions()[0].name, "test__echo");
         let output = client.tools[0]
@@ -898,7 +1019,49 @@ mod tests {
         assert_eq!(output, ToolOutput::success("echo:hello"));
 
         client.close().await.unwrap();
-        server.cancel().await.unwrap();
-        assert!(client.is_closed());
+        assert!(client.is_released().await);
+    }
+
+    #[tokio::test]
+    async fn released_connections_fail_clearly_and_require_a_captured_reconnect_spec() {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1_024);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        let server_task = tokio::spawn(async move {
+            TestMcpServer
+                .serve((server_read, server_write))
+                .await
+                .unwrap()
+        });
+
+        let running = connect_transport((client_read, client_write), DEFAULT_MCP_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        let client = McpClient::from_running(running, McpClientOptions::default())
+            .await
+            .unwrap();
+        let _server = server_task.await.unwrap();
+
+        // Tools work while the connection is live, then fail with a clear
+        // message once the connection is released.
+        let output = client.tools[0]
+            .execute(json!({ "text": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(output, ToolOutput::success("echo:hello"));
+        assert!(!client.is_released().await);
+
+        client.close().await.unwrap();
+        assert!(client.is_released().await);
+        let error = client.tools[0]
+            .execute(json!({ "text": "hello" }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not connected"), "{error}");
+
+        // A client built without captured configuration cannot reconnect.
+        let error = client.reconnect().await.unwrap_err();
+        assert!(matches!(error, McpError::NoReconnectSpec));
+        assert!(client.is_released().await);
     }
 }
