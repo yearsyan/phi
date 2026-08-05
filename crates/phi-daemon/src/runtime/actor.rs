@@ -1462,12 +1462,18 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                     }
                     *active = None;
                 }
-                // Release stdio MCP children as soon as no prompt is queued.
-                // Each spawned browser automation server holds a browser and
-                // profile locks; leaving them alive accumulates processes that
-                // eventually block the next connection. The next Prompt
-                // command reconnects before running.
+                // Scheduled runs release stdio MCP children once no prompt is
+                // queued. Each spawned browser automation server holds a
+                // browser and profile locks; leaving them alive between daily
+                // runs accumulates processes that eventually block the next
+                // connection. Interactive sessions keep their connection warm
+                // across prompts, so the next Prompt command only reconnects
+                // when a release actually happened.
+                let scheduled = binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.record.scheduled_task_id.is_some());
                 if backlog.is_empty()
+                    && scheduled
                     && let Err(error) = agent.release_mcp().await
                 {
                     error!(error = %error, "failed to release MCP clients after run");

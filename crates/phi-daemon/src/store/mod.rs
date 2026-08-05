@@ -172,6 +172,13 @@ pub struct SessionRecord {
     #[serde(default)]
     pub pinned: bool,
     pub profile_id: String,
+    /// The scheduled task that owns this session, when the session was created
+    /// by a scheduled run. Ordinary interactive sessions leave this unset. The
+    /// actor uses it to release MCP connections (terminating stdio children)
+    /// after scheduled runs drain, while interactive sessions keep their
+    /// connection warm across prompts.
+    #[serde(default)]
+    pub scheduled_task_id: Option<String>,
     /// Complete Agent Profile snapshot selected before this session was
     /// activated. Old metadata omits it and resumes with the built-in
     /// `default@0` profile.
@@ -198,6 +205,7 @@ impl SessionRecord {
             title: None,
             pinned: false,
             profile_id: profile_id.into(),
+            scheduled_task_id: None,
             agent_profile: None,
             model: model.into(),
             workspace: None,

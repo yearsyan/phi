@@ -677,7 +677,11 @@ impl ScheduledTaskManager {
             Ok(prepared) => prepared,
             Err(error) => return TaskCompletion::failed(error.to_string()),
         };
-        let handle = match self.service.activate_session(&prepared).await {
+        let handle = match self
+            .service
+            .activate_session_for_task(&prepared, task.id.to_string())
+            .await
+        {
             Ok(handle) => handle,
             Err(error) => {
                 self.service.discard_prepared(&prepared).await;

@@ -624,13 +624,36 @@ impl ApplicationService {
         &self,
         prepared: &PreparedSession,
     ) -> Result<AgentHandle, ServiceError> {
+        self.activate_session_with_source(prepared, None).await
+    }
+
+    /// Activates a prepared session on behalf of a scheduled task. The
+    /// session's record carries the owning task ID so the actor can release
+    /// MCP connections (terminating stdio children) once the scheduled run
+    /// drains, instead of keeping browser automation servers alive between
+    /// daily runs.
+    pub(crate) async fn activate_session_for_task(
+        &self,
+        prepared: &PreparedSession,
+        task_id: impl Into<String>,
+    ) -> Result<AgentHandle, ServiceError> {
+        self.activate_session_with_source(prepared, Some(task_id.into()))
+            .await
+    }
+
+    async fn activate_session_with_source(
+        &self,
+        prepared: &PreparedSession,
+        scheduled_task_id: Option<String>,
+    ) -> Result<AgentHandle, ServiceError> {
         let _lifecycle = self.enter().await?;
         let session_id = prepared.handle.session_id();
         // Activation and restart-time attach use the same per-session lock.
         // Once metadata becomes visible, an attaching client therefore either
         // observes this exact actor or waits for activation to fail cleanly.
         let _activation_guard = self.registry.lock_session(session_id).await;
-        self.activate_session_locked(prepared).await
+        self.activate_session_locked(prepared, scheduled_task_id)
+            .await
     }
 
     /// Atomically exposes a freshly prepared session and admits the prompt
@@ -657,7 +680,7 @@ impl ApplicationService {
         let _lifecycle = self.enter().await?;
         let session_id = prepared.handle.session_id();
         let _activation_guard = self.registry.lock_session(session_id).await;
-        let handle = self.activate_session_locked(prepared).await?;
+        let handle = self.activate_session_locked(prepared, None).await?;
         let queued = handle.enqueue_prompt(content).await?;
         self.schedule_session_title(&handle, title_content).await;
         Ok((handle, queued))
@@ -666,6 +689,7 @@ impl ApplicationService {
     async fn activate_session_locked(
         &self,
         prepared: &PreparedSession,
+        scheduled_task_id: Option<String>,
     ) -> Result<AgentHandle, ServiceError> {
         let session_id = prepared.handle.session_id();
         let view = prepared.handle.summary();
@@ -682,6 +706,7 @@ impl ApplicationService {
             view.model,
             view.reasoning_effort,
         );
+        record.scheduled_task_id = scheduled_task_id;
         record.agent_profile = Some(prepared.handle.agent_profile().clone());
         record.workspace = view.workspace;
         record.config_revision = view.config_revision;

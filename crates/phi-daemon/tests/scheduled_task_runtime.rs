@@ -385,6 +385,11 @@ async fn due_task_creates_a_named_independent_session_and_records_success() {
         Some("Automated review")
     );
     assert_eq!(
+        sessions[0].record.scheduled_task_id.as_deref(),
+        Some(task.id.to_string().as_str()),
+        "scheduled runs must mark their owning task on the session record"
+    );
+    assert_eq!(
         sessions[0].record.workspace,
         Some(Workspace::new(&workspace.0))
     );

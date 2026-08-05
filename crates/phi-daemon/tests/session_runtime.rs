@@ -1079,6 +1079,10 @@ async fn prepared_session_is_invisible_until_first_prompt_activation() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].record.id, session_id);
     assert_eq!(
+        sessions[0].record.scheduled_task_id, None,
+        "interactively activated sessions must not carry a scheduled task marker"
+    );
+    assert_eq!(
         sessions[0].state.as_ref().unwrap().status,
         AgentStatus::Idle
     );
