@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use futures_util::FutureExt;
@@ -38,6 +39,12 @@ use crate::store::{ControlStore, SessionRecord};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 1_024;
+/// Interactive sessions release their MCP connections (terminating stdio
+/// children) after this idle period without commands. Scheduled-run sessions
+/// already release as soon as their run queue drains; this timeout covers
+/// manual sessions whose stale browser automation server would otherwise
+/// linger until the next daily run, slowing down (or timing out) its connect.
+const MCP_IDLE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentStatus {
@@ -1104,6 +1111,16 @@ async fn run_actor(mut agent: Agent, runtime: ActorRuntime) {
                         }
                         if let Some(command) = backlog.pop_front() {
                             break Some(command);
+                        }
+                    }
+                    _ = tokio::time::sleep(MCP_IDLE_RELEASE_TIMEOUT) => {
+                        // Idle actors release MCP children so manual sessions do
+                        // not leave a browser automation server running until the
+                        // next scheduled run. Release is idempotent: scheduled
+                        // sessions already released after their run drained, and
+                        // the next prompt reconnects via `ensure_mcp`.
+                        if let Err(error) = agent.release_mcp().await {
+                            error!(error = %error, "failed to release MCP clients after idle timeout");
                         }
                     }
                 }
