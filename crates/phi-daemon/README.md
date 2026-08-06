@@ -135,7 +135,7 @@ profiles     AgentRegistry
 
 MCP stdio 子进程由 session actor 持有。定时任务创建的 session 在 run 队列清空后
 关闭 MCP 连接并终止子进程（释放浏览器/profile 锁等服务器资源），下一条 prompt 开始前
-自动重连；交互式 session 保持连接常驻，连续 prompt 不重连，但空闲超过 30 分钟也会
+自动重连；交互式 session 保持连接常驻，连续 prompt 不重连，但空闲超过 15 分钟也会
 自动释放，避免手动会话的残留实例拖慢后续定时任务的连接初始化。工具列表在重连
 前后必须一致，否则该次 run 以可读错误失败。
 | Bot Account | Telegram token | 可被多个收件目标复用，公开响应只显示 token 是否已配置 |

@@ -44,7 +44,7 @@ const EVENT_CAPACITY: usize = 1_024;
 /// already release as soon as their run queue drains; this timeout covers
 /// manual sessions whose stale browser automation server would otherwise
 /// linger until the next daily run, slowing down (or timing out) its connect.
-const MCP_IDLE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MCP_IDLE_RELEASE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentStatus {
